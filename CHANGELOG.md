@@ -1,5 +1,14 @@
 # Changelog
 
+## v1.1.2-polygon-provider-diagnostics-dev
+
+- Added sanitized Polygon/Massive HTTP status diagnostics for read-only provider failures.
+- Added provider troubleshooting guidance for 1D key/config checks versus 15m intraday plan/entitlement checks.
+- Improved Live Data — Read Only diagnostic notes without auto-refresh, downloads, or persistence.
+- Preserved existing scoring logic.
+- Preserved no broker/order/alert/payment automation.
+- Preserved no secrets or real data commits.
+
 ## v1.1.1-polygon-readonly-provider-smoke-dev
 
 - Added Polygon/Massive read-only aggregate bars provider support.

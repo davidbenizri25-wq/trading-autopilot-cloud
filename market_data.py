@@ -9,9 +9,11 @@ from __future__ import annotations
 import csv
 import io
 import json
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping, Optional, Union
+from urllib.error import HTTPError
 from urllib.parse import quote, urlencode
 from urllib.request import urlopen
 
@@ -24,6 +26,14 @@ CONFIG_KEYS = [
     "POLYGON_API_KEY",
 ]
 SUPPORTED_PROVIDERS = {"alpaca", "polygon"}
+HTTP_STATUS_LABELS = {
+    400: "bad request",
+    401: "unauthorized",
+    403: "forbidden",
+    404: "not found",
+    429: "rate limited",
+}
+PROVIDER_MESSAGE_MAX_CHARS = 220
 TRADINGVIEW_IMPORT_HEADER = [
     "ticker",
     "price",
@@ -143,6 +153,66 @@ def polygon_date_range_for_timeframe(
     return start.date().isoformat(), current.date().isoformat()
 
 
+def sanitize_provider_message(message: Any) -> str:
+    text = str(message or "").strip()
+    if not text:
+        return ""
+    text = re.sub(r"(?i)(apiKey=)[^&\s\"']+", r"\1[redacted]", text)
+    text = re.sub(r"(?i)(api_key=)[^&\s\"']+", r"\1[redacted]", text)
+    text = re.sub(r"(?i)(POLYGON_API_KEY=)[^&\s\"']+", r"\1[redacted]", text)
+    text = " ".join(text.split())
+    if len(text) > PROVIDER_MESSAGE_MAX_CHARS:
+        text = text[: PROVIDER_MESSAGE_MAX_CHARS - 3].rstrip() + "..."
+    return text
+
+
+def _read_http_error_body(error: HTTPError) -> str:
+    try:
+        raw_body = error.read()
+    except Exception:
+        return ""
+    if not raw_body:
+        return ""
+    if isinstance(raw_body, str):
+        return raw_body
+    try:
+        return raw_body.decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
+def _http_error_body_detail(body: str) -> str:
+    clean_body = sanitize_provider_message(body)
+    if not clean_body:
+        return ""
+    try:
+        payload = json.loads(clean_body)
+    except json.JSONDecodeError:
+        return clean_body
+    if not isinstance(payload, dict):
+        return clean_body
+    details = []
+    for key in ["status", "error", "message"]:
+        value = payload.get(key)
+        if value not in (None, ""):
+            details.append(f"{key}: {sanitize_provider_message(value)}")
+    return "; ".join(details)
+
+
+def provider_http_error_message(ticker: str, error: HTTPError) -> str:
+    clean_ticker = str(ticker or "").strip().upper() or "UNKNOWN"
+    code = int(getattr(error, "code", 0) or 0)
+    label = HTTP_STATUS_LABELS.get(code)
+    if label is None:
+        reason = sanitize_provider_message(getattr(error, "reason", "") or "")
+        label = reason.lower() if reason else "error"
+    base = f"{clean_ticker}: provider HTTP {code} {label}".strip()
+    detail = _http_error_body_detail(_read_http_error_body(error))
+    if detail:
+        return f"{base}: {detail}"
+    return base
+
+
 def build_polygon_aggs_url(
     ticker: str,
     timeframe: str,
@@ -208,7 +278,7 @@ def fetch_readonly_market_data_rows(
     if provider == "disabled":
         return [], ["MARKET_DATA_PROVIDER is not configured."]
     if provider != "polygon":
-        return [], ["Only polygon read-only fetch is implemented in v1.1.1."]
+        return [], ["Only polygon read-only fetch is implemented in v1.1.2."]
     config_errors = market_data_config_errors(config)
     if config_errors:
         return [], config_errors
@@ -222,6 +292,9 @@ def fetch_readonly_market_data_rows(
             continue
         try:
             bars = fetch_polygon_aggregate_bars(clean_ticker, timeframe, api_key)
+        except HTTPError as exc:
+            errors.append(provider_http_error_message(clean_ticker, exc))
+            continue
         except Exception as exc:
             errors.append(f"{clean_ticker}: provider fetch failed ({exc.__class__.__name__})")
             continue

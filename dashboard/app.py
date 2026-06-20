@@ -32,7 +32,7 @@ from tools.validate_candidates import ALL_CANDIDATE_COLUMNS, validate_candidate_
 from shares_filter import filter_share_candidates
 
 
-APP_VERSION = "1.1.1-polygon-readonly-provider-smoke-dev"
+APP_VERSION = "1.1.2-polygon-provider-diagnostics-dev"
 SAMPLE_WARNING = "SAMPLE/EXAMPLE DATA ONLY — NOT LIVE MARKET DATA"
 LEGACY_SAMPLE_WARNING = "SAMPLE DATA ONLY — NOT LIVE MARKET DATA"
 USER_SUPPLIED_WARNING = "USER-SUPPLIED DATA — VERIFY MANUALLY BEFORE ANY TRADING DECISION"
@@ -1681,6 +1681,9 @@ def _show_live_data_readonly(st: Any) -> None:
     st.subheader("Provider status")
     st.metric("MARKET_DATA_PROVIDER", provider)
     st.warning("Read-only provider data may be delayed depending on your market-data plan.")
+    st.info("Provider diagnostic tip: try 1D first to verify key/config. If 1D works but 15m fails, your market-data plan may not include intraday bars.")
+    st.caption("Basic/free plans may be delayed or end-of-day depending on provider plan and entitlements.")
+    st.caption("This tab does not auto-refresh, download provider data, or persist generated rows.")
 
     if provider == "disabled":
         st.info("Configure MARKET_DATA_PROVIDER and provider API keys in Streamlit secrets or environment variables.")
@@ -1693,7 +1696,7 @@ def _show_live_data_readonly(st: Any) -> None:
     else:
         st.success("Read-only provider configuration detected.")
         if provider != "polygon":
-            st.caption("Only polygon read-only fetch is implemented in v1.1.1.")
+            st.caption("Only polygon read-only fetch is implemented in v1.1.2.")
 
     tickers_text = st.text_area("Tickers to fetch", height=100, key="readonly_market_data_tickers")
     timeframe = st.selectbox("Timeframe", options=["15m", "1h", "4h", "1D"], index=0, key="readonly_market_data_timeframe")

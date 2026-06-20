@@ -47,3 +47,4 @@ def load_risk_config(path: Path | str = CONFIG_PATH) -> dict[str, float]:
 
 
 RISK_CONFIG = load_risk_config()
+
