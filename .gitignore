@@ -1,0 +1,7 @@
+.env
+.streamlit/secrets.toml
+.codex/
+__pycache__/
+*.pyc
+data/real_candidates_WORKING.csv
+*calibration*.csv
