@@ -32,7 +32,7 @@ from tools.validate_candidates import ALL_CANDIDATE_COLUMNS, validate_candidate_
 from shares_filter import filter_share_candidates
 
 
-APP_VERSION = "1.1.3-polygon-provider-diagnostics-hardening-dev"
+APP_VERSION = "1.2.0-product-ui-dev"
 SAMPLE_WARNING = "SAMPLE/EXAMPLE DATA ONLY — NOT LIVE MARKET DATA"
 LEGACY_SAMPLE_WARNING = "SAMPLE DATA ONLY — NOT LIVE MARKET DATA"
 USER_SUPPLIED_WARNING = "USER-SUPPLIED DATA — VERIFY MANUALLY BEFORE ANY TRADING DECISION"
@@ -141,7 +141,7 @@ DASHBOARD_SECTION_NAMES = [
     "Alerts",
     "Journal Prep",
 ]
-DASHBOARD_TAB_NAMES = ["Daily Review", "Live Data — Read Only"] + DASHBOARD_SECTION_NAMES + [
+DASHBOARD_TAB_NAMES = ["Home", "Daily Review", "Live Data — Read Only"] + DASHBOARD_SECTION_NAMES + [
     "Calibration Guide",
     "Calibration Results",
     "Calibration Batch Log",
@@ -1099,6 +1099,89 @@ def daily_review_next_action(summary: dict[str, Any]) -> str:
     return "Open Calibration Review and use Calibration Batch Log."
 
 
+def app_product_status_summary(
+    rows: list[dict[str, Any]],
+    validation_errors: list[str],
+    validation_warnings: list[str],
+    calibration_rows: list[dict[str, Any]],
+    batch_rows: list[dict[str, Any]],
+    provider_status: str,
+) -> dict[str, Any]:
+    candidate_count = len(rows)
+    blocking_issues = len(validation_errors)
+    provider = str(provider_status or "disabled").strip().lower() or "disabled"
+    if provider == "polygon":
+        provider_label = "Connected to Polygon"
+    elif provider == "disabled":
+        provider_label = "Manual import mode"
+    else:
+        provider_label = provider
+
+    ready_status = "Ready" if candidate_count > 0 and blocking_issues == 0 else "Needs Fix"
+    if candidate_count == 0:
+        ready_status = "Review Next"
+
+    return {
+        "app_version": APP_VERSION,
+        "provider_status": provider,
+        "provider_label": provider_label,
+        "candidate_count": candidate_count,
+        "blocking_issues": blocking_issues,
+        "warnings": len(validation_warnings),
+        "calibration_results_rows": len(calibration_rows),
+        "batch_log_rows": len(batch_rows),
+        "ready_status": ready_status,
+        "ready_for_review": candidate_count > 0 and blocking_issues == 0,
+        "live_data_status": "Live Data Ready" if provider == "polygon" else "Manual Confirmation Required",
+    }
+
+
+def product_next_best_action(summary: dict[str, Any]) -> str:
+    if int(summary.get("candidate_count", 0) or 0) == 0:
+        return "Start by using Live Data — Read Only or TradingView Import."
+    if int(summary.get("blocking_issues", 0) or 0) > 0:
+        return "Fix blocking validation issues before reviewing."
+    provider = str(summary.get("provider_status", "") or "").strip().lower()
+    if provider == "disabled":
+        return "Manual import works. Add provider secrets only if you want read-only live data."
+    if provider == "polygon":
+        return "Live Data is connected. Generate rows, then verify charts manually."
+    if int(summary.get("calibration_results_rows", 0) or 0) == 0:
+        return "Open Calibration Results after importing rows."
+    if int(summary.get("batch_log_rows", 0) or 0) == 0:
+        return "Apply labels and add rows to Batch Log when ready."
+    return "Open Calibration Review to summarize your session."
+
+
+def build_product_review_cards(
+    rows: list[dict[str, Any]],
+    sections: dict[str, list[dict[str, Any]]],
+    limit: int = 6,
+) -> list[dict[str, Any]]:
+    cards: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for row in rank_candidates(rows):
+        if row.get("bias") == "context":
+            continue
+        ticker = str(row.get("ticker", "") or "").strip().upper()
+        if not ticker or ticker in seen:
+            continue
+        seen.add(ticker)
+        cards.append(
+            {
+                "ticker": ticker,
+                "bias": row.get("bias", ""),
+                "score": row.get("score", ""),
+                "grade": row.get("grade", ""),
+                "state": row.get("state", ""),
+                "bucket": _daily_review_card_bucket(ticker, sections),
+            }
+        )
+        if len(cards) >= limit:
+            break
+    return cards
+
+
 def calibration_label_template_csv(rows: list[dict[str, Any]]) -> str:
     output = io.StringIO()
     writer = csv.DictWriter(output, fieldnames=CALIBRATION_LABEL_COLUMNS, lineterminator="\n")
@@ -1522,9 +1605,159 @@ def _show_top_review_summary(st: Any, summary: dict[str, Any]) -> None:
 
     top_candidates = [_summary_row(row) for row in summary["top_candidates"]]
     if top_candidates:
-        st.dataframe(top_candidates, use_container_width=True, hide_index=True)
+        st.dataframe(top_candidates, width="stretch", hide_index=True)
     else:
         st.caption("No ranked non-context candidates.")
+
+
+def _render_product_card(st: Any, title: str, body: str, status: str = "info") -> None:
+    status_class = {
+        "success": "product-card-success",
+        "warning": "product-card-warning",
+        "error": "product-card-error",
+    }.get(status, "product-card-info")
+    st.markdown(
+        f"""
+        <div class="product-card {status_class}">
+          <div class="product-card-title">{title}</div>
+          <div class="product-card-body">{body}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _show_product_home(st: Any, rows: list[dict[str, Any]], sections: dict[str, list[dict[str, Any]]]) -> None:
+    st.markdown(
+        """
+        <style>
+        .product-hero {
+            padding: 1rem 0 0.5rem 0;
+        }
+        .product-kicker {
+            color: #6b7280;
+            font-size: 0.95rem;
+            margin-bottom: 0.25rem;
+        }
+        .product-card {
+            border: 1px solid rgba(148, 163, 184, 0.35);
+            border-radius: 8px;
+            padding: 0.95rem;
+            min-height: 120px;
+            margin-bottom: 0.75rem;
+            background: rgba(255, 255, 255, 0.03);
+        }
+        .product-card-title {
+            font-weight: 700;
+            margin-bottom: 0.35rem;
+        }
+        .product-card-body {
+            color: inherit;
+            line-height: 1.45;
+        }
+        .product-card-success { border-left: 4px solid #16a34a; }
+        .product-card-warning { border-left: 4px solid #f59e0b; }
+        .product-card-error { border-left: 4px solid #dc2626; }
+        .product-card-info { border-left: 4px solid #2563eb; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    validation_errors, validation_warnings = validate_candidate_rows(rows, ALL_CANDIDATE_COLUMNS)
+    calibration_rows = _current_session_calibration_rows(st)
+    batch_rows = _calibration_batch_log_rows(st)
+    config = _market_data_config_from_streamlit(st)
+    provider = configured_market_data_provider(config)
+    config_errors = market_data_config_errors(config)
+    provider_status = "missing" if provider != "disabled" and config_errors else provider
+    summary = app_product_status_summary(
+        rows,
+        validation_errors,
+        validation_warnings,
+        calibration_rows,
+        batch_rows,
+        provider_status,
+    )
+
+    st.markdown('<div class="product-hero">', unsafe_allow_html=True)
+    st.markdown('<div class="product-kicker">Simple daily decision-support dashboard.</div>', unsafe_allow_html=True)
+    st.header("Trading Autopilot")
+    st.caption("No broker connection. No orders. Manual chart confirmation required.")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    metric_columns = st.columns(3)
+    metrics = [
+        ("App version", summary["app_version"]),
+        ("Provider status", summary["provider_status"]),
+        ("Candidates", summary["candidate_count"]),
+        ("Blocking issues", summary["blocking_issues"]),
+        ("Calibration rows", summary["calibration_results_rows"]),
+        ("Batch Log rows", summary["batch_log_rows"]),
+    ]
+    for index, (label, value) in enumerate(metrics):
+        metric_columns[index % 3].metric(label, value)
+
+    status_columns = st.columns(3)
+    status_columns[0].metric("Ready status", summary["ready_status"])
+    status_columns[1].metric("Review Next", product_next_best_action(summary))
+    status_columns[2].metric("Live Data", summary["live_data_status"])
+    st.caption("Ready means the current rows have no blocking validation issues. Manual Confirmation Required always applies.")
+
+    st.subheader("60-second workflow")
+    workflow_columns = st.columns(5)
+    for index, step in enumerate(
+        [
+            "1. Get data",
+            "2. Review signal cards",
+            "3. Confirm charts manually",
+            "4. Add calibration notes",
+            "5. Review session summary",
+        ]
+    ):
+        workflow_columns[index].write(step)
+
+    st.subheader("Next Best Action")
+    st.info(product_next_best_action(summary))
+
+    st.subheader("Quick actions")
+    card_columns = st.columns(4)
+    with card_columns[0]:
+        _render_product_card(
+            st,
+            "Live Data",
+            "Generate read-only rows from Polygon, then paste into TradingView Import.",
+            "success" if summary["provider_status"] == "polygon" else "info",
+        )
+    with card_columns[1]:
+        _render_product_card(st, "Daily Review", "See what to review next.", "info")
+    with card_columns[2]:
+        _render_product_card(st, "Calibration", "Label rows and review match/issue patterns.", "info")
+    with card_columns[3]:
+        _render_product_card(st, "Safety", "Decision-support only. No orders.", "warning")
+
+    st.subheader("Top Review Cards")
+    cards = build_product_review_cards(rows, sections, limit=6)
+    if cards:
+        st.dataframe(cards, width="stretch", hide_index=True)
+    else:
+        st.info("No review cards yet. Start by using Live Data — Read Only or TradingView Import.")
+
+    st.subheader("What this app will not do")
+    for item in [
+        "Place trades.",
+        "Connect brokers.",
+        "Create alerts.",
+        "Manage payments.",
+        "Replace chart confirmation.",
+    ]:
+        st.write(f"- {item}")
+
+    st.subheader("Beginner help")
+    st.write("- Start on Home.")
+    st.write("- If Live Data says polygon, generate read-only rows and paste them into TradingView Import.")
+    st.write("- If Live Data is disabled, manual import still works.")
+    st.write("- Do not worry about advanced tabs at first; they remain available for deeper review.")
 
 
 def _show_daily_review(st: Any, rows: list[dict[str, Any]], sections: dict[str, list[dict[str, Any]]]) -> None:
@@ -1596,10 +1829,10 @@ def _show_daily_review(st: Any, rows: list[dict[str, Any]], sections: dict[str, 
     else:
         st.success("Ready for review. Still verify charts manually.")
 
-    st.subheader("Current Review Cards")
+    st.subheader("Review Cards")
     cards = build_daily_review_cards(rows, sections)
     if cards:
-        st.dataframe(cards, use_container_width=True, hide_index=True)
+        st.dataframe(cards, width="stretch", hide_index=True)
     else:
         st.info("No non-context ranked candidates to review yet.")
 
@@ -1612,7 +1845,7 @@ def _show_daily_review(st: Any, rows: list[dict[str, Any]], sections: dict[str, 
     else:
         st.caption("Open Calibration Results to create label-ready rows.")
 
-    st.subheader("Stop conditions")
+    st.subheader("Stop Conditions")
     for stop_condition in [
         "Blocking issues are not 0.",
         "Values are missing or invented.",
@@ -1690,7 +1923,8 @@ def _show_live_data_readonly(st: Any) -> None:
     st.caption("This tab does not auto-refresh, download provider data, or persist generated rows.")
 
     if provider == "disabled":
-        st.info("Configure MARKET_DATA_PROVIDER and provider API keys in Streamlit secrets or environment variables.")
+        st.info("Manual import mode")
+        st.write("Manual import works. Add provider secrets only if you want read-only live data.")
         st.write("- Supported providers: alpaca, polygon.")
         st.write("- Do not commit secrets.")
     elif config_errors:
@@ -1699,8 +1933,14 @@ def _show_live_data_readonly(st: Any) -> None:
             st.write(f"- {error}")
     else:
         st.success("Read-only provider configuration detected.")
+        if provider == "polygon":
+            st.success("Connected to Polygon")
         if provider != "polygon":
-            st.caption("Only polygon read-only fetch is implemented in v1.1.3.")
+            st.caption("Only polygon read-only fetch is implemented for the current provider path.")
+
+    st.subheader("Generate read-only rows")
+    st.write("Copy into TradingView Import, confirm Blocking issues = 0, then verify chart manually.")
+    st.caption("No orders are created. Data is not persisted, downloaded, or auto-refreshed.")
 
     tickers_text = st.text_area("Tickers to fetch", height=100, key="readonly_market_data_tickers")
     timeframe = st.selectbox("Timeframe", options=["15m", "1h", "4h", "1D"], index=0, key="readonly_market_data_timeframe")
@@ -1728,6 +1968,12 @@ def _show_live_data_readonly(st: Any) -> None:
     generated_csv = st.session_state.get("readonly_market_data_csv", "")
     if generated_csv:
         st.subheader("Generated TradingView Import CSV")
+        st.success("Provider CSV generated successfully.")
+        st.write("- Next: copy into TradingView Import.")
+        st.write("- Then confirm Blocking issues = 0.")
+        st.write("- Then use Daily Review / Calibration Results.")
+        st.write("- Verify chart manually before any decision.")
+        st.write("- No orders are created.")
         st.code(generated_csv, language="csv")
         st.caption("Copy this into TradingView Import. Verify charts manually.")
 
@@ -1738,7 +1984,7 @@ def _show_calibration_guide(st: Any) -> None:
     st.write(CALIBRATION_BATCH_TEXT)
     st.dataframe(
         [{"ticker": ticker, "status": "pending_manual_review"} for ticker in CALIBRATION_BATCH],
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
     st.subheader("Calibration steps")
@@ -1791,7 +2037,7 @@ def _show_calibration_results(st: Any, rows: list[dict[str, Any]], sections: dic
     edited_rows = st.data_editor(
         st.session_state.calibration_results_rows,
         column_order=CALIBRATION_RESULT_COLUMNS,
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
         num_rows="fixed",
         column_config=column_config,
@@ -1862,7 +2108,7 @@ def _show_calibration_batch_log(st: Any) -> None:
     edited_rows = st.data_editor(
         rows,
         column_order=CALIBRATION_RESULT_COLUMNS,
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
         num_rows="dynamic",
         column_config=column_config,
@@ -1877,7 +2123,7 @@ def _show_calibration_batch_log(st: Any) -> None:
     st.subheader("Rows needing manual confirmation")
     review_rows = calibration_rows_needing_review(rows)
     if review_rows:
-        st.dataframe(review_rows, use_container_width=True, hide_index=True)
+        st.dataframe(review_rows, width="stretch", hide_index=True)
     else:
         st.success("No unclear or needs_manual_chart_confirmation rows found.")
 
@@ -1923,7 +2169,7 @@ def _show_calibration_summary_sections(st: Any, rows: list[dict[str, Any]]) -> d
         {"issue_type": issue_type, "count": count}
         for issue_type, count in summary["issue_type_counts"].items()
     ]
-    st.dataframe(issue_rows, use_container_width=True, hide_index=True)
+    st.dataframe(issue_rows, width="stretch", hide_index=True)
     return summary
 
 
@@ -1991,12 +2237,12 @@ def _show_calibration_review(st: Any) -> None:
 
     st.subheader("Top scoring rows")
     top_rows = sorted(rows, key=_calibration_score_value, reverse=True)[:10]
-    st.dataframe(top_rows, use_container_width=True, hide_index=True)
+    st.dataframe(top_rows, width="stretch", hide_index=True)
 
     st.subheader("Rows needing manual confirmation")
     review_rows = calibration_rows_needing_review(rows)
     if review_rows:
-        st.dataframe(review_rows, use_container_width=True, hide_index=True)
+        st.dataframe(review_rows, width="stretch", hide_index=True)
     else:
         st.success("No unclear or needs_manual_chart_confirmation rows found.")
 
@@ -2032,7 +2278,7 @@ def streamlit_dashboard(path: Path = DEFAULT_DATA) -> None:
             edited_rows = st.data_editor(
                 rows,
                 column_order=MANUAL_REVIEW_COLUMNS,
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
                 num_rows="dynamic",
                 height=320,
@@ -2051,7 +2297,9 @@ def streamlit_dashboard(path: Path = DEFAULT_DATA) -> None:
     tabs = st.tabs(DASHBOARD_TAB_NAMES)
     for tab, name in zip(tabs, DASHBOARD_TAB_NAMES):
         with tab:
-            if name == "Daily Review":
+            if name == "Home":
+                _show_product_home(st, rows, sections)
+            elif name == "Daily Review":
                 _show_daily_review(st, rows, sections)
             elif name == "Live Data — Read Only":
                 _show_live_data_readonly(st)
@@ -2064,7 +2312,7 @@ def streamlit_dashboard(path: Path = DEFAULT_DATA) -> None:
             elif name == "Calibration Review":
                 _show_calibration_review(st)
             else:
-                st.dataframe(sections[name], use_container_width=True)
+                st.dataframe(sections[name], width="stretch")
 
 
 def main() -> None:

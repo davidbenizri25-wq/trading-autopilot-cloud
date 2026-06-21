@@ -1,5 +1,28 @@
 # Changelog
 
+## v1.2.0-product-ui-dev
+
+- Added product-style Home experience for non-coder daily use.
+- Added cleaner status cards and next-action guidance.
+- Added simplified daily workflow sections.
+- Added Live Data quick-start guidance.
+- Added beginner-friendly Help / Safety section.
+- Preserved advanced dashboard tabs.
+- Preserved existing scoring logic.
+- Preserved read-only market-data behavior.
+- Preserved no broker/order/alert/payment automation.
+- Preserved no secrets or real data commits.
+
+## v1.1.4-streamlit-width-cleanup-and-live-data-polish-dev
+
+- Replaced deprecated Streamlit use_container_width parameters.
+- Polished Live Data — Read Only success guidance after Polygon provider smoke passed.
+- Added post-Polygon-success workflow notes.
+- Preserved existing scoring logic.
+- Preserved read-only market-data behavior.
+- Preserved no broker/order/alert/payment automation.
+- Preserved no secrets or real data commits.
+
 ## v1.1.3-polygon-provider-diagnostics-hardening-dev
 
 - Hardened read-only Polygon/Massive diagnostics for HTTPError-like provider failures.

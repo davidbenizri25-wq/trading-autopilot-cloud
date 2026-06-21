@@ -1,4 +1,4 @@
-# Trading Autopilot v1.1.3-polygon-provider-diagnostics-hardening-dev
+# Trading Autopilot v1.2.0-product-ui-dev
 
 Trading Autopilot is a decision-support dashboard for scanner ranking, watchlist review, helper levels, review planning, and journaling.
 
@@ -22,6 +22,7 @@ python3 tools/generate_pine_levels.py
 
 ## Review Surfaces
 
+- `Home` tab: product UI for non-coders with status cards, Next Best Action, review cards, and beginner safety guidance.
 - `scoring.py`: bullish, bearish, neutral, and context bias scoring.
 - `options_filter.py`: manual call/put review candidates.
 - `shares_filter.py`: under-$25 bullish long-share candidates.
@@ -59,6 +60,13 @@ python3 tools/generate_pine_levels.py
 - Cloud smoke test: `docs/cloud_smoke_test.md`.
 - Deploy troubleshooting: `docs/streamlit_deploy_troubleshooting.md`.
 - Post-deploy operator checklist: `docs/post_deploy_operator_checklist.md`.
+- Product UI guide: `docs/product_ui.md`.
+- Non-coder quickstart: `docs/non_coder_quickstart.md`.
+- Use Home first.
+- Home tab exists.
+- Product UI for non-coders.
+- Next Best Action guidance exists.
+- Advanced tabs remain available.
 - Daily Review tab now includes status summary and next best action.
 - Use fake EXAMPLE row for cloud smoke test.
 - Cloud dashboard remains decision-support only.
@@ -75,6 +83,10 @@ python3 tools/generate_pine_levels.py
 - Use `docs/readonly_market_data.md`.
 - Provider setup notes: `docs/market_data_provider_setup.md`.
 - v1.1.3 hardens provider diagnostics for placeholder keys, HTTP-like 401/403/429/400 errors, and secret redaction.
+- v1.1.4 confirms Polygon provider smoke passed for SPY 1D and SPY 15m.
+- If provider CSV generates, paste it into TradingView Import and continue with Daily Review.
+- If provider fetch fails later, use the EXAMPLE fallback and check provider diagnostics.
+- Home shows Live Data as a simple product feature while preserving advanced tabs.
 - No broker/order/alert/payment automation.
 - No TradingView scraping or sync.
 - Do not commit API keys.
