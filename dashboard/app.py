@@ -26,13 +26,19 @@ from market_data import (
     market_data_rows_to_tradingview_import_csv,
     normalize_market_data_bars,
 )
+from market_breakdown import (
+    build_market_breakdown_row,
+    build_market_breakdown_rows,
+    market_breakdown_summary,
+    parse_watchlist_text,
+)
 from options_filter import filter_options_candidates
 from scoring import load_candidates_csv, rank_candidates
 from tools.validate_candidates import ALL_CANDIDATE_COLUMNS, validate_candidate_rows
 from shares_filter import filter_share_candidates
 
 
-APP_VERSION = "1.2.0-product-ui-dev"
+APP_VERSION = "1.3.0-live-market-breakdown-dev"
 SAMPLE_WARNING = "SAMPLE/EXAMPLE DATA ONLY — NOT LIVE MARKET DATA"
 LEGACY_SAMPLE_WARNING = "SAMPLE DATA ONLY — NOT LIVE MARKET DATA"
 USER_SUPPLIED_WARNING = "USER-SUPPLIED DATA — VERIFY MANUALLY BEFORE ANY TRADING DECISION"
@@ -141,7 +147,7 @@ DASHBOARD_SECTION_NAMES = [
     "Alerts",
     "Journal Prep",
 ]
-DASHBOARD_TAB_NAMES = ["Home", "Daily Review", "Live Data — Read Only"] + DASHBOARD_SECTION_NAMES + [
+DASHBOARD_TAB_NAMES = ["Home", "Market Breakdown", "Daily Review", "Live Data — Read Only"] + DASHBOARD_SECTION_NAMES + [
     "Calibration Guide",
     "Calibration Results",
     "Calibration Batch Log",
@@ -1138,7 +1144,10 @@ def app_product_status_summary(
 
 def product_next_best_action(summary: dict[str, Any]) -> str:
     if int(summary.get("candidate_count", 0) or 0) == 0:
-        return "Start by using Live Data — Read Only or TradingView Import."
+        provider = str(summary.get("provider_status", "") or "").strip().lower()
+        if provider == "polygon":
+            return "Start with Market Breakdown or Live Data — Read Only."
+        return "Start with Market Breakdown EXAMPLE mode or TradingView Import."
     if int(summary.get("blocking_issues", 0) or 0) > 0:
         return "Fix blocking validation issues before reviewing."
     provider = str(summary.get("provider_status", "") or "").strip().lower()
@@ -1725,14 +1734,14 @@ def _show_product_home(st: Any, rows: list[dict[str, Any]], sections: dict[str, 
     with card_columns[0]:
         _render_product_card(
             st,
-            "Live Data",
-            "Generate read-only rows from Polygon, then paste into TradingView Import.",
+            "Start with Market Breakdown",
+            "Enter your watchlist and get plain-English breakdown cards.",
             "success" if summary["provider_status"] == "polygon" else "info",
         )
     with card_columns[1]:
-        _render_product_card(st, "Daily Review", "See what to review next.", "info")
+        _render_product_card(st, "Live Data", "Generate advanced CSV rows when you need the bridge.", "info")
     with card_columns[2]:
-        _render_product_card(st, "Calibration", "Label rows and review match/issue patterns.", "info")
+        _render_product_card(st, "Daily Review", "See what to review next.", "info")
     with card_columns[3]:
         _render_product_card(st, "Safety", "Decision-support only. No orders.", "warning")
 
@@ -1741,7 +1750,7 @@ def _show_product_home(st: Any, rows: list[dict[str, Any]], sections: dict[str, 
     if cards:
         st.dataframe(cards, width="stretch", hide_index=True)
     else:
-        st.info("No review cards yet. Start by using Live Data — Read Only or TradingView Import.")
+        st.info("No review cards yet. Start with Market Breakdown or TradingView Import.")
 
     st.subheader("What this app will not do")
     for item in [
@@ -1755,7 +1764,8 @@ def _show_product_home(st: Any, rows: list[dict[str, Any]], sections: dict[str, 
 
     st.subheader("Beginner help")
     st.write("- Start on Home.")
-    st.write("- If Live Data says polygon, generate read-only rows and paste them into TradingView Import.")
+    st.write("- Open Market Breakdown first for plain-English ticker explanations.")
+    st.write("- If Live Data says polygon, Market Breakdown can analyze a watchlist from read-only provider rows.")
     st.write("- If Live Data is disabled, manual import still works.")
     st.write("- Do not worry about advanced tabs at first; they remain available for deeper review.")
 
@@ -1776,6 +1786,7 @@ def _show_daily_review(st: Any, rows: list[dict[str, Any]], sections: dict[str, 
 
     st.subheader("Today’s Review Flow")
     for step in [
+        "Use Market Breakdown first if you want Plain-English ticker explanations.",
         "Import row.",
         "Fix blocking issues.",
         "Review card.",
@@ -1900,9 +1911,190 @@ def _parse_market_data_tickers(text: str) -> list[str]:
     return tickers
 
 
+def _market_breakdown_config_from_streamlit(st: Any) -> dict[str, str]:
+    return _market_data_config_from_streamlit(st)
+
+
+def _market_breakdown_rows_from_provider(
+    tickers: list[str],
+    timeframe: str,
+    config: dict[str, str],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    rows, errors = fetch_readonly_market_data_rows(tickers, timeframe, config)
+    return build_market_breakdown_rows(rows), errors
+
+
+def _breakdown_rows_to_import_csv(rows: list[dict[str, Any]]) -> str:
+    return market_data_rows_to_tradingview_import_csv(rows)
+
+
+def _example_market_breakdown_rows(timeframe: str) -> list[dict[str, Any]]:
+    examples: list[dict[str, Any]] = []
+    for ticker, start, drift in [
+        ("EXAMPLE", 95.0, 0.08),
+        ("DEMO", 110.0, -0.05),
+        ("MIXED", 50.0, 0.0),
+    ]:
+        raw_bars = []
+        for index in range(220):
+            close = start + (index * drift)
+            if ticker == "MIXED":
+                close = start + ((-1) ** index) * 0.35 + (index * 0.005)
+            raw_bars.append(
+                {
+                    "timestamp": f"{ticker}-{index + 1}",
+                    "open": close - 0.2,
+                    "high": close + 0.45,
+                    "low": close - 0.55,
+                    "close": close,
+                    "volume": 100000 + index,
+                }
+            )
+        normalized = normalize_market_data_bars(raw_bars, ticker=ticker, timeframe=timeframe)
+        indicators = compute_market_data_indicators(normalized)
+        examples.append(
+            build_market_breakdown_row(
+                {
+                    "ticker": ticker,
+                    "timeframe": timeframe,
+                    **indicators,
+                }
+            )
+        )
+    return examples
+
+
+def _render_breakdown_card(st: Any, row: dict[str, Any]) -> None:
+    st.markdown("---")
+    header_columns = st.columns([1.2, 1, 1, 1, 1])
+    header_columns[0].subheader(str(row.get("ticker", "UNKNOWN")))
+    header_columns[1].metric("Bias", row.get("bias", "unknown"))
+    header_columns[2].metric("Confidence", row.get("confidence", "C"))
+    header_columns[3].metric("Price", row.get("price", "unknown"))
+    header_columns[4].metric("Timeframe", row.get("timeframe", "unknown"))
+
+    summary_columns = st.columns(3)
+    summary_columns[0].write("Trend")
+    summary_columns[0].info(str(row.get("trend_summary", "Trend needs manual confirmation.")))
+    summary_columns[1].write("Momentum")
+    summary_columns[1].info(str(row.get("momentum_summary", "Momentum needs manual confirmation.")))
+    summary_columns[2].write("Levels")
+    summary_columns[2].info(str(row.get("level_summary", "Levels need manual confirmation.")))
+
+    flags = row.get("risk_flags")
+    if not isinstance(flags, list):
+        flags = []
+    if flags:
+        st.warning("Risk flags: " + ", ".join(str(flag) for flag in flags))
+    else:
+        st.success("Risk flags: none from available read-only fields")
+
+    st.write("Why this read:")
+    explanation = row.get("explanation")
+    if not isinstance(explanation, list):
+        explanation = ["Manual chart confirmation is still required."]
+    for bullet in explanation:
+        st.write(f"- {bullet}")
+    st.info(str(row.get("next_action", "Verify chart manually before any decision.")))
+
+
+def _show_market_breakdown(st: Any) -> None:
+    st.warning("READ ONLY MARKET DATA — VERIFY CHARTS MANUALLY")
+    st.header("Market Breakdown")
+    st.caption("Live read-only ticker analysis. Decision-support only — no orders.")
+
+    config = _market_breakdown_config_from_streamlit(st)
+    provider = configured_market_data_provider(config)
+    config_errors = market_data_config_errors(config)
+
+    status_columns = st.columns(2)
+    status_columns[0].metric("Provider status", "missing" if provider != "disabled" and config_errors else provider)
+    status_columns[1].metric("Mode", "Read-only")
+    if provider == "disabled":
+        st.info("Polygon is not configured. Use EXAMPLE mode or manual TradingView Import.")
+    elif config_errors:
+        st.error("Provider is configured but not ready.")
+        for error in config_errors:
+            st.write(f"- {error}")
+    elif provider == "polygon":
+        st.success("Polygon read-only data connected.")
+    else:
+        st.warning("Only polygon is supported for the current read-only breakdown fetch path.")
+
+    watchlist = st.text_area("Enter tickers", value="SPY, QQQ, AAPL", height=110, key="market_breakdown_watchlist")
+    timeframe = st.selectbox("Breakdown timeframe", options=["15m", "1h", "4h", "1D"], index=0, key="market_breakdown_timeframe")
+
+    analyze_clicked = st.button("Analyze Watchlist", type="primary")
+    example_clicked = st.button("Generate EXAMPLE Breakdown")
+    if analyze_clicked:
+        tickers = parse_watchlist_text(watchlist, limit=20)
+        if not tickers:
+            st.warning("Enter at least one ticker.")
+        elif provider == "disabled" or config_errors:
+            st.warning("Provider is not ready. Use Generate EXAMPLE Breakdown or the manual import workflow.")
+        else:
+            rows, errors = _market_breakdown_rows_from_provider(tickers, timeframe, config)
+            st.session_state.market_breakdown_errors = errors
+            st.session_state.market_breakdown_rows = rows
+            st.session_state.market_breakdown_import_csv = _breakdown_rows_to_import_csv(rows) if rows else ""
+    if example_clicked:
+        rows = _example_market_breakdown_rows(timeframe)
+        st.session_state.market_breakdown_errors = []
+        st.session_state.market_breakdown_rows = rows
+        st.session_state.market_breakdown_import_csv = _breakdown_rows_to_import_csv(rows)
+
+    errors = st.session_state.get("market_breakdown_errors", [])
+    if errors:
+        st.subheader("Provider messages")
+        for error in errors:
+            st.write(f"- {error}")
+        st.caption("If provider data is unavailable, use Generate EXAMPLE Breakdown or manual chart confirmation.")
+
+    rows = st.session_state.get("market_breakdown_rows", [])
+    if not rows:
+        st.info("Enter a watchlist and click Analyze Watchlist, or use Generate EXAMPLE Breakdown.")
+        return
+
+    summary = market_breakdown_summary(rows)
+    st.subheader("Market Breakdown Summary")
+    metric_columns = st.columns(5)
+    metric_columns[0].metric("Tickers analyzed", summary["total"])
+    metric_columns[1].metric("Bullish", summary["bullish"])
+    metric_columns[2].metric("Bearish", summary["bearish"])
+    metric_columns[3].metric("Neutral/Mixed", summary["neutral_mixed"])
+    metric_columns[4].metric("Needs manual confirmation", summary["needs_manual_confirmation"])
+
+    st.subheader("Top Breakdown")
+    top_rows = [
+        {
+            "ticker": row.get("ticker"),
+            "bias": row.get("bias"),
+            "confidence": row.get("confidence"),
+            "price": row.get("price"),
+            "timeframe": row.get("timeframe"),
+            "next_action": row.get("next_action"),
+        }
+        for row in rows
+    ]
+    st.dataframe(top_rows, width="stretch", hide_index=True)
+
+    st.subheader("Breakdown Cards")
+    for row in rows:
+        _render_breakdown_card(st, row)
+
+    generated_csv = st.session_state.get("market_breakdown_import_csv", "")
+    with st.expander("Advanced: TradingView Import CSV"):
+        st.caption("Optional bridge. Copy into TradingView Import if you want to use the existing validation/calibration flow.")
+        if generated_csv:
+            st.code(generated_csv, language="csv")
+        else:
+            st.info("No CSV generated yet.")
+
+
 def _show_live_data_readonly(st: Any) -> None:
     st.warning(LIVE_DATA_READONLY_WARNING)
     st.write("This tab can prepare import rows from a market-data provider when configured.")
+    st.write("For a more user-friendly explanation, use Market Breakdown.")
     st.write("It does not place orders.")
     st.write("It does not connect brokers.")
     st.write("It does not create alerts.")
@@ -2299,6 +2491,8 @@ def streamlit_dashboard(path: Path = DEFAULT_DATA) -> None:
         with tab:
             if name == "Home":
                 _show_product_home(st, rows, sections)
+            elif name == "Market Breakdown":
+                _show_market_breakdown(st)
             elif name == "Daily Review":
                 _show_daily_review(st, rows, sections)
             elif name == "Live Data — Read Only":

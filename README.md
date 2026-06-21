@@ -1,4 +1,4 @@
-# Trading Autopilot v1.2.0-product-ui-dev
+# Trading Autopilot v1.3.0-live-market-breakdown-dev
 
 Trading Autopilot is a decision-support dashboard for scanner ranking, watchlist review, helper levels, review planning, and journaling.
 
@@ -23,6 +23,7 @@ python3 tools/generate_pine_levels.py
 ## Review Surfaces
 
 - `Home` tab: product UI for non-coders with status cards, Next Best Action, review cards, and beginner safety guidance.
+- `Market Breakdown` tab: enter a watchlist and get plain-English breakdown cards with bias, confidence, trend, momentum, levels, risk flags, and next action.
 - `scoring.py`: bullish, bearish, neutral, and context bias scoring.
 - `options_filter.py`: manual call/put review candidates.
 - `shares_filter.py`: under-$25 bullish long-share candidates.
@@ -62,8 +63,14 @@ python3 tools/generate_pine_levels.py
 - Post-deploy operator checklist: `docs/post_deploy_operator_checklist.md`.
 - Product UI guide: `docs/product_ui.md`.
 - Non-coder quickstart: `docs/non_coder_quickstart.md`.
+- Live Market Breakdown guide: `docs/live_market_breakdown.md`.
+- Non-coder market review: `docs/non_coder_market_review.md`.
 - Use Home first.
 - Home tab exists.
+- Market Breakdown tab exists.
+- Watchlist input exists.
+- Plain-English breakdown cards exist.
+- Optional advanced CSV bridge exists.
 - Product UI for non-coders.
 - Next Best Action guidance exists.
 - Advanced tabs remain available.
@@ -77,6 +84,7 @@ python3 tools/generate_pine_levels.py
 ## Live Data — Read Only
 
 - Dashboard tab: `Live Data — Read Only`.
+- For a more user-friendly explanation, use `Market Breakdown` first.
 - Market-data provider support is read-only.
 - Provider config uses Streamlit secrets or environment variables.
 - Supported provider names for config: `alpaca`, `polygon`.
@@ -86,6 +94,9 @@ python3 tools/generate_pine_levels.py
 - v1.1.4 confirms Polygon provider smoke passed for SPY 1D and SPY 15m.
 - If provider CSV generates, paste it into TradingView Import and continue with Daily Review.
 - If provider fetch fails later, use the EXAMPLE fallback and check provider diagnostics.
+- Market Breakdown can use the same read-only Polygon provider to create watchlist analysis cards.
+- Market Breakdown shows bias/confidence/trend/momentum/level/risk explanations.
+- TradingView Import CSV remains an optional advanced/debug bridge.
 - Home shows Live Data as a simple product feature while preserving advanced tabs.
 - No broker/order/alert/payment automation.
 - No TradingView scraping or sync.

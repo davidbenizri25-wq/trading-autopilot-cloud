@@ -530,6 +530,18 @@ def _macd_hist(values: list[float]) -> Optional[float]:
 def compute_market_data_indicators(bars: list[dict[str, Any]]) -> dict[str, Any]:
     closes = [_to_float(bar.get("close")) for bar in bars]
     close_values = [value for value in closes if value is not None]
+    highs = [_to_float(bar.get("high")) for bar in bars]
+    high_values = [value for value in highs if value is not None]
+    lows = [_to_float(bar.get("low")) for bar in bars]
+    low_values = [value for value in lows if value is not None]
+    recent_highs = high_values[-20:]
+    wider_highs = high_values[-50:]
+    recent_lows = low_values[-20:]
+    wider_lows = low_values[-50:]
+    support1 = min(recent_lows) if recent_lows else None
+    support2 = min(wider_lows) if wider_lows else None
+    resistance1 = max(recent_highs) if recent_highs else None
+    resistance2 = max(wider_highs) if wider_highs else None
     if not close_values:
         return {
             "close": "",
@@ -538,6 +550,13 @@ def compute_market_data_indicators(bars: list[dict[str, Any]]) -> dict[str, Any]
             "wma50": "",
             "wma200": "",
             "sma200": "",
+            "support1": _format_number(support1),
+            "support2": _format_number(support2),
+            "resistance1": _format_number(resistance1),
+            "resistance2": _format_number(resistance2),
+            "breakout": _format_number(resistance1),
+            "breakdown": _format_number(support1),
+            "invalid": _format_number(support1),
             "macd_hist": "",
             "source_note": "READ_ONLY_MARKET_DATA",
         }
@@ -548,6 +567,13 @@ def compute_market_data_indicators(bars: list[dict[str, Any]]) -> dict[str, Any]
         "wma50": _format_number(_wma(close_values, 50)),
         "wma200": _format_number(_wma(close_values, 200)),
         "sma200": _format_number(_sma(close_values, 200)),
+        "support1": _format_number(support1),
+        "support2": _format_number(support2),
+        "resistance1": _format_number(resistance1),
+        "resistance2": _format_number(resistance2),
+        "breakout": _format_number(resistance1),
+        "breakdown": _format_number(support1),
+        "invalid": _format_number(support1),
         "macd_hist": _format_number(_macd_hist(close_values)),
         "source_note": "READ_ONLY_MARKET_DATA",
     }

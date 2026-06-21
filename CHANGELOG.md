@@ -1,5 +1,18 @@
 # Changelog
 
+## v1.3.0-live-market-breakdown-dev
+
+- Added Live Market Breakdown experience for non-coder watchlist review.
+- Added plain-English ticker breakdown cards from read-only Polygon data.
+- Added trend, momentum, level, risk, and next-action explanations.
+- Added watchlist analysis flow that reduces CSV-first friction.
+- Kept TradingView Import CSV as an advanced/debug bridge.
+- Preserved existing scoring logic.
+- Preserved read-only market-data behavior.
+- Preserved manual chart confirmation.
+- Preserved no broker/order/alert/payment automation.
+- Preserved no secrets or real data commits.
+
 ## v1.2.0-product-ui-dev
 
 - Added product-style Home experience for non-coder daily use.
