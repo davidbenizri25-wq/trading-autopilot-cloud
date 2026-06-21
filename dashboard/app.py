@@ -2319,7 +2319,8 @@ def _show_chart_workspace(st: Any) -> None:
     st.table(chart_review_timeframe_summary(normalized_rows))
 
     st.subheader("Chart Review Rows")
-    st.dataframe(normalized_rows, width="stretch", hide_index=True, column_order=CHART_REVIEW_COLUMNS)
+    ordered_rows = [{column: row.get(column, "") for column in CHART_REVIEW_COLUMNS} for row in normalized_rows]
+    st.table(ordered_rows)
 
     st.subheader("TradingView Import Bridge")
     st.caption("Copy this into TradingView Import if you want the existing validation, Daily Review, and Calibration flow.")
