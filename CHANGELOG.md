@@ -1,5 +1,18 @@
 # Changelog
 
+## v1.4.0-tradingview-chart-workspace-dev
+
+- Added read-only TradingView Chart Workspace for manual chart review capture.
+- Added multi-timeframe chart review CSV template and parser.
+- Added support/resistance, supply/demand, breakout/breakdown, invalidation, MA, MACD, volume, pattern, fundamentals, and macro context fields.
+- Added Chart Review CSV bridge into the existing TradingView Import workflow.
+- Added optional non-trading Pine helper source for manual chart value review.
+- Preserved existing scoring logic.
+- Preserved read-only market-data behavior.
+- Preserved manual chart confirmation.
+- Preserved no broker/order/alert/payment automation.
+- Preserved no secrets or real data commits.
+
 ## v1.3.1-market-breakdown-mobile-polish-dev
 
 - Added Beginner/Advanced navigation modes to reduce tab overload.

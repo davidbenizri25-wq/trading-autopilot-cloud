@@ -1,4 +1,4 @@
-# Trading Autopilot v1.3.1-market-breakdown-mobile-polish-dev
+# Trading Autopilot v1.4.0-tradingview-chart-workspace-dev
 
 Trading Autopilot is a decision-support dashboard for scanner ranking, watchlist review, helper levels, review planning, and journaling.
 
@@ -24,6 +24,7 @@ python3 tools/generate_pine_levels.py
 
 - `Home` tab: product UI for non-coders with status cards, Next Best Action, review cards, and beginner safety guidance.
 - `Market Breakdown` tab: enter a watchlist and get plain-English breakdown cards with bias, confidence, trend, momentum, levels, risk flags, and next action.
+- `Chart Workspace` tab: capture manual TradingView chart review notes, multi-timeframe levels, fundamentals, and macro context.
 - Beginner mode is the default and shows only the core daily-use tabs.
 - Advanced mode preserves every technical review tab.
 - `Help / Safety` tab explains what to click, when to stop, and what the app never does.
@@ -33,6 +34,7 @@ python3 tools/generate_pine_levels.py
 - `covered_call_filter.py`: covered-call review.
 - `dashboard/app.py`: Streamlit or CLI dashboard tabs.
 - `tradingview/autopilot_helper_v0_1.pine`: TradingView indicator helper.
+- `tradingview/trading_autopilot_chart_helper_v140.pine`: optional read-only chart review helper source, indicator-only and manual-use only.
 - `tradingview/generated_level_maps.pine`: generated level map output.
 - `docs/tradingview_layout_rollout_report.md`: TradingView layout rollout inventory and safety notes.
 - `playbook/`: trading playbook, setup definitions, risk rules, avoid rules, workflow, and TradingView style audit.
@@ -67,17 +69,24 @@ python3 tools/generate_pine_levels.py
 - Post-deploy operator checklist: `docs/post_deploy_operator_checklist.md`.
 - Product UI guide: `docs/product_ui.md`.
 - Market Breakdown mobile polish: `docs/market_breakdown_mobile_polish.md`.
+- TradingView Chart Workspace guide: `docs/tradingview_chart_workspace.md`.
+- Chart Review CSV Bridge guide: `docs/chart_review_csv_bridge.md`.
+- Fundamentals and macro context guide: `docs/fundamentals_macro_context.md`.
 - Non-coder quickstart: `docs/non_coder_quickstart.md`.
 - Live Market Breakdown guide: `docs/live_market_breakdown.md`.
 - Non-coder market review: `docs/non_coder_market_review.md`.
 - Use Home first.
 - Home tab exists.
 - Market Breakdown tab exists.
+- Chart Workspace tab exists.
 - Beginner mode is default.
 - Advanced mode keeps all tabs.
 - Help / Safety tab exists.
 - Watchlist input exists.
 - Plain-English breakdown cards exist.
+- Manual chart-review CSV template exists.
+- Multi-timeframe chart review summary exists.
+- Optional TradingView Import bridge exists for chart review rows.
 - Optional advanced CSV bridge exists.
 - Product UI for non-coders.
 - Next Best Action guidance exists.
@@ -114,6 +123,21 @@ python3 tools/generate_pine_levels.py
 - Do not commit API keys.
 - Do not commit `.streamlit/secrets.toml`.
 - Generated rows still require manual chart confirmation.
+
+## TradingView Chart Workspace
+
+- Dashboard tab: `Chart Workspace`.
+- Use it to capture manual chart review context for `15m`, `1h`, `4h`, and `1D`.
+- Fields include ticker, timeframe, price, chart bias, supply/demand, support/resistance, breakout, breakdown, invalidation, EMA9, EMA21, WMA50, WMA200, SMA200, MACD histogram, volume notes, pattern notes, fundamentals notes, macro notes, manual notes, and source.
+- The chart-review CSV template is copy-ready.
+- The chart-review-to-TradingView-Import bridge is optional and session-only.
+- Use `docs/tradingview_chart_workspace.md`.
+- Use `docs/chart_review_csv_bridge.md`.
+- Use `docs/fundamentals_macro_context.md`.
+- Optional Pine helper source: `tradingview/trading_autopilot_chart_helper_v140.pine`.
+- Pine helper is indicator-only, has no alertcondition, has no strategy, and must not be published by automation.
+- Manual TradingView confirmation remains required.
+- No broker/order/alert/payment automation.
 
 ## TradingView Layout Rollout
 

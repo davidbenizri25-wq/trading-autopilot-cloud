@@ -18,6 +18,15 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from covered_call_filter import filter_covered_call_candidates
+from chart_review import (
+    CHART_REVIEW_COLUMNS,
+    chart_review_rows_to_tradingview_import_csv,
+    chart_review_summary,
+    chart_review_template_csv,
+    chart_review_timeframe_summary,
+    normalize_chart_review_row,
+    parse_chart_review_csv,
+)
 from market_data import (
     compute_market_data_indicators,
     configured_market_data_provider,
@@ -39,7 +48,7 @@ from tools.validate_candidates import ALL_CANDIDATE_COLUMNS, validate_candidate_
 from shares_filter import filter_share_candidates
 
 
-APP_VERSION = "1.3.1-market-breakdown-mobile-polish-dev"
+APP_VERSION = "1.4.0-tradingview-chart-workspace-dev"
 SAMPLE_WARNING = "SAMPLE/EXAMPLE DATA ONLY — NOT LIVE MARKET DATA"
 LEGACY_SAMPLE_WARNING = "SAMPLE DATA ONLY — NOT LIVE MARKET DATA"
 USER_SUPPLIED_WARNING = "USER-SUPPLIED DATA — VERIFY MANUALLY BEFORE ANY TRADING DECISION"
@@ -49,6 +58,7 @@ CALIBRATION_BATCH_LOG_WARNING = "CALIBRATION BATCH LOG — SESSION ONLY, NOT TRA
 CALIBRATION_REVIEW_WARNING = "CALIBRATION REVIEW — SESSION ONLY, NOT TRADE ADVICE"
 DAILY_REVIEW_WARNING = "DAILY REVIEW — DECISION SUPPORT ONLY, NOT TRADE ADVICE"
 LIVE_DATA_READONLY_WARNING = "LIVE DATA — READ ONLY, NOT TRADE ADVICE"
+CHART_WORKSPACE_WARNING = "READ-ONLY CHART REVIEW — NO ORDERS, NO ALERTS"
 DEFAULT_DATA = ROOT / "data" / "sample_candidates.csv"
 TEMPLATE_DATA = ROOT / "data" / "real_candidates_template.csv"
 WORKING_DATA = ROOT / "data" / "real_candidates_WORKING.csv"
@@ -151,13 +161,14 @@ DASHBOARD_SECTION_NAMES = [
 BEGINNER_TAB_NAMES = [
     "Home",
     "Market Breakdown",
+    "Chart Workspace",
     "Live Data — Read Only",
     "Daily Review",
     "Calibration Results",
     "Calibration Review",
     "Help / Safety",
 ]
-ADVANCED_TAB_NAMES = ["Home", "Daily Review", "Live Data — Read Only", "Market Breakdown"] + DASHBOARD_SECTION_NAMES + [
+ADVANCED_TAB_NAMES = ["Home", "Market Breakdown", "Chart Workspace", "Daily Review", "Live Data — Read Only"] + DASHBOARD_SECTION_NAMES + [
     "Calibration Guide",
     "Calibration Results",
     "Calibration Batch Log",
@@ -1163,15 +1174,15 @@ def product_next_best_action(summary: dict[str, Any]) -> str:
     if int(summary.get("candidate_count", 0) or 0) == 0:
         provider = str(summary.get("provider_status", "") or "").strip().lower()
         if provider == "polygon":
-            return "Start with Market Breakdown or Live Data — Read Only."
-        return "Start with Market Breakdown EXAMPLE mode or TradingView Import."
+            return "Start with Market Breakdown, then use Chart Workspace for manual levels."
+        return "Start with Market Breakdown EXAMPLE mode, Chart Workspace, or TradingView Import."
     if int(summary.get("blocking_issues", 0) or 0) > 0:
         return "Fix blocking validation issues before reviewing."
     provider = str(summary.get("provider_status", "") or "").strip().lower()
     if provider == "disabled":
         return "Manual import works. Add provider secrets only if you want read-only live data."
     if provider == "polygon":
-        return "Live Data is connected. Generate rows, then verify charts manually."
+        return "Live Data is connected. Review Market Breakdown and capture manual chart notes."
     if int(summary.get("calibration_results_rows", 0) or 0) == 0:
         return "Open Calibration Results after importing rows."
     if int(summary.get("batch_log_rows", 0) or 0) == 0:
@@ -1765,8 +1776,8 @@ def _show_product_home(st: Any, rows: list[dict[str, Any]], sections: dict[str, 
         [
             "1. Get data",
             "2. Review signal cards",
-            "3. Confirm charts manually",
-            "4. Add calibration notes",
+            "3. Capture chart workspace notes",
+            "4. Confirm charts manually",
             "5. Review session summary",
         ]
     ):
@@ -1785,7 +1796,7 @@ def _show_product_home(st: Any, rows: list[dict[str, Any]], sections: dict[str, 
             "success" if summary["provider_status"] == "polygon" else "info",
         )
     with card_columns[1]:
-        _render_product_card(st, "Live Data", "Generate advanced CSV rows when you need the bridge.", "info")
+        _render_product_card(st, "Chart Workspace", "Capture manual levels, bias, fundamentals, and macro context.", "info")
     with card_columns[2]:
         _render_product_card(st, "Daily Review", "See what to review next.", "info")
     with card_columns[3]:
@@ -1820,6 +1831,7 @@ def _show_product_home(st: Any, rows: list[dict[str, Any]], sections: dict[str, 
     st.subheader("Beginner help")
     st.write("- Start on Home.")
     st.write("- Open Market Breakdown first for plain-English ticker explanations.")
+    st.write("- Use Chart Workspace when you want to capture manual TradingView chart notes.")
     st.write("- If Live Data says polygon, Market Breakdown can analyze a watchlist from read-only provider rows.")
     st.write("- If Live Data is disabled, manual import still works.")
     st.write("- Do not worry about advanced tabs at first; they remain available for deeper review.")
@@ -1843,6 +1855,7 @@ def _show_daily_review(st: Any, rows: list[dict[str, Any]], sections: dict[str, 
     st.subheader("Today’s Review Flow")
     for step in [
         "Use Market Breakdown first if you want Plain-English ticker explanations.",
+        "Use Chart Workspace to capture manual support/resistance, bias, fundamentals, and macro notes.",
         "Import row.",
         "Fix blocking issues.",
         "Review card.",
@@ -2179,10 +2192,146 @@ def _show_market_breakdown(st: Any) -> None:
             st.info("No CSV generated yet.")
 
 
+def _manual_chart_review_row_from_streamlit(st: Any, default_timeframe: str) -> dict[str, str]:
+    row: dict[str, str] = {}
+    field_help = {
+        "supply_zone": "Manual supply/resistance zone from chart review.",
+        "demand_zone": "Manual demand/support zone from chart review.",
+        "breakout": "Level that would confirm an upside break. Verify manually.",
+        "breakdown": "Level that would confirm a downside break. Verify manually.",
+        "invalid": "Level that invalidates the chart read. Verify manually.",
+        "fundamentals_note": "Plain-English business/news context. Do not fabricate.",
+        "macro_note": "Plain-English market/rate/sector context. Do not fabricate.",
+    }
+    with st.form("chart_workspace_manual_form", clear_on_submit=False):
+        st.caption("Manual fields are session-only. Confirm all chart values yourself.")
+        first = st.columns(4)
+        row["ticker"] = first[0].text_input("ticker", value="", key="chart_review_ticker")
+        row["timeframe"] = first[1].selectbox(
+            "timeframe",
+            options=["15m", "1h", "4h", "1D"],
+            index=["15m", "1h", "4h", "1D"].index(default_timeframe) if default_timeframe in ["15m", "1h", "4h", "1D"] else 0,
+            key="chart_review_timeframe",
+        )
+        row["price"] = first[2].text_input("price", value="", key="chart_review_price")
+        row["chart_bias"] = first[3].selectbox(
+            "chart_bias",
+            options=["unclear", "bullish", "bearish", "neutral", "mixed"],
+            index=0,
+            key="chart_review_bias",
+        )
+
+        levels = st.columns(4)
+        for index, field in enumerate(["supply_zone", "demand_zone", "support", "resistance"]):
+            row[field] = levels[index].text_input(field, value="", key=f"chart_review_{field}", help=field_help.get(field))
+
+        triggers = st.columns(3)
+        for index, field in enumerate(["breakout", "breakdown", "invalid"]):
+            row[field] = triggers[index].text_input(field, value="", key=f"chart_review_{field}", help=field_help.get(field))
+
+        averages = st.columns(5)
+        for index, field in enumerate(["ema9", "ema21", "wma50", "wma200", "sma200"]):
+            row[field] = averages[index].text_input(field, value="", key=f"chart_review_{field}")
+
+        row["macd_hist"] = st.text_input("macd_hist", value="", key="chart_review_macd_hist")
+        row["volume_note"] = st.text_input("volume_note", value="", key="chart_review_volume_note")
+        row["pattern_note"] = st.text_input("pattern_note", value="", key="chart_review_pattern_note")
+        row["fundamentals_note"] = st.text_area(
+            "fundamentals_note",
+            value="",
+            height=70,
+            key="chart_review_fundamentals_note",
+            help=field_help["fundamentals_note"],
+        )
+        row["macro_note"] = st.text_area(
+            "macro_note",
+            value="",
+            height=70,
+            key="chart_review_macro_note",
+            help=field_help["macro_note"],
+        )
+        row["manual_notes"] = st.text_area("manual_notes", value="", height=80, key="chart_review_manual_notes")
+        row["source"] = st.text_input("source", value="manual_chart_review", key="chart_review_source")
+        submitted = st.form_submit_button("Add Manual Chart Review Row")
+    if not submitted:
+        return {}
+    return normalize_chart_review_row(row)
+
+
+def _show_chart_workspace(st: Any) -> None:
+    st.warning(CHART_WORKSPACE_WARNING)
+    st.header("Chart Workspace")
+    st.caption("Manual TradingView chart review capture. Decision-support only. No downloads, no persistence.")
+    st.info("Default execution/review timeframe is 15m. Use 1h, 4h, and 1D for context.")
+
+    st.subheader("Chart Review CSV Template")
+    st.caption("Copy this template, fill only verified chart values, then paste it below.")
+    st.code(chart_review_template_csv(["SPY", "QQQ"]), language="csv")
+
+    pasted = st.text_area("Paste Chart Review CSV", height=180, key="chart_review_csv_paste")
+    parse_clicked = st.button("Parse Chart Review CSV")
+    if parse_clicked:
+        rows, errors = parse_chart_review_csv(pasted)
+        st.session_state.chart_workspace_errors = errors
+        if rows:
+            st.session_state.chart_workspace_rows = rows
+        if errors:
+            st.error("Chart review CSV needs repair before using the bridge.")
+            for error in errors:
+                st.write(f"- {error}")
+        elif rows:
+            st.success("Chart review rows parsed into session memory.")
+
+    with st.expander("Manual single-row entry", expanded=False):
+        manual_row = _manual_chart_review_row_from_streamlit(st, "15m")
+        if manual_row:
+            rows = list(st.session_state.get("chart_workspace_rows", []))
+            rows.append(manual_row)
+            st.session_state.chart_workspace_rows = rows
+            st.session_state.chart_workspace_errors = []
+            st.success("Manual chart review row added to session memory.")
+
+    st.subheader("Fundamentals / Macro Context Notes")
+    st.caption("Use this section for context you manually verify. Do not fabricate news, earnings, macro, or catalyst details.")
+    st.write("- Fundamentals note: business, earnings, product, or headline context you have verified.")
+    st.write("- Macro note: index, rate, sector, event, or risk context you have verified.")
+    st.write("- These notes do not change scoring and do not trigger any automated action.")
+
+    rows = st.session_state.get("chart_workspace_rows", [])
+    errors = st.session_state.get("chart_workspace_errors", [])
+    if errors:
+        st.subheader("Chart Review Repair")
+        for error in errors:
+            st.write(f"- {error}")
+    if not rows:
+        st.info("Paste chart review CSV or add a manual row. Nothing is written to disk.")
+        return
+
+    normalized_rows = [normalize_chart_review_row(row) for row in rows]
+    summary = chart_review_summary(normalized_rows)
+    st.subheader("Multi-Timeframe Review Summary")
+    metric_columns = st.columns(5)
+    metric_columns[0].metric("Rows", summary["total"])
+    metric_columns[1].metric("Bullish", summary["bullish"])
+    metric_columns[2].metric("Bearish", summary["bearish"])
+    metric_columns[3].metric("Neutral/Mixed", summary["neutral_or_mixed"])
+    metric_columns[4].metric("Missing levels", summary["missing_levels"])
+    st.table(chart_review_timeframe_summary(normalized_rows))
+
+    st.subheader("Chart Review Rows")
+    st.dataframe(normalized_rows, width="stretch", hide_index=True, column_order=CHART_REVIEW_COLUMNS)
+
+    st.subheader("TradingView Import Bridge")
+    st.caption("Copy this into TradingView Import if you want the existing validation, Daily Review, and Calibration flow.")
+    st.code(chart_review_rows_to_tradingview_import_csv(normalized_rows), language="csv")
+    st.warning("Manual chart confirmation is still required. Do not place orders from this app.")
+
+
 def _show_live_data_readonly(st: Any) -> None:
     st.warning(LIVE_DATA_READONLY_WARNING)
     st.write("This tab can prepare import rows from a market-data provider when configured.")
     st.write("For a more user-friendly explanation, use Market Breakdown.")
+    st.write("For manual chart-review notes and multi-timeframe context, use Chart Workspace.")
     st.write("It does not place orders.")
     st.write("It does not connect brokers.")
     st.write("It does not create alerts.")
@@ -2640,6 +2789,8 @@ def streamlit_dashboard(path: Path = DEFAULT_DATA) -> None:
                 _show_product_home(st, rows, sections)
             elif name == "Market Breakdown":
                 _show_market_breakdown(st)
+            elif name == "Chart Workspace":
+                _show_chart_workspace(st)
             elif name == "Daily Review":
                 _show_daily_review(st, rows, sections)
             elif name == "Live Data — Read Only":

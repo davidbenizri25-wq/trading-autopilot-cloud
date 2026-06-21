@@ -1,0 +1,66 @@
+//@version=5
+indicator("Trading Autopilot Chart Helper v1.4.0", overlay=true)
+
+lookback = input.int(50, "Recent level lookback", minval=5, maxval=250)
+
+ema9 = ta.ema(close, 9)
+ema21 = ta.ema(close, 21)
+wma50 = ta.wma(close, 50)
+wma200 = ta.wma(close, 200)
+sma200 = ta.sma(close, 200)
+[macdLine, signalLine, macdHist] = ta.macd(close, 12, 26, 9)
+
+recentSupport = ta.lowest(low, lookback)
+recentResistance = ta.highest(high, lookback)
+breakout = recentResistance
+breakdown = recentSupport
+invalidation = recentSupport
+
+bullishStack = close > ema9 and close > ema21 and close > sma200
+bearishStack = close < ema9 and close < ema21 and close < sma200
+biasHint = bullishStack ? "bullish context" : bearishStack ? "bearish context" : "mixed context"
+
+plot(ema9, "EMA9", color=color.new(color.green, 0))
+plot(ema21, "EMA21", color=color.new(color.teal, 0))
+plot(wma50, "WMA50", color=color.new(color.orange, 0))
+plot(wma200, "WMA200", color=color.new(color.purple, 0))
+plot(sma200, "SMA200", color=color.new(color.gray, 0))
+plot(recentSupport, "Recent support", color=color.new(color.green, 65), style=plot.style_linebr)
+plot(recentResistance, "Recent resistance", color=color.new(color.red, 65), style=plot.style_linebr)
+
+var table helper = table.new(position.top_right, 2, 15, border_width=1)
+
+formatValue(value) =>
+    str.tostring(value, format.mintick)
+
+if barstate.islast
+    table.cell(helper, 0, 0, "Trading Autopilot", text_color=color.white, bgcolor=color.new(color.blue, 35))
+    table.cell(helper, 1, 0, "Decision support only - verify manually - no orders", text_color=color.white, bgcolor=color.new(color.blue, 35))
+    table.cell(helper, 0, 1, "ticker")
+    table.cell(helper, 1, 1, syminfo.ticker)
+    table.cell(helper, 0, 2, "timeframe")
+    table.cell(helper, 1, 2, timeframe.period)
+    table.cell(helper, 0, 3, "price")
+    table.cell(helper, 1, 3, formatValue(close))
+    table.cell(helper, 0, 4, "EMA9")
+    table.cell(helper, 1, 4, formatValue(ema9))
+    table.cell(helper, 0, 5, "EMA21")
+    table.cell(helper, 1, 5, formatValue(ema21))
+    table.cell(helper, 0, 6, "WMA50")
+    table.cell(helper, 1, 6, formatValue(wma50))
+    table.cell(helper, 0, 7, "WMA200")
+    table.cell(helper, 1, 7, formatValue(wma200))
+    table.cell(helper, 0, 8, "SMA200")
+    table.cell(helper, 1, 8, formatValue(sma200))
+    table.cell(helper, 0, 9, "MACD hist")
+    table.cell(helper, 1, 9, str.tostring(macdHist, "#.####"))
+    table.cell(helper, 0, 10, "recent support")
+    table.cell(helper, 1, 10, formatValue(recentSupport))
+    table.cell(helper, 0, 11, "recent resistance")
+    table.cell(helper, 1, 11, formatValue(recentResistance))
+    table.cell(helper, 0, 12, "breakout / breakdown")
+    table.cell(helper, 1, 12, formatValue(breakout) + " / " + formatValue(breakdown))
+    table.cell(helper, 0, 13, "invalidation")
+    table.cell(helper, 1, 13, formatValue(invalidation))
+    table.cell(helper, 0, 14, "bias hint")
+    table.cell(helper, 1, 14, biasHint)
