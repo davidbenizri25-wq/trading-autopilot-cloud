@@ -1,4 +1,4 @@
-# Trading Autopilot v1.3.0-live-market-breakdown-dev
+# Trading Autopilot v1.3.1-market-breakdown-mobile-polish-dev
 
 Trading Autopilot is a decision-support dashboard for scanner ranking, watchlist review, helper levels, review planning, and journaling.
 
@@ -24,6 +24,9 @@ python3 tools/generate_pine_levels.py
 
 - `Home` tab: product UI for non-coders with status cards, Next Best Action, review cards, and beginner safety guidance.
 - `Market Breakdown` tab: enter a watchlist and get plain-English breakdown cards with bias, confidence, trend, momentum, levels, risk flags, and next action.
+- Beginner mode is the default and shows only the core daily-use tabs.
+- Advanced mode preserves every technical review tab.
+- `Help / Safety` tab explains what to click, when to stop, and what the app never does.
 - `scoring.py`: bullish, bearish, neutral, and context bias scoring.
 - `options_filter.py`: manual call/put review candidates.
 - `shares_filter.py`: under-$25 bullish long-share candidates.
@@ -54,6 +57,7 @@ python3 tools/generate_pine_levels.py
 - Do not commit real calibration CSVs.
 - Cloud dashboard remains decision-support only.
 - Manual TradingView confirmation is required.
+- Manual chart confirmation required.
 - No broker/order/alert/payment automation.
 
 ## Cloud Smoke Test / Mobile Daily Use
@@ -62,12 +66,16 @@ python3 tools/generate_pine_levels.py
 - Deploy troubleshooting: `docs/streamlit_deploy_troubleshooting.md`.
 - Post-deploy operator checklist: `docs/post_deploy_operator_checklist.md`.
 - Product UI guide: `docs/product_ui.md`.
+- Market Breakdown mobile polish: `docs/market_breakdown_mobile_polish.md`.
 - Non-coder quickstart: `docs/non_coder_quickstart.md`.
 - Live Market Breakdown guide: `docs/live_market_breakdown.md`.
 - Non-coder market review: `docs/non_coder_market_review.md`.
 - Use Home first.
 - Home tab exists.
 - Market Breakdown tab exists.
+- Beginner mode is default.
+- Advanced mode keeps all tabs.
+- Help / Safety tab exists.
 - Watchlist input exists.
 - Plain-English breakdown cards exist.
 - Optional advanced CSV bridge exists.
@@ -96,7 +104,10 @@ python3 tools/generate_pine_levels.py
 - If provider fetch fails later, use the EXAMPLE fallback and check provider diagnostics.
 - Market Breakdown can use the same read-only Polygon provider to create watchlist analysis cards.
 - Market Breakdown shows bias/confidence/trend/momentum/level/risk explanations.
+- Provider rows include provider-derived support/resistance from recent highs/lows when possible.
+- Provider-derived support/resistance is read-only context only and must be verified manually.
 - TradingView Import CSV remains an optional advanced/debug bridge.
+- Advanced CSV bridge is optional; most users can ignore it unless they are doing validation/calibration.
 - Home shows Live Data as a simple product feature while preserving advanced tabs.
 - No broker/order/alert/payment automation.
 - No TradingView scraping or sync.

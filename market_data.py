@@ -527,13 +527,14 @@ def _macd_hist(values: list[float]) -> Optional[float]:
     return macd_values[-1] - signal
 
 
-def compute_market_data_indicators(bars: list[dict[str, Any]]) -> dict[str, Any]:
-    closes = [_to_float(bar.get("close")) for bar in bars]
-    close_values = [value for value in closes if value is not None]
+def compute_provider_levels(bars: list[dict[str, Any]]) -> dict[str, Any]:
+    """Compute simple read-only recent high/low context levels from provider bars."""
+
     highs = [_to_float(bar.get("high")) for bar in bars]
     high_values = [value for value in highs if value is not None]
     lows = [_to_float(bar.get("low")) for bar in bars]
     low_values = [value for value in lows if value is not None]
+
     recent_highs = high_values[-20:]
     wider_highs = high_values[-50:]
     recent_lows = low_values[-20:]
@@ -542,6 +543,22 @@ def compute_market_data_indicators(bars: list[dict[str, Any]]) -> dict[str, Any]
     support2 = min(wider_lows) if wider_lows else None
     resistance1 = max(recent_highs) if recent_highs else None
     resistance2 = max(wider_highs) if wider_highs else None
+    return {
+        "support1": _format_number(support1),
+        "support2": _format_number(support2),
+        "resistance1": _format_number(resistance1),
+        "resistance2": _format_number(resistance2),
+        "breakout": _format_number(resistance1),
+        "breakdown": _format_number(support1),
+        "invalid": _format_number(support1),
+        "source_note": "READ_ONLY_MARKET_DATA | provider-derived support/resistance; verify chart manually",
+    }
+
+
+def compute_market_data_indicators(bars: list[dict[str, Any]]) -> dict[str, Any]:
+    closes = [_to_float(bar.get("close")) for bar in bars]
+    close_values = [value for value in closes if value is not None]
+    levels = compute_provider_levels(bars)
     if not close_values:
         return {
             "close": "",
@@ -550,15 +567,8 @@ def compute_market_data_indicators(bars: list[dict[str, Any]]) -> dict[str, Any]
             "wma50": "",
             "wma200": "",
             "sma200": "",
-            "support1": _format_number(support1),
-            "support2": _format_number(support2),
-            "resistance1": _format_number(resistance1),
-            "resistance2": _format_number(resistance2),
-            "breakout": _format_number(resistance1),
-            "breakdown": _format_number(support1),
-            "invalid": _format_number(support1),
             "macd_hist": "",
-            "source_note": "READ_ONLY_MARKET_DATA",
+            **levels,
         }
     return {
         "close": _format_number(close_values[-1]),
@@ -567,15 +577,8 @@ def compute_market_data_indicators(bars: list[dict[str, Any]]) -> dict[str, Any]
         "wma50": _format_number(_wma(close_values, 50)),
         "wma200": _format_number(_wma(close_values, 200)),
         "sma200": _format_number(_sma(close_values, 200)),
-        "support1": _format_number(support1),
-        "support2": _format_number(support2),
-        "resistance1": _format_number(resistance1),
-        "resistance2": _format_number(resistance2),
-        "breakout": _format_number(resistance1),
-        "breakdown": _format_number(support1),
-        "invalid": _format_number(support1),
         "macd_hist": _format_number(_macd_hist(close_values)),
-        "source_note": "READ_ONLY_MARKET_DATA",
+        **levels,
     }
 
 
@@ -584,13 +587,19 @@ def market_data_rows_to_tradingview_import_csv(rows: list[dict[str, Any]]) -> st
     writer = csv.DictWriter(output, fieldnames=TRADINGVIEW_IMPORT_HEADER, lineterminator="\n")
     writer.writeheader()
     for row in rows:
+        has_levels = any(
+            _format_number(row.get(column))
+            for column in ["support1", "support2", "resistance1", "resistance2", "breakout", "breakdown", "invalid"]
+        )
         writer.writerow(
             {
                 "ticker": str(row.get("ticker", "") or "").strip().upper(),
                 "price": _format_number(row.get("close") or row.get("price")),
                 "timeframe": str(row.get("timeframe", "") or "15m").strip() or "15m",
                 "bias_note": "unclear",
-                "key_level_note": "read-only market data; verify chart manually",
+                "key_level_note": "provider-derived support/resistance; verify chart manually"
+                if has_levels
+                else "read-only market data; verify chart manually",
                 "ema9": _format_number(row.get("ema9")),
                 "ema21": _format_number(row.get("ema21")),
                 "wma50": _format_number(row.get("wma50")),

@@ -1,5 +1,20 @@
 # Changelog
 
+## v1.3.1-market-breakdown-mobile-polish-dev
+
+- Added Beginner/Advanced navigation modes to reduce tab overload.
+- Added Help / Safety tab for non-coder operation.
+- Improved Market Breakdown mobile card spacing and plain-English guidance.
+- Added provider-derived support/resistance levels from read-only market data.
+- Improved Daily Review label helper so it reflects current imported rows.
+- Clarified Advanced CSV bridge as optional.
+- Reduced dataframe toolbar exposure in beginner/product views where practical.
+- Preserved advanced dashboard mode.
+- Preserved existing scoring logic.
+- Preserved read-only market-data behavior.
+- Preserved no broker/order/alert/payment automation.
+- Preserved no secrets or real data commits.
+
 ## v1.3.0-live-market-breakdown-dev
 
 - Added Live Market Breakdown experience for non-coder watchlist review.

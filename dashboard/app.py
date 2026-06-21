@@ -7,6 +7,7 @@ CLI dashboard. Decision support only; no broker or order execution features.
 from __future__ import annotations
 
 import csv
+import html
 import io
 import os
 import sys
@@ -38,7 +39,7 @@ from tools.validate_candidates import ALL_CANDIDATE_COLUMNS, validate_candidate_
 from shares_filter import filter_share_candidates
 
 
-APP_VERSION = "1.3.0-live-market-breakdown-dev"
+APP_VERSION = "1.3.1-market-breakdown-mobile-polish-dev"
 SAMPLE_WARNING = "SAMPLE/EXAMPLE DATA ONLY — NOT LIVE MARKET DATA"
 LEGACY_SAMPLE_WARNING = "SAMPLE DATA ONLY — NOT LIVE MARKET DATA"
 USER_SUPPLIED_WARNING = "USER-SUPPLIED DATA — VERIFY MANUALLY BEFORE ANY TRADING DECISION"
@@ -147,12 +148,22 @@ DASHBOARD_SECTION_NAMES = [
     "Alerts",
     "Journal Prep",
 ]
-DASHBOARD_TAB_NAMES = ["Home", "Market Breakdown", "Daily Review", "Live Data — Read Only"] + DASHBOARD_SECTION_NAMES + [
+BEGINNER_TAB_NAMES = [
+    "Home",
+    "Market Breakdown",
+    "Live Data — Read Only",
+    "Daily Review",
+    "Calibration Results",
+    "Calibration Review",
+    "Help / Safety",
+]
+ADVANCED_TAB_NAMES = ["Home", "Daily Review", "Live Data — Read Only", "Market Breakdown"] + DASHBOARD_SECTION_NAMES + [
     "Calibration Guide",
     "Calibration Results",
     "Calibration Batch Log",
     "Calibration Review",
 ]
+DASHBOARD_TAB_NAMES = ADVANCED_TAB_NAMES
 MANUAL_REVIEW_COLUMNS = [
     "ticker",
     "asset_type",
@@ -172,6 +183,12 @@ MANUAL_REVIEW_COLUMNS = [
     "relative_volume",
     "watchlist",
 ]
+
+
+def dashboard_tab_names_for_mode(mode: str) -> list[str]:
+    if str(mode or "").strip().lower() == "advanced":
+        return list(ADVANCED_TAB_NAMES)
+    return list(BEGINNER_TAB_NAMES)
 
 
 class TradingViewImportParseError(ValueError):
@@ -1211,6 +1228,35 @@ def calibration_label_template_csv(rows: list[dict[str, Any]]) -> str:
     return output.getvalue()
 
 
+def _calibration_label_keys(rows: list[dict[str, Any]]) -> set[str]:
+    return {_calibration_label_key(row) for row in rows if _calibration_label_key(row).strip("|")}
+
+
+def current_label_template_rows(st: Any, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    current_rows = [_normalize_calibration_result_row(row) for row in rows if isinstance(row, dict)]
+    session_rows = _current_session_calibration_rows(st)
+    if not current_rows:
+        return []
+    if not session_rows:
+        return current_rows
+
+    current_keys = _calibration_label_keys(current_rows)
+    session_keys = _calibration_label_keys(session_rows)
+    if current_keys and session_keys == current_keys:
+        return session_rows
+    return current_rows
+
+
+def label_template_staleness_warning(template_rows: list[dict[str, Any]], current_rows: list[dict[str, Any]]) -> str:
+    template_keys = _calibration_label_keys(template_rows)
+    current_keys = _calibration_label_keys(current_rows)
+    if not current_keys:
+        return "Open Calibration Results after importing rows to create label-ready rows."
+    if template_keys and template_keys != current_keys:
+        return "Label template may be stale. Open Calibration Results to refresh current rows."
+    return ""
+
+
 def _format_optional_number(value: Any) -> str:
     text = str(value or "").strip().replace(",", "")
     if not text:
@@ -1748,7 +1794,16 @@ def _show_product_home(st: Any, rows: list[dict[str, Any]], sections: dict[str, 
     st.subheader("Top Review Cards")
     cards = build_product_review_cards(rows, sections, limit=6)
     if cards:
-        st.dataframe(cards, width="stretch", hide_index=True)
+        for card in cards:
+            _render_product_card(
+                st,
+                f"{card.get('ticker', 'UNKNOWN')} — {card.get('bias', 'unknown')} {card.get('grade', '')}",
+                (
+                    f"Score {card.get('score', 'n/a')} · state {card.get('state', 'n/a')} · "
+                    f"bucket {card.get('bucket', 'unbucketed')}"
+                ),
+                "success" if str(card.get("state", "")).lower() in {"alert", "priority_watch"} else "info",
+            )
     else:
         st.info("No review cards yet. Start with Market Breakdown or TradingView Import.")
 
@@ -1774,7 +1829,8 @@ def _show_daily_review(st: Any, rows: list[dict[str, Any]], sections: dict[str, 
     st.warning(DAILY_REVIEW_WARNING)
 
     validation_errors, validation_warnings = validate_candidate_rows(rows, ALL_CANDIDATE_COLUMNS)
-    session_rows = _current_session_calibration_rows(st)
+    base_calibration_rows = build_calibration_result_rows(rows, sections)
+    session_rows = current_label_template_rows(st, base_calibration_rows)
     batch_rows = _calibration_batch_log_rows(st)
     status_summary = daily_review_status_summary(
         rows,
@@ -1843,15 +1899,18 @@ def _show_daily_review(st: Any, rows: list[dict[str, Any]], sections: dict[str, 
     st.subheader("Review Cards")
     cards = build_daily_review_cards(rows, sections)
     if cards:
-        st.dataframe(cards, width="stretch", hide_index=True)
+        st.table(cards)
     else:
         st.info("No non-context ranked candidates to review yet.")
 
     st.subheader("Copy/Paste Helpers")
+    staleness_warning = label_template_staleness_warning(session_rows, base_calibration_rows)
+    if staleness_warning:
+        st.info(staleness_warning)
     if session_rows:
         st.caption("Edit manual_chart_bias, match_status, issue_type, and follow_up before applying.")
         st.write("Label CSV Template")
-        st.caption("Copy this into Calibration Labels CSV if you want to label rows faster.")
+        st.caption("Current imported rows only. Copy this into Calibration Labels CSV if you want to label rows faster.")
         st.code(calibration_label_template_csv(session_rows), language="csv")
     else:
         st.caption("Open Calibration Results to create label-ready rows.")
@@ -1965,20 +2024,47 @@ def _example_market_breakdown_rows(timeframe: str) -> list[dict[str, Any]]:
 
 
 def _render_breakdown_card(st: Any, row: dict[str, Any]) -> None:
-    st.markdown("---")
-    header_columns = st.columns([1.2, 1, 1, 1, 1])
-    header_columns[0].subheader(str(row.get("ticker", "UNKNOWN")))
-    header_columns[1].metric("Bias", row.get("bias", "unknown"))
-    header_columns[2].metric("Confidence", row.get("confidence", "C"))
-    header_columns[3].metric("Price", row.get("price", "unknown"))
-    header_columns[4].metric("Timeframe", row.get("timeframe", "unknown"))
+    st.markdown(
+        """
+        <style>
+        .breakdown-card {
+            border: 1px solid rgba(148, 163, 184, 0.35);
+            border-radius: 8px;
+            padding: 0.8rem 0.9rem;
+            margin: 0.65rem 0;
+        }
+        .breakdown-card-title {
+            font-size: 1.05rem;
+            font-weight: 700;
+            margin-bottom: 0.2rem;
+        }
+        .breakdown-card-meta {
+            color: #64748b;
+            font-size: 0.9rem;
+            margin-bottom: 0.4rem;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    ticker = html.escape(str(row.get("ticker", "UNKNOWN")))
+    meta = (
+        f"Bias: {row.get('bias', 'unknown')} · Confidence: {row.get('confidence', 'C')} · "
+        f"Price: {row.get('price', 'unknown')} · {row.get('timeframe', 'unknown')}"
+    )
+    meta = html.escape(meta)
+    st.markdown(
+        f"<div class='breakdown-card'><div class='breakdown-card-title'>{ticker}</div>"
+        f"<div class='breakdown-card-meta'>{meta}</div></div>",
+        unsafe_allow_html=True,
+    )
 
     summary_columns = st.columns(3)
-    summary_columns[0].write("Trend")
+    summary_columns[0].caption("Trend")
     summary_columns[0].info(str(row.get("trend_summary", "Trend needs manual confirmation.")))
-    summary_columns[1].write("Momentum")
+    summary_columns[1].caption("Momentum")
     summary_columns[1].info(str(row.get("momentum_summary", "Momentum needs manual confirmation.")))
-    summary_columns[2].write("Levels")
+    summary_columns[2].caption("Levels")
     summary_columns[2].info(str(row.get("level_summary", "Levels need manual confirmation.")))
 
     flags = row.get("risk_flags")
@@ -1995,6 +2081,7 @@ def _render_breakdown_card(st: Any, row: dict[str, Any]) -> None:
         explanation = ["Manual chart confirmation is still required."]
     for bullet in explanation:
         st.write(f"- {bullet}")
+    st.write("What I’d check next")
     st.info(str(row.get("next_action", "Verify chart manually before any decision.")))
 
 
@@ -2021,7 +2108,8 @@ def _show_market_breakdown(st: Any) -> None:
     else:
         st.warning("Only polygon is supported for the current read-only breakdown fetch path.")
 
-    watchlist = st.text_area("Enter tickers", value="SPY, QQQ, AAPL", height=110, key="market_breakdown_watchlist")
+    st.caption("Beginner flow: type tickers, analyze, read cards, then verify charts manually.")
+    watchlist = st.text_area("Enter tickers", value="SPY, QQQ, AAPL", height=90, key="market_breakdown_watchlist")
     timeframe = st.selectbox("Breakdown timeframe", options=["15m", "1h", "4h", "1D"], index=0, key="market_breakdown_timeframe")
 
     analyze_clicked = st.button("Analyze Watchlist", type="primary")
@@ -2076,15 +2164,15 @@ def _show_market_breakdown(st: Any) -> None:
         }
         for row in rows
     ]
-    st.dataframe(top_rows, width="stretch", hide_index=True)
+    st.table(top_rows)
 
     st.subheader("Breakdown Cards")
     for row in rows:
         _render_breakdown_card(st, row)
 
     generated_csv = st.session_state.get("market_breakdown_import_csv", "")
-    with st.expander("Advanced: TradingView Import CSV"):
-        st.caption("Optional bridge. Copy into TradingView Import if you want to use the existing validation/calibration flow.")
+    with st.expander("Advanced CSV bridge — optional"):
+        st.caption("Most users can ignore this. It is for copying rows into the advanced calibration workflow.")
         if generated_csv:
             st.code(generated_csv, language="csv")
         else:
@@ -2168,6 +2256,53 @@ def _show_live_data_readonly(st: Any) -> None:
         st.write("- No orders are created.")
         st.code(generated_csv, language="csv")
         st.caption("Copy this into TradingView Import. Verify charts manually.")
+
+
+def _show_help_safety(st: Any) -> None:
+    st.warning("HELP / SAFETY — DECISION SUPPORT ONLY")
+    st.header("Help / Safety")
+    st.caption("A non-coder guide for using Trading Autopilot without touching broker/order workflows.")
+
+    st.subheader("What this app does")
+    for item in [
+        "Helps review tickers.",
+        "Fetches read-only market data when Polygon is configured.",
+        "Creates import rows for the advanced workflow.",
+        "Explains dashboard reads in plain English.",
+        "Helps calibration and review notes stay organized.",
+    ]:
+        st.write(f"- {item}")
+
+    st.subheader("What this app does not do")
+    for item in [
+        "No orders.",
+        "No broker connection.",
+        "No auto-trading.",
+        "No TradingView alerts.",
+        "No financial advice.",
+    ]:
+        st.write(f"- {item}")
+
+    st.subheader("How to use")
+    for step in [
+        "1. Start on Home.",
+        "2. Use Live Data or manual import.",
+        "3. Confirm Blocking issues = 0.",
+        "4. Read Market Breakdown.",
+        "5. Verify chart manually.",
+        "6. Use Calibration Review if tracking accuracy.",
+    ]:
+        st.write(step)
+
+    st.subheader("Stop if")
+    for item in [
+        "Blocking issues appear.",
+        "Data looks wrong.",
+        "Provider fails.",
+        "You feel rushed.",
+        "Anything asks for broker/order/payment.",
+    ]:
+        st.write(f"- {item}")
 
 
 def _show_calibration_guide(st: Any) -> None:
@@ -2462,6 +2597,17 @@ def streamlit_dashboard(path: Path = DEFAULT_DATA) -> None:
     if source_label == "TradingView Import":
         st.warning(TRADINGVIEW_IMPORT_WARNING)
     st.caption("Decision support only. No broker connection or order execution.")
+    view_mode = st.radio(
+        "View mode",
+        options=["Beginner", "Advanced"],
+        index=0,
+        horizontal=True,
+        help="Beginner mode shows the few tabs most people need. Advanced mode shows all technical review tabs. Switching modes does not change data or scoring.",
+    )
+    if view_mode == "Beginner":
+        st.caption("Beginner mode shows the few tabs most people need.")
+    else:
+        st.caption("Advanced mode shows all technical review tabs.")
     _show_phone_workflow(st, source_label, user_supplied)
     _show_tradingview_import_repair(st, source_label)
 
@@ -2486,8 +2632,9 @@ def streamlit_dashboard(path: Path = DEFAULT_DATA) -> None:
     _show_download(st, rows, user_supplied)
     _show_top_review_summary(st, summary)
 
-    tabs = st.tabs(DASHBOARD_TAB_NAMES)
-    for tab, name in zip(tabs, DASHBOARD_TAB_NAMES):
+    tab_names = dashboard_tab_names_for_mode(view_mode)
+    tabs = st.tabs(tab_names)
+    for tab, name in zip(tabs, tab_names):
         with tab:
             if name == "Home":
                 _show_product_home(st, rows, sections)
@@ -2505,6 +2652,8 @@ def streamlit_dashboard(path: Path = DEFAULT_DATA) -> None:
                 _show_calibration_batch_log(st)
             elif name == "Calibration Review":
                 _show_calibration_review(st)
+            elif name == "Help / Safety":
+                _show_help_safety(st)
             else:
                 st.dataframe(sections[name], width="stretch")
 

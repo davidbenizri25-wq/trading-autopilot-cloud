@@ -186,9 +186,15 @@ def breakdown_risk_flags(row: dict[str, Any]) -> list[str]:
     sma200 = _first_float(row, ["sma200", "sma_200"])
     macd = _first_float(row, ["macd_hist", "macd_histogram"])
     levels = breakdown_level_context(row)
+    support = _first_float(row, ["support1", "support_1"])
+    resistance = _first_float(row, ["resistance1", "resistance_1"])
+    support = support if support is not None else _to_float(levels.get("support"))
+    resistance = resistance if resistance is not None else _to_float(levels.get("resistance"))
 
     if price is None:
         flags.append("missing data")
+    if support is None or resistance is None:
+        flags.append("missing levels")
     if levels.get("near_resistance"):
         flags.append("near resistance")
     if levels.get("near_support"):
@@ -201,6 +207,8 @@ def breakdown_risk_flags(row: dict[str, Any]) -> list[str]:
         flags.append("missing data")
     elif macd < -FLAT_MACD_ABS:
         flags.append("negative MACD")
+        flags.append("weak confirmation")
+    flags.append("needs manual chart confirmation")
 
     deduped: list[str] = []
     for flag in flags:
@@ -253,6 +261,10 @@ def market_breakdown_explanation(row: dict[str, Any]) -> list[str]:
         bullets.append("Price is below SMA200, so longer-term trend context is weaker.")
     if "missing data" in flags:
         bullets.append("Some data is missing; use manual chart confirmation before relying on this row.")
+    if "missing levels" in flags:
+        bullets.append("Levels are incomplete, so mark support and resistance manually.")
+    if "weak confirmation" in flags:
+        bullets.append("Confirmation is weak until momentum improves or price holds the key level.")
     bullets.append("Manual chart confirmation is still required.")
     return bullets
 
@@ -263,6 +275,8 @@ def market_breakdown_next_action(row: dict[str, Any]) -> str:
     momentum = breakdown_momentum(row)["status"]
     if "missing data" in flags:
         return "Verify chart manually before any decision."
+    if "missing levels" in flags:
+        return "Mark support/resistance manually, then verify the chart."
     if "near resistance" in flags:
         return "Watch for confirmation near resistance."
     if trend == "mixed" or momentum in {"negative", "unknown", "flat"}:
