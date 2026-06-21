@@ -1,5 +1,15 @@
 # Changelog
 
+## v1.1.3-polygon-provider-diagnostics-hardening-dev
+
+- Hardened read-only Polygon/Massive diagnostics for HTTPError-like provider failures.
+- Added placeholder key detection before provider calls.
+- Expanded secret redaction for apiKey, api_key, POLYGON_API_KEY, token, password, secret, and bearer values.
+- Added dashboard guidance for 401, 403, 429, and 400 provider responses.
+- Preserved existing scoring logic.
+- Preserved no broker/order/alert/payment automation.
+- Preserved no secrets or real data commits.
+
 ## v1.1.2-polygon-provider-diagnostics-dev
 
 - Added sanitized Polygon/Massive HTTP status diagnostics for read-only provider failures.

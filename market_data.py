@@ -34,6 +34,16 @@ HTTP_STATUS_LABELS = {
     429: "rate limited",
 }
 PROVIDER_MESSAGE_MAX_CHARS = 220
+PLACEHOLDER_PROVIDER_KEYS = {
+    "your-polygon-key",
+    "user-provider-key",
+    "actual-polygon-key-here",
+    "choose-your-provider-key",
+    "user-real-polygon-key",
+    "placeholder",
+    "demo",
+    "test",
+}
 TRADINGVIEW_IMPORT_HEADER = [
     "ticker",
     "price",
@@ -126,7 +136,10 @@ def market_data_config_errors(config: dict[str, str]) -> list[str]:
         "alpaca": ["ALPACA_API_KEY_ID", "ALPACA_API_SECRET_KEY"],
         "polygon": ["POLYGON_API_KEY"],
     }[provider]
-    return [f"Missing required setting: {key}" for key in required if not str(config.get(key, "") or "").strip()]
+    errors = [f"Missing required setting: {key}" for key in required if not str(config.get(key, "") or "").strip()]
+    if provider == "polygon" and is_placeholder_provider_key(str(config.get("POLYGON_API_KEY", "") or "")):
+        errors.append("POLYGON_API_KEY appears to be a placeholder. Replace it in Streamlit secrets with a real provider key.")
+    return errors
 
 
 def polygon_timespan_for_timeframe(timeframe: str) -> tuple[int, str]:
@@ -157,16 +170,60 @@ def sanitize_provider_message(message: Any) -> str:
     text = str(message or "").strip()
     if not text:
         return ""
-    text = re.sub(r"(?i)(apiKey=)[^&\s\"']+", r"\1[redacted]", text)
-    text = re.sub(r"(?i)(api_key=)[^&\s\"']+", r"\1[redacted]", text)
-    text = re.sub(r"(?i)(POLYGON_API_KEY=)[^&\s\"']+", r"\1[redacted]", text)
+    text = re.sub(
+        r"(?i)\b(apiKey|api_key|POLYGON_API_KEY|token|password|secret)=([^&\s\"']+)",
+        lambda match: f"{match.group(1)}=[redacted]",
+        text,
+    )
+    text = re.sub(
+        r"(?i)(\"(?:apiKey|api_key|POLYGON_API_KEY|token|password|secret)\"\s*:\s*\")[^\"]+",
+        lambda match: f"{match.group(1)}[redacted]",
+        text,
+    )
+    text = re.sub(
+        r"(?i)('(?:apiKey|api_key|POLYGON_API_KEY|token|password|secret)'\s*:\s*')[^']+",
+        lambda match: f"{match.group(1)}[redacted]",
+        text,
+    )
+    text = re.sub(r"(?i)\b(Bearer\s+)[A-Za-z0-9._\-]+", r"\1[redacted]", text)
     text = " ".join(text.split())
     if len(text) > PROVIDER_MESSAGE_MAX_CHARS:
         text = text[: PROVIDER_MESSAGE_MAX_CHARS - 3].rstrip() + "..."
     return text
 
 
-def _read_http_error_body(error: HTTPError) -> str:
+def is_placeholder_provider_key(value: str) -> bool:
+    key = str(value or "").strip().lower()
+    if not key:
+        return False
+    if key in PLACEHOLDER_PROVIDER_KEYS:
+        return True
+    return any(fragment in key for fragment in ["placeholder", "your-", "choose-", "-here"])
+
+
+def _read_http_error_body(error: Any) -> str:
+    response = getattr(error, "response", None)
+    if response is not None:
+        try:
+            payload = response.json()
+        except Exception:
+            payload = None
+        if payload not in (None, ""):
+            try:
+                return json.dumps(payload)
+            except Exception:
+                return str(payload)
+        text = getattr(response, "text", "")
+        if text:
+            return str(text)
+        content = getattr(response, "content", b"")
+        if content:
+            if isinstance(content, str):
+                return content
+            try:
+                return content.decode("utf-8", errors="replace")
+            except Exception:
+                return ""
     try:
         raw_body = error.read()
     except Exception:
@@ -199,18 +256,60 @@ def _http_error_body_detail(body: str) -> str:
     return "; ".join(details)
 
 
-def provider_http_error_message(ticker: str, error: HTTPError) -> str:
+def _http_like_status_code(error: Any) -> int:
+    for attr in ["code", "status", "status_code"]:
+        value = getattr(error, attr, None)
+        try:
+            code = int(value or 0)
+        except (TypeError, ValueError):
+            code = 0
+        if code:
+            return code
+    response = getattr(error, "response", None)
+    if response is not None:
+        try:
+            return int(getattr(response, "status_code", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+    return 0
+
+
+def _http_like_reason(error: Any) -> str:
+    for attr in ["reason", "msg"]:
+        reason = sanitize_provider_message(getattr(error, attr, "") or "")
+        if reason:
+            return reason
+    response = getattr(error, "response", None)
+    if response is not None:
+        reason = sanitize_provider_message(getattr(response, "reason", "") or "")
+        if reason:
+            return reason
+    return ""
+
+
+def provider_http_error_message(ticker: str, error: Any) -> str:
     clean_ticker = str(ticker or "").strip().upper() or "UNKNOWN"
-    code = int(getattr(error, "code", 0) or 0)
+    code = _http_like_status_code(error)
     label = HTTP_STATUS_LABELS.get(code)
     if label is None:
-        reason = sanitize_provider_message(getattr(error, "reason", "") or "")
+        reason = _http_like_reason(error)
         label = reason.lower() if reason else "error"
     base = f"{clean_ticker}: provider HTTP {code} {label}".strip()
     detail = _http_error_body_detail(_read_http_error_body(error))
     if detail:
         return f"{base}: {detail}"
     return base
+
+
+def provider_exception_message(ticker: str, error: Exception) -> str:
+    if _http_like_status_code(error):
+        return provider_http_error_message(ticker, error)
+    clean_ticker = str(ticker or "").strip().upper() or "UNKNOWN"
+    class_name = sanitize_provider_message(error.__class__.__name__)
+    detail = sanitize_provider_message(str(error))
+    if detail and detail != class_name:
+        return f"{clean_ticker}: provider fetch failed ({class_name}): {detail}"
+    return f"{clean_ticker}: provider fetch failed ({class_name})"
 
 
 def build_polygon_aggs_url(
@@ -278,12 +377,14 @@ def fetch_readonly_market_data_rows(
     if provider == "disabled":
         return [], ["MARKET_DATA_PROVIDER is not configured."]
     if provider != "polygon":
-        return [], ["Only polygon read-only fetch is implemented in v1.1.2."]
+        return [], ["Only polygon read-only fetch is implemented in v1.1.3."]
     config_errors = market_data_config_errors(config)
     if config_errors:
         return [], config_errors
 
     api_key = str(config.get("POLYGON_API_KEY", "") or "").strip()
+    if is_placeholder_provider_key(api_key):
+        return [], ["POLYGON_API_KEY appears to be a placeholder. Replace it in Streamlit secrets with a real provider key."]
     rows: list[dict[str, Any]] = []
     errors: list[str] = []
     for ticker in tickers:
@@ -296,7 +397,7 @@ def fetch_readonly_market_data_rows(
             errors.append(provider_http_error_message(clean_ticker, exc))
             continue
         except Exception as exc:
-            errors.append(f"{clean_ticker}: provider fetch failed ({exc.__class__.__name__})")
+            errors.append(provider_exception_message(clean_ticker, exc))
             continue
         if not bars:
             errors.append(f"{clean_ticker}: no provider bars returned")

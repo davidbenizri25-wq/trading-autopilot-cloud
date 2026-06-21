@@ -1,4 +1,4 @@
-# Trading Autopilot v1.1.2-polygon-provider-diagnostics-dev
+# Trading Autopilot v1.1.3-polygon-provider-diagnostics-hardening-dev
 
 Trading Autopilot is a decision-support dashboard for scanner ranking, watchlist review, helper levels, review planning, and journaling.
 
@@ -74,6 +74,7 @@ python3 tools/generate_pine_levels.py
 - Supported provider names for config: `alpaca`, `polygon`.
 - Use `docs/readonly_market_data.md`.
 - Provider setup notes: `docs/market_data_provider_setup.md`.
+- v1.1.3 hardens provider diagnostics for placeholder keys, HTTP-like 401/403/429/400 errors, and secret redaction.
 - No broker/order/alert/payment automation.
 - No TradingView scraping or sync.
 - Do not commit API keys.
