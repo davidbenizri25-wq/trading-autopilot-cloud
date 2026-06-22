@@ -48,7 +48,7 @@ from tools.validate_candidates import ALL_CANDIDATE_COLUMNS, validate_candidate_
 from shares_filter import filter_share_candidates
 
 
-APP_VERSION = "1.4.0-tradingview-chart-workspace-dev"
+APP_VERSION = "1.4.1-chart-workspace-real-session-polish-dev"
 SAMPLE_WARNING = "SAMPLE/EXAMPLE DATA ONLY — NOT LIVE MARKET DATA"
 LEGACY_SAMPLE_WARNING = "SAMPLE DATA ONLY — NOT LIVE MARKET DATA"
 USER_SUPPLIED_WARNING = "USER-SUPPLIED DATA — VERIFY MANUALLY BEFORE ANY TRADING DECISION"
@@ -2264,9 +2264,29 @@ def _show_chart_workspace(st: Any) -> None:
     st.caption("Manual TradingView chart review capture. Decision-support only. No downloads, no persistence.")
     st.info("Default execution/review timeframe is 15m. Use 1h, 4h, and 1D for context.")
 
+    st.subheader("Start Chart Review")
+    st.write("- Open SPY/QQQ/your ticker in TradingView manually.")
+    st.write("- Use the read-only helper or your chart to copy price, moving averages, MACD, support, and resistance.")
+    st.write("- Enter one `15m` execution row per ticker, plus optional `1h`, `4h`, or `1D` context rows.")
+    st.write("- The bridge sends one execution row per ticker to TradingView Import. Context rows stay here for review.")
+    st.write("- Stop if a broker, order, alert, publish, payment, or credential screen appears.")
+
     st.subheader("Chart Review CSV Template")
     st.caption("Copy this template, fill only verified chart values, then paste it below.")
     st.code(chart_review_template_csv(["SPY", "QQQ"]), language="csv")
+
+    st.subheader("SPY example rows")
+    st.caption("Example only. Replace these with values you manually verify on your own chart.")
+    st.code(
+        "\n".join(
+            [
+                ",".join(CHART_REVIEW_COLUMNS),
+                "SPY,1D,746.90,bullish,,672.04,672.04,758.45,758.45,672.04,672.04,743.26,741.05,738.05,697.41,684.49,-1.47,manual volume check,helper visible,manual context only,manual context only,verify chart manually; no orders,tradingview_readonly_helper",
+                "SPY,15m,746.90,neutral,,743.35,743.35,748.50,748.50,743.35,743.35,746.96,747.00,746.89,746.67,747.96,-0.1388,manual volume check,helper visible,manual context only,manual context only,verify chart manually; no orders,tradingview_readonly_helper",
+            ]
+        ),
+        language="csv",
+    )
 
     pasted = st.text_area("Paste Chart Review CSV", height=180, key="chart_review_csv_paste")
     parse_clicked = st.button("Parse Chart Review CSV")
@@ -2323,7 +2343,10 @@ def _show_chart_workspace(st: Any) -> None:
     st.table(ordered_rows)
 
     st.subheader("TradingView Import Bridge")
-    st.caption("Copy this into TradingView Import if you want the existing validation, Daily Review, and Calibration flow.")
+    st.caption(
+        "Copy this into TradingView Import if you want validation, Daily Review, and Calibration. "
+        "The bridge keeps one execution row per ticker, preferring 15m. Higher-timeframe rows remain Chart Workspace context."
+    )
     st.code(chart_review_rows_to_tradingview_import_csv(normalized_rows), language="csv")
     st.warning("Manual chart confirmation is still required. Do not place orders from this app.")
 

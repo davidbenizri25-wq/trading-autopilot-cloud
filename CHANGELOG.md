@@ -1,5 +1,17 @@
 # Changelog
 
+## v1.4.1-chart-workspace-real-session-polish-dev
+
+- Polished Chart Workspace after real-session smoke testing.
+- Improved Chart Workspace row entry and multi-timeframe summary guidance.
+- Improved TradingView helper setup instructions.
+- Added clearer chart-review examples for SPY 1D and 15m.
+- Updated the TradingView Import bridge to send one execution row per ticker, preferring 15m, while preserving higher-timeframe rows as Chart Workspace context.
+- Preserved existing scoring logic.
+- Preserved read-only chart workflow.
+- Preserved no broker/order/alert/payment automation.
+- Preserved no secrets or real data commits.
+
 ## v1.4.0-tradingview-chart-workspace-dev
 
 - Added read-only TradingView Chart Workspace for manual chart review capture.

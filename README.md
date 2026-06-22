@@ -1,4 +1,4 @@
-# Trading Autopilot v1.4.0-tradingview-chart-workspace-dev
+# Trading Autopilot v1.4.1-chart-workspace-real-session-polish-dev
 
 Trading Autopilot is a decision-support dashboard for scanner ranking, watchlist review, helper levels, review planning, and journaling.
 
@@ -131,6 +131,8 @@ python3 tools/generate_pine_levels.py
 - Fields include ticker, timeframe, price, chart bias, supply/demand, support/resistance, breakout, breakdown, invalidation, EMA9, EMA21, WMA50, WMA200, SMA200, MACD histogram, volume notes, pattern notes, fundamentals notes, macro notes, manual notes, and source.
 - The chart-review CSV template is copy-ready.
 - The chart-review-to-TradingView-Import bridge is optional and session-only.
+- The bridge sends one execution row per ticker, preferring `15m`, so `1h`, `4h`, and `1D` rows stay as context in Chart Workspace.
+- Use the SPY 1D/15m examples as shape examples only; replace values with chart-confirmed values.
 - Use `docs/tradingview_chart_workspace.md`.
 - Use `docs/chart_review_csv_bridge.md`.
 - Use `docs/fundamentals_macro_context.md`.

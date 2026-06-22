@@ -64,6 +64,7 @@ TRADINGVIEW_IMPORT_COLUMNS = [
 
 SUPPORTED_TIMEFRAMES = {"15m", "1h", "4h", "1D"}
 ALLOWED_BIASES = {"bullish", "bearish", "neutral", "mixed", "unclear"}
+EXECUTION_TIMEFRAME_PRIORITY = ("15m", "1h", "4h", "1D")
 
 
 def _clean(value: Any) -> str:
@@ -203,8 +204,40 @@ def chart_review_to_import_row(row: dict[str, Any]) -> dict[str, str]:
     }
 
 
+def chart_review_execution_rows(rows: list[dict[str, Any]]) -> list[dict[str, str]]:
+    """Return one execution/review row per ticker for the import bridge.
+
+    Chart Workspace can hold multi-timeframe context, but Daily Review and
+    Calibration Results are ticker-level workflows. Prefer the 15m row when it
+    exists, then fall back to higher context timeframes.
+    """
+
+    ordered_tickers: list[str] = []
+    grouped: dict[str, dict[str, dict[str, str]]] = {}
+    for raw in rows:
+        if not isinstance(raw, dict):
+            continue
+        row = normalize_chart_review_row(raw)
+        ticker = row["ticker"]
+        if ticker not in grouped:
+            grouped[ticker] = {}
+            ordered_tickers.append(ticker)
+        grouped[ticker][row["timeframe"]] = row
+
+    selected: list[dict[str, str]] = []
+    for ticker in ordered_tickers:
+        timeframe_rows = grouped[ticker]
+        for timeframe in EXECUTION_TIMEFRAME_PRIORITY:
+            if timeframe in timeframe_rows:
+                selected.append(timeframe_rows[timeframe])
+                break
+        else:
+            selected.append(next(iter(timeframe_rows.values())))
+    return selected
+
+
 def chart_review_rows_to_import_rows(rows: list[dict[str, Any]]) -> list[dict[str, str]]:
-    return [chart_review_to_import_row(row) for row in rows if isinstance(row, dict)]
+    return [chart_review_to_import_row(row) for row in chart_review_execution_rows(rows)]
 
 
 def chart_review_rows_to_tradingview_import_csv(rows: list[dict[str, Any]]) -> str:
