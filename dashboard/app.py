@@ -23,13 +23,50 @@ from alert_planning import (
     alert_plan_status_summary,
     alert_plan_template_csv,
     alert_plan_to_tradingview_message,
-    build_decision_support_card,
     build_alert_plan_from_chart_review,
     build_alert_plan_from_market_breakdown,
     normalize_alert_plan_row,
     parse_alert_plan_csv,
     setup_decision_support,
 )
+
+try:
+    from alert_planning import build_decision_support_card
+except ImportError:
+
+    def build_decision_support_card(row: dict[str, Any]) -> dict[str, Any]:
+        """Local fallback for mixed Streamlit Cloud deploy caches."""
+
+        ticker = str(row.get("ticker") or "UNKNOWN").strip().upper()
+        timeframe = str(row.get("timeframe") or "15m").strip()
+        bias = str(row.get("setup_bias") or "unclear").strip()
+        setup_type = str(row.get("setup_type") or "watch_only").strip()
+        status = str(row.get("status") or "draft").strip()
+        trigger = str(row.get("trigger_condition") or row.get("trigger_level") or "mark manually").strip()
+        invalidation = str(row.get("invalidation_level") or "mark manually").strip()
+        confidence = str(row.get("confidence") or "manual_review").strip()
+        cautions: list[str] = []
+        if status == "needs_chart_confirmation":
+            cautions.append("manual chart confirmation needed")
+        if invalidation == "mark manually":
+            cautions.append("invalidation level missing")
+        if trigger == "mark manually":
+            cautions.append("trigger level missing")
+        return {
+            "ticker": ticker,
+            "timeframe": timeframe,
+            "setup": f"{bias} {setup_type}".strip(),
+            "current_read": status,
+            "trigger": trigger,
+            "invalidation": invalidation,
+            "caution_flags": cautions or ["manual confirmation still required"],
+            "context": str(row.get("manual_notes") or "decision-support draft only").strip(),
+            "confidence": confidence,
+            "status": status,
+            "next_action": "Verify chart manually before creating any manual reminder.",
+            "final_reminder": "This is not a trade, not an order, and not a live alert.",
+        }
+
 from chart_review import (
     CHART_REVIEW_COLUMNS,
     chart_review_rows_to_tradingview_import_csv,
