@@ -1617,6 +1617,10 @@ def _streamlit_candidate_source(st: Any, initial_path: Path) -> tuple[str, Path 
     else:
         default_source = "Custom CSV path"
 
+    if _has_review_engine_session_rows(st) and st.session_state.get("review_engine_source_requested"):
+        st.session_state.candidate_source = "Review Engine Session"
+        st.session_state.review_engine_source_requested = False
+
     if st.session_state.get("candidate_source") not in source_options:
         st.session_state.candidate_source = default_source
 
@@ -1638,7 +1642,7 @@ def _streamlit_candidate_source(st: Any, initial_path: Path) -> tuple[str, Path 
             st.session_state.review_engine_csv = ""
             st.session_state.review_engine_source_label = ""
             st.session_state.review_engine_loaded = False
-            st.session_state.candidate_source = _review_engine_label()
+            st.session_state.review_engine_source_requested = False
             st.rerun()
         if not import_text.strip():
             st.info("No Review Engine session rows are loaded yet.")
@@ -2015,7 +2019,7 @@ def _send_rows_to_review_session(st: Any, csv_text: str, source_label: str) -> N
     st.session_state.review_engine_csv = clean_csv
     st.session_state.review_engine_source_label = str(source_label or "Session Rows").strip() or "Session Rows"
     st.session_state.review_engine_loaded = True
-    st.session_state.candidate_source = "Review Engine Session"
+    st.session_state.review_engine_source_requested = True
 
 
 def review_engine_status_summary(
