@@ -1,0 +1,81 @@
+//@version=5
+indicator("Trading Autopilot Chart Helper v1.5.0", overlay=true)
+
+lookback = input.int(50, "Recent level lookback", minval=5, maxval=250)
+nearLevelPct = input.float(0.35, "Near level percent", minval=0.05, maxval=5.0) / 100.0
+
+ema9 = ta.ema(close, 9)
+ema21 = ta.ema(close, 21)
+wma50 = ta.wma(close, 50)
+wma200 = ta.wma(close, 200)
+sma200 = ta.sma(close, 200)
+[macdLine, signalLine, macdHist] = ta.macd(close, 12, 26, 9)
+
+recentSupport = ta.lowest(low, lookback)
+recentResistance = ta.highest(high, lookback)
+breakoutCandidate = close > recentResistance[1] and close > ema9 and close > ema21
+breakdownCandidate = close < recentSupport[1] and close < ema9 and close < ema21
+nearSupportCandidate = math.abs(close - recentSupport) / recentSupport <= nearLevelPct
+nearResistanceCandidate = math.abs(close - recentResistance) / recentResistance <= nearLevelPct
+
+bullishStack = close > ema9 and close > ema21 and close > sma200
+bearishStack = close < ema9 and close < ema21 and close < sma200
+biasHint = bullishStack ? "bullish context" : bearishStack ? "bearish context" : "mixed context"
+manualAlertCandidate = breakoutCandidate ? "bullish breakout candidate" : breakdownCandidate ? "bearish breakdown candidate" : nearResistanceCandidate ? "near resistance candidate" : nearSupportCandidate ? "near support candidate" : "watch only"
+
+plot(ema9, "EMA9", color=color.new(color.green, 0))
+plot(ema21, "EMA21", color=color.new(color.teal, 0))
+plot(wma50, "WMA50", color=color.new(color.orange, 0))
+plot(wma200, "WMA200", color=color.new(color.purple, 0))
+plot(sma200, "SMA200", color=color.new(color.gray, 0))
+plot(recentSupport, "Recent support", color=color.new(color.green, 65), style=plot.style_linebr)
+plot(recentResistance, "Recent resistance", color=color.new(color.red, 65), style=plot.style_linebr)
+
+plotshape(breakoutCandidate, title="Bullish breakout candidate", style=shape.triangleup, color=color.new(color.green, 0), location=location.belowbar, size=size.tiny, text="Breakout?")
+plotshape(breakdownCandidate, title="Bearish breakdown candidate", style=shape.triangledown, color=color.new(color.red, 0), location=location.abovebar, size=size.tiny, text="Breakdown?")
+
+alertcondition(breakoutCandidate, "bullish_breakout_candidate", "Trading Autopilot bullish breakout candidate. Decision support only. Verify manually. No orders.")
+alertcondition(breakdownCandidate, "bearish_breakdown_candidate", "Trading Autopilot bearish breakdown candidate. Decision support only. Verify manually. No orders.")
+alertcondition(nearSupportCandidate, "price_near_support_candidate", "Trading Autopilot price near support candidate. Decision support only. Verify manually. No orders.")
+alertcondition(nearResistanceCandidate, "price_near_resistance_candidate", "Trading Autopilot price near resistance candidate. Decision support only. Verify manually. No orders.")
+
+var table helper = table.new(position.top_right, 2, 17, border_width=1)
+
+formatValue(value) =>
+    str.tostring(value, format.mintick)
+
+if barstate.islast
+    table.cell(helper, 0, 0, "Trading Autopilot", text_color=color.white, bgcolor=color.new(color.blue, 35))
+    table.cell(helper, 1, 0, "Decision support only - verify manually - no orders", text_color=color.white, bgcolor=color.new(color.blue, 35))
+    table.cell(helper, 0, 1, "ticker")
+    table.cell(helper, 1, 1, syminfo.ticker)
+    table.cell(helper, 0, 2, "timeframe")
+    table.cell(helper, 1, 2, timeframe.period)
+    table.cell(helper, 0, 3, "price")
+    table.cell(helper, 1, 3, formatValue(close))
+    table.cell(helper, 0, 4, "EMA9 / EMA21")
+    table.cell(helper, 1, 4, formatValue(ema9) + " / " + formatValue(ema21))
+    table.cell(helper, 0, 5, "WMA50 / WMA200")
+    table.cell(helper, 1, 5, formatValue(wma50) + " / " + formatValue(wma200))
+    table.cell(helper, 0, 6, "SMA200")
+    table.cell(helper, 1, 6, formatValue(sma200))
+    table.cell(helper, 0, 7, "MACD hist")
+    table.cell(helper, 1, 7, str.tostring(macdHist, "#.####"))
+    table.cell(helper, 0, 8, "recent support")
+    table.cell(helper, 1, 8, formatValue(recentSupport))
+    table.cell(helper, 0, 9, "recent resistance")
+    table.cell(helper, 1, 9, formatValue(recentResistance))
+    table.cell(helper, 0, 10, "bias hint")
+    table.cell(helper, 1, 10, biasHint)
+    table.cell(helper, 0, 11, "breakout candidate")
+    table.cell(helper, 1, 11, str.tostring(breakoutCandidate))
+    table.cell(helper, 0, 12, "breakdown candidate")
+    table.cell(helper, 1, 12, str.tostring(breakdownCandidate))
+    table.cell(helper, 0, 13, "near support")
+    table.cell(helper, 1, 13, str.tostring(nearSupportCandidate))
+    table.cell(helper, 0, 14, "near resistance")
+    table.cell(helper, 1, 14, str.tostring(nearResistanceCandidate))
+    table.cell(helper, 0, 15, "manual alert candidate")
+    table.cell(helper, 1, 15, manualAlertCandidate)
+    table.cell(helper, 0, 16, "reminder")
+    table.cell(helper, 1, 16, "Verify manually. No orders.")

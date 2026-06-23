@@ -1,5 +1,18 @@
 # Changelog
 
+## v1.5.0-alert-planning-decision-support-dev
+
+- Added Alert Planning workflow for TradingView-ready decision-support alerts.
+- Added setup decision-support cards with bias, trigger, invalidation, target zones, risk/reward notes, and manual confirmation requirements.
+- Added alert-plan CSV template and parser.
+- Added Pine helper update for alert-ready conditions without creating live alerts.
+- Added fundamentals/macro context weighting notes for setup planning.
+- Preserved read-only market-data behavior.
+- Preserved existing scoring logic.
+- Preserved no broker/order/trade execution.
+- Preserved no automatic TradingView alert creation.
+- Preserved no secrets or real data commits.
+
 ## v1.4.2-live-market-data-first-run-ux-dev
 
 - Added a Home tab "Start with Live Market Data" first-run path.

@@ -1,4 +1,4 @@
-# Trading Autopilot v1.4.2-live-market-data-first-run-ux-dev
+# Trading Autopilot v1.5.0-alert-planning-decision-support-dev
 
 Trading Autopilot is a decision-support dashboard for scanner ranking, watchlist review, helper levels, review planning, and journaling.
 
@@ -25,6 +25,7 @@ python3 tools/generate_pine_levels.py
 - `Home` tab: product UI for non-coders with Start with Live Market Data, status cards, Next Best Action, review cards, and beginner safety guidance.
 - `Market Breakdown` tab: enter a watchlist and get plain-English breakdown cards with bias, confidence, trend, momentum, levels, risk flags, and next action.
 - `Chart Workspace` tab: capture manual TradingView chart review notes, multi-timeframe levels, fundamentals, and macro context.
+- `Alert Planner` tab: draft manual TradingView alert plans and message text without creating live alerts.
 - Beginner mode is the default and shows only the core daily-use tabs.
 - Advanced mode preserves every technical review tab.
 - `Help / Safety` tab explains what to click, when to stop, and what the app never does.
@@ -70,6 +71,9 @@ python3 tools/generate_pine_levels.py
 - Product UI guide: `docs/product_ui.md`.
 - Market Breakdown mobile polish: `docs/market_breakdown_mobile_polish.md`.
 - TradingView Chart Workspace guide: `docs/tradingview_chart_workspace.md`.
+- Alert Planner guide: `docs/alert_planner.md`.
+- TradingView alert safety: `docs/tradingview_alert_safety.md`.
+- Decision-support workflow: `docs/decision_support_workflow.md`.
 - Chart Review CSV Bridge guide: `docs/chart_review_csv_bridge.md`.
 - Fundamentals and macro context guide: `docs/fundamentals_macro_context.md`.
 - Non-coder quickstart: `docs/non_coder_quickstart.md`.
@@ -84,6 +88,9 @@ python3 tools/generate_pine_levels.py
 - Home tab exists.
 - Market Breakdown tab exists.
 - Chart Workspace tab exists.
+- Alert Planner tab exists.
+- TradingView alert message drafts exist.
+- Alert Plan CSV template exists.
 - Beginner mode is default.
 - Advanced mode keeps all tabs.
 - Help / Safety tab exists.
@@ -147,6 +154,24 @@ python3 tools/generate_pine_levels.py
 - Pine helper is indicator-only, has no alertcondition, has no strategy, and must not be published by automation.
 - Manual TradingView confirmation remains required.
 - No broker/order/alert/payment automation.
+
+## Alert Planner
+
+- Dashboard tab: `Alert Planner`.
+- Use it after Market Breakdown and Chart Workspace to draft manual alert ideas.
+- Fields include ticker, timeframe, setup bias, setup type, trigger, invalidation, targets, risk/reward note, chart confirmation, fundamentals context, macro context, news catalyst, volume confirmation, manual notes, and status.
+- Alert Planner can build draft rows from Chart Workspace or Market Breakdown session rows.
+- Alert Planner includes a Manual Alert Plan CSV template and parser.
+- Alert message drafts include `Decision support only. Verify chart manually. No orders.`
+- Copy alert message drafts manually only after chart confirmation and final user approval.
+- Pine helper source: `tradingview/trading_autopilot_chart_helper_v150.pine`.
+- Pine v1.5.0 is indicator-only and includes alert-ready conditions as code only.
+- No automatic TradingView alert creation/editing/enabling/deleting.
+- No webhook automation.
+- No broker/order/payment automation.
+- Use `docs/alert_planner.md`.
+- Use `docs/tradingview_alert_safety.md`.
+- Use `docs/decision_support_workflow.md`.
 
 ## TradingView Layout Rollout
 

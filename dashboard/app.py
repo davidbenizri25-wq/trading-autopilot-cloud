@@ -18,6 +18,17 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from covered_call_filter import filter_covered_call_candidates
+from alert_planning import (
+    ALERT_PLAN_COLUMNS,
+    alert_plan_status_summary,
+    alert_plan_template_csv,
+    alert_plan_to_tradingview_message,
+    build_alert_plan_from_chart_review,
+    build_alert_plan_from_market_breakdown,
+    normalize_alert_plan_row,
+    parse_alert_plan_csv,
+    setup_decision_support,
+)
 from chart_review import (
     CHART_REVIEW_COLUMNS,
     chart_review_rows_to_tradingview_import_csv,
@@ -48,7 +59,7 @@ from tools.validate_candidates import ALL_CANDIDATE_COLUMNS, validate_candidate_
 from shares_filter import filter_share_candidates
 
 
-APP_VERSION = "1.4.2-live-market-data-first-run-ux-dev"
+APP_VERSION = "1.5.0-alert-planning-decision-support-dev"
 SAMPLE_WARNING = "SAMPLE/EXAMPLE DATA ONLY — NOT LIVE MARKET DATA"
 LEGACY_SAMPLE_WARNING = "SAMPLE DATA ONLY — NOT LIVE MARKET DATA"
 USER_SUPPLIED_WARNING = "USER-SUPPLIED DATA — VERIFY MANUALLY BEFORE ANY TRADING DECISION"
@@ -59,6 +70,7 @@ CALIBRATION_REVIEW_WARNING = "CALIBRATION REVIEW — SESSION ONLY, NOT TRADE ADV
 DAILY_REVIEW_WARNING = "DAILY REVIEW — DECISION SUPPORT ONLY, NOT TRADE ADVICE"
 LIVE_DATA_READONLY_WARNING = "LIVE DATA — READ ONLY, NOT TRADE ADVICE"
 CHART_WORKSPACE_WARNING = "READ-ONLY CHART REVIEW — NO ORDERS, NO ALERTS"
+ALERT_PLANNER_WARNING = "ALERT PLANNING ONLY — NO ALERTS ARE CREATED"
 DEFAULT_DATA = ROOT / "data" / "sample_candidates.csv"
 TEMPLATE_DATA = ROOT / "data" / "real_candidates_template.csv"
 WORKING_DATA = ROOT / "data" / "real_candidates_WORKING.csv"
@@ -162,13 +174,14 @@ BEGINNER_TAB_NAMES = [
     "Home",
     "Market Breakdown",
     "Chart Workspace",
+    "Alert Planner",
     "Live Data — Read Only",
     "Daily Review",
     "Calibration Results",
     "Calibration Review",
     "Help / Safety",
 ]
-ADVANCED_TAB_NAMES = ["Home", "Market Breakdown", "Chart Workspace", "Daily Review", "Live Data — Read Only"] + DASHBOARD_SECTION_NAMES + [
+ADVANCED_TAB_NAMES = ["Home", "Market Breakdown", "Chart Workspace", "Alert Planner", "Daily Review", "Live Data — Read Only"] + DASHBOARD_SECTION_NAMES + [
     "Calibration Guide",
     "Calibration Results",
     "Calibration Batch Log",
@@ -1787,10 +1800,10 @@ def _show_product_home(st: Any, rows: list[dict[str, Any]], sections: dict[str, 
     for index, step in enumerate(
         [
             "1. Get data",
-            "2. Review signal cards",
-            "3. Capture chart workspace notes",
-            "4. Confirm charts manually",
-            "5. Review session summary",
+            "2. Review Market Breakdown",
+            "3. Capture Chart Workspace notes",
+            "4. Draft Alert Plan",
+            "5. Decide manually",
         ]
     ):
         workflow_columns[index].write(step)
@@ -1810,7 +1823,7 @@ def _show_product_home(st: Any, rows: list[dict[str, Any]], sections: dict[str, 
     with card_columns[1]:
         _render_product_card(st, "Chart Workspace", "Capture manual levels, bias, fundamentals, and macro context.", "info")
     with card_columns[2]:
-        _render_product_card(st, "Daily Review", "See what to review next.", "info")
+        _render_product_card(st, "Alert Planner", "Draft manual TradingView alert ideas after chart confirmation.", "info")
     with card_columns[3]:
         _render_product_card(st, "Safety", "Decision-support only. No orders.", "warning")
 
@@ -1845,6 +1858,7 @@ def _show_product_home(st: Any, rows: list[dict[str, Any]], sections: dict[str, 
     st.write("- Use Start with Live Market Data if Polygon is connected.")
     st.write("- Open Market Breakdown when you want the same plain-English cards in a dedicated tab.")
     st.write("- Use Chart Workspace when you want to capture manual TradingView chart notes.")
+    st.write("- Use Alert Planner when you want manual alert ideas after chart confirmation.")
     st.write("- If Live Data says polygon, Market Breakdown can analyze a watchlist from read-only provider rows.")
     st.write("- If Live Data is disabled, manual import still works.")
     st.write("- Do not worry about advanced tabs at first; they remain available for deeper review.")
@@ -1869,6 +1883,7 @@ def _show_daily_review(st: Any, rows: list[dict[str, Any]], sections: dict[str, 
     for step in [
         "Use Start with Live Market Data or Market Breakdown first if you want plain-English ticker explanations.",
         "Use Chart Workspace to capture manual support/resistance, bias, fundamentals, and macro notes.",
+        "Use Alert Planner only for manual alert ideas after chart confirmation.",
         "Import row.",
         "Fix blocking issues.",
         "Review card.",
@@ -2183,9 +2198,11 @@ def _show_home_live_market_data(st: Any, provider: str, config: dict[str, str], 
             st.code(generated_csv, language="csv")
 
     with st.expander("What should I click?", expanded=True):
-        st.write("- Want live market cards? Market Breakdown.")
-        st.write("- Want rows for Daily Review? Live Data — Read Only → TradingView Import.")
-        st.write("- Want manual chart notes? Chart Workspace.")
+        st.write("- Want live cards? Start with Live Market Data.")
+        st.write("- Want chart notes? Chart Workspace.")
+        st.write("- Want alert ideas? Alert Planner.")
+        st.write("- Want daily rows? TradingView Import / Daily Review.")
+        st.write("- Want calibration? Calibration Results / Review.")
 
 
 def _show_market_breakdown(st: Any) -> None:
@@ -2441,6 +2458,162 @@ def _show_chart_workspace(st: Any) -> None:
     st.warning("Manual chart confirmation is still required. Do not place orders from this app.")
 
 
+def _alert_plan_rows_from_chart_workspace(st: Any) -> list[dict[str, str]]:
+    rows = st.session_state.get("chart_workspace_rows", [])
+    if not isinstance(rows, list):
+        return []
+    return build_alert_plan_from_chart_review([row for row in rows if isinstance(row, dict)])
+
+
+def _alert_plan_rows_from_market_breakdown(st: Any) -> list[dict[str, str]]:
+    rows = st.session_state.get("market_breakdown_rows", []) or st.session_state.get("home_live_market_rows", [])
+    if not isinstance(rows, list):
+        return []
+    return build_alert_plan_from_market_breakdown([row for row in rows if isinstance(row, dict)])
+
+
+def _render_alert_plan_card(st: Any, row: dict[str, Any]) -> None:
+    normalized = normalize_alert_plan_row(row)
+    decision = setup_decision_support(normalized)
+    ticker = html.escape(normalized.get("ticker", "UNKNOWN"))
+    meta = html.escape(
+        f"{normalized.get('timeframe', '15m')} · {normalized.get('setup_bias', 'unclear')} · "
+        f"{normalized.get('setup_type', 'watch_only')} · {normalized.get('status', 'draft')}"
+    )
+    st.markdown(
+        f"""
+        <div class="breakdown-card">
+          <div class="breakdown-card-title">{ticker}</div>
+          <div class="breakdown-card-meta">{meta}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    columns = st.columns(3)
+    columns[0].caption("Trigger")
+    columns[0].info(decision["trigger_summary"])
+    columns[1].caption("Invalidation")
+    columns[1].info(decision["invalidation_summary"])
+    columns[2].caption("Targets")
+    columns[2].info(decision["target_summary"])
+
+    st.caption("Fundamentals / macro context")
+    st.write(
+        " | ".join(
+            [
+                f"fundamentals: {normalized.get('fundamentals_context') or 'manual check'}",
+                f"macro: {normalized.get('macro_context') or 'manual check'}",
+                f"news: {normalized.get('news_catalyst') or 'unknown'}",
+            ]
+        )
+    )
+    warnings = decision["safety_warnings"]
+    if warnings:
+        st.warning("Safety warnings: " + " | ".join(str(item) for item in warnings))
+    st.write("Next action")
+    st.info(decision["next_action"])
+    st.write("TradingView alert message draft")
+    message = alert_plan_to_tradingview_message(normalized)
+    st.code(message)
+    st.caption("Copy manually into TradingView only after chart confirmation and final user approval.")
+
+
+def _show_alert_planner(st: Any) -> None:
+    st.warning(ALERT_PLANNER_WARNING)
+    st.header("TradingView Alert Planner")
+    st.caption("Draft alert plans only. Decision-support only. No live alerts are created.")
+
+    st.subheader("Start here")
+    st.write("- This creates draft alert plans. It does not create TradingView alerts.")
+    st.write("- You must manually verify the chart and give final confirmation before creating any alert.")
+    st.write("- Stop if a broker, order, alert, publish, payment, or credential screen appears.")
+
+    st.subheader("Build from Chart Workspace")
+    chart_rows = _alert_plan_rows_from_chart_workspace(st)
+    market_rows = _alert_plan_rows_from_market_breakdown(st)
+    builder_columns = st.columns(2)
+    with builder_columns[0]:
+        if st.button("Build Alert Plans from Chart Workspace"):
+            if chart_rows:
+                st.session_state.alert_plan_rows = chart_rows
+                st.success("Draft alert plans built from session Chart Workspace rows.")
+            else:
+                st.info("No Chart Workspace rows found in this session.")
+    with builder_columns[1]:
+        if st.button("Build Alert Plans from Market Breakdown"):
+            if market_rows:
+                st.session_state.alert_plan_rows = market_rows
+                st.success("Draft alert plans built from session Market Breakdown rows.")
+            else:
+                st.info("No Market Breakdown rows found in this session.")
+
+    st.subheader("Manual Alert Plan CSV")
+    st.caption("Template only. Fill values you manually verify. Nothing is written to disk.")
+    st.code(alert_plan_template_csv(["SPY"]), language="csv")
+    pasted = st.text_area("Manual Alert Plan CSV", height=180, key="manual_alert_plan_csv")
+    if st.button("Parse Alert Plan CSV"):
+        rows, errors = parse_alert_plan_csv(pasted)
+        st.session_state.alert_plan_errors = errors
+        if rows:
+            st.session_state.alert_plan_rows = rows
+        if errors:
+            st.error("Alert plan CSV needs repair before use.")
+            for error in errors:
+                st.write(f"- {error}")
+        elif rows:
+            st.success("Alert plan rows parsed into session memory.")
+
+    rows = st.session_state.get("alert_plan_rows", [])
+    errors = st.session_state.get("alert_plan_errors", [])
+    if errors:
+        st.subheader("Alert Plan Repair")
+        for error in errors:
+            st.write(f"- {error}")
+    if not rows:
+        st.info("Build from Chart Workspace, build from Market Breakdown, or paste the manual Alert Plan CSV.")
+    else:
+        normalized_rows = [normalize_alert_plan_row(row) for row in rows if isinstance(row, dict)]
+        summary = alert_plan_status_summary(normalized_rows)
+        st.subheader("Alert Plan Summary")
+        metric_columns = st.columns(4)
+        for index, (label, value) in enumerate(
+            [
+                ("Total", summary.get("total", 0)),
+                ("Needs chart confirmation", summary.get("needs_chart_confirmation", 0)),
+                ("Ready for manual alert", summary.get("ready_for_manual_alert", 0)),
+                ("Draft", summary.get("draft", 0)),
+            ]
+        ):
+            metric_columns[index % 4].metric(label, value)
+
+        st.subheader("Alert Plan Cards")
+        for row in normalized_rows:
+            _render_alert_plan_card(st, row)
+
+    st.subheader("Decision Support Checklist")
+    for item in [
+        "Chart confirmation complete.",
+        "Support/resistance level marked.",
+        "Invalidation clear.",
+        "Risk/reward acceptable.",
+        "Macro/fundamental context not conflicting.",
+        "No earnings/catalyst surprise unchecked.",
+        "Manual final confirmation required.",
+    ]:
+        st.write(f"- {item}")
+
+    st.subheader("Stop Conditions")
+    for item in [
+        "Alert trigger is stale.",
+        "Support/resistance invalidated.",
+        "Macro/fundamental context changed.",
+        "Chart disagrees across timeframes.",
+        "User is unsure/rushed.",
+        "Broker/order/payment/alert screen appears unexpectedly.",
+    ]:
+        st.write(f"- {item}")
+
+
 def _show_live_data_readonly(st: Any) -> None:
     st.warning(LIVE_DATA_READONLY_WARNING)
     st.write("This tab can prepare import rows from a market-data provider when configured.")
@@ -2532,6 +2705,7 @@ def _show_help_safety(st: Any) -> None:
         "Fetches read-only market data when Polygon is configured.",
         "Creates import rows for the advanced workflow.",
         "Explains dashboard reads in plain English.",
+        "Drafts manual alert plans for chart-confirmed setups.",
         "Helps calibration and review notes stay organized.",
     ]:
         st.write(f"- {item}")
@@ -2552,8 +2726,10 @@ def _show_help_safety(st: Any) -> None:
         "2. Use Live Data or manual import.",
         "3. Confirm Blocking issues = 0.",
         "4. Read Market Breakdown.",
-        "5. Verify chart manually.",
-        "6. Use Calibration Review if tracking accuracy.",
+        "5. Capture chart notes in Chart Workspace.",
+        "6. Draft manual alert ideas in Alert Planner if useful.",
+        "7. Verify chart manually.",
+        "8. Use Calibration Review if tracking accuracy.",
     ]:
         st.write(step)
 
@@ -2905,6 +3081,8 @@ def streamlit_dashboard(path: Path = DEFAULT_DATA) -> None:
                 _show_market_breakdown(st)
             elif name == "Chart Workspace":
                 _show_chart_workspace(st)
+            elif name == "Alert Planner":
+                _show_alert_planner(st)
             elif name == "Daily Review":
                 _show_daily_review(st, rows, sections)
             elif name == "Live Data — Read Only":
