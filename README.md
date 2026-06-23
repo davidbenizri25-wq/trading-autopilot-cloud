@@ -1,4 +1,4 @@
-# Trading Autopilot v1.5.1-wow-ui-alert-planner-polish-dev
+# Trading Autopilot v1.5.2-mobile-first-run-one-click-review-dev
 
 Trading Autopilot is a decision-support dashboard for scanner ranking, watchlist review, helper levels, review planning, and journaling.
 
@@ -26,6 +26,8 @@ python3 tools/generate_pine_levels.py
 - `Market Breakdown` tab: enter a watchlist and get plain-English breakdown cards with bias, confidence, trend, momentum, levels, risk flags, and next action.
 - `Chart Workspace` tab: capture manual TradingView chart review notes, multi-timeframe levels, fundamentals, and macro context.
 - `Alert Planner` tab: draft manual TradingView alert plans and message text without creating live alerts.
+- `Send to Review Engine`: session-only handoff from Home, Market Breakdown, Chart Workspace, or Live Data into validation and Daily Review.
+- `Review Engine Paste Box`: beginner-friendly name for the technical TradingView Import path.
 - Beginner mode is the default and shows only the core daily-use tabs.
 - Advanced mode preserves every technical review tab.
 - `Help / Safety` tab explains what to click, when to stop, and what the app never does.
@@ -70,6 +72,7 @@ python3 tools/generate_pine_levels.py
 - Post-deploy operator checklist: `docs/post_deploy_operator_checklist.md`.
 - Product UI guide: `docs/product_ui.md`.
 - Wow UI product polish: `docs/wow_ui_product_polish.md`.
+- Mobile first-run one-click review: `docs/mobile_first_run_one_click_review.md`.
 - Market Breakdown mobile polish: `docs/market_breakdown_mobile_polish.md`.
 - TradingView Chart Workspace guide: `docs/tradingview_chart_workspace.md`.
 - Alert Planner guide: `docs/alert_planner.md`.
@@ -86,8 +89,9 @@ python3 tools/generate_pine_levels.py
 - Home includes watchlist input, timeframe selector, Analyze Live Market Data, and the compatibility phrase Analyze with Polygon.
 - Home shows `Live data connected: Polygon` or `Live data not connected`.
 - Live data is not connected means you can still use Sample data or manual import.
-- Home-generated CSV says: Copy this into TradingView Import to unlock Daily Review / Calibration Results.
-- Beginner translation explains TradingView Import = Review Engine paste box.
+- Home-generated rows can use `Send to Review Engine` to unlock Daily Review / Calibration Results without manual copy/paste.
+- Beginner translation explains TradingView Import = Review Engine Paste Box.
+- Review Engine Status shows whether session rows are loaded, source, blocking issues, and next step.
 - Home tab exists.
 - Market Breakdown tab exists.
 - Chart Workspace tab exists.
@@ -127,16 +131,16 @@ python3 tools/generate_pine_levels.py
 - Provider setup notes: `docs/market_data_provider_setup.md`.
 - v1.1.3 hardens provider diagnostics for placeholder keys, HTTP-like 401/403/429/400 errors, and secret redaction.
 - v1.1.4 confirms Polygon provider smoke passed for SPY 1D and SPY 15m.
-- If provider CSV generates, paste it into TradingView Import and continue with Daily Review.
+- If provider rows generate, use `Send to Review Engine` or paste into the Review Engine Paste Box and continue with Daily Review.
 - If provider fetch fails later, use the EXAMPLE fallback and check provider diagnostics.
 - Market Breakdown can use the same read-only Polygon provider to create watchlist analysis cards.
 - Market Breakdown shows bias/confidence/trend/momentum/level/risk explanations.
 - Provider rows include provider-derived support/resistance from recent highs/lows when possible.
 - Provider-derived support/resistance is read-only context only and must be verified manually.
 - TradingView Import CSV remains an optional advanced/debug bridge.
-- Advanced CSV bridge is optional; most users can ignore it unless they are doing validation/calibration.
+- Advanced copy/paste table text is optional; most users can ignore it unless they are doing validation/calibration.
 - Home shows Live Data as a simple product feature while preserving advanced tabs.
-- Home can generate Market Breakdown cards and a TradingView Import CSV from read-only Polygon data.
+- Home can generate Market Breakdown cards and Send to Review Engine from read-only Polygon data.
 - No broker/order/alert/payment automation.
 - No TradingView scraping or sync.
 - Do not commit API keys.
@@ -168,7 +172,7 @@ python3 tools/generate_pine_levels.py
 - Alert Planner uses decision-support cards and final manual confirmation reminders.
 - Fields include ticker, timeframe, setup bias, setup type, trigger, invalidation, targets, risk/reward note, chart confirmation, fundamentals context, macro context, news catalyst, volume confirmation, manual notes, and status.
 - Alert Planner can build draft rows from Chart Workspace or Market Breakdown session rows.
-- Alert Planner includes a Manual Alert Plan CSV template and parser.
+- Alert Planner includes a Quick Draft Alert Plan form and an advanced Manual Alert Plan CSV template/parser.
 - Alert message drafts include `Decision support only. Verify chart manually. No orders.`
 - Copy alert message drafts manually only after chart confirmation and final user approval.
 - Pine helper source: `tradingview/trading_autopilot_chart_helper_v150.pine`.

@@ -97,7 +97,7 @@ from tools.validate_candidates import ALL_CANDIDATE_COLUMNS, validate_candidate_
 from shares_filter import filter_share_candidates
 
 
-APP_VERSION = "1.5.1-wow-ui-alert-planner-polish-dev"
+APP_VERSION = "1.5.2-mobile-first-run-one-click-review-dev"
 SAMPLE_WARNING = "SAMPLE/EXAMPLE DATA ONLY — NOT LIVE MARKET DATA"
 LEGACY_SAMPLE_WARNING = "SAMPLE DATA ONLY — NOT LIVE MARKET DATA"
 USER_SUPPLIED_WARNING = "USER-SUPPLIED DATA — VERIFY MANUALLY BEFORE ANY TRADING DECISION"
@@ -1595,31 +1595,80 @@ def _require_streamlit_access(st: Any) -> None:
 
 def _streamlit_candidate_source(st: Any, initial_path: Path) -> tuple[str, Path | None, list[dict[str, Any]], bool]:
     initial_path = _resolve_path(initial_path)
-    if initial_path.name == "sample_candidates.csv":
-        index = 0
+    source_options = [
+        "Sample data",
+        "real_candidates_template.csv",
+        _review_engine_label(),
+        "Upload CSV",
+        "Paste CSV",
+        "TradingView Import",
+        "Manual Entry",
+        "Custom CSV path",
+    ]
+    if _has_review_engine_session_rows(st):
+        source_options.insert(2, "Review Engine Session")
+
+    if _has_review_engine_session_rows(st):
+        default_source = "Review Engine Session"
+    elif initial_path.name == "sample_candidates.csv":
+        default_source = "Sample data"
     elif initial_path.name == "real_candidates_template.csv":
-        index = 1
+        default_source = "real_candidates_template.csv"
     else:
-        index = 6
+        default_source = "Custom CSV path"
+
+    if st.session_state.get("candidate_source") not in source_options:
+        st.session_state.candidate_source = default_source
 
     source = st.sidebar.radio(
         "Candidate source",
-        [
-            "Sample data",
-            "real_candidates_template.csv",
-            "Upload CSV",
-            "Paste CSV",
-            "TradingView Import",
-            "Manual Entry",
-            "Custom CSV path",
-        ],
-        index=index,
+        source_options,
+        key="candidate_source",
     )
     st.session_state.tradingview_import_errors = []
     if source == "Sample data":
         return source, DEFAULT_DATA, _load(DEFAULT_DATA), False
     if source == "real_candidates_template.csv":
         return source, TEMPLATE_DATA, _load(TEMPLATE_DATA), False
+    if source == "Review Engine Session":
+        import_text = _current_review_engine_csv(st)
+        st.sidebar.success("Session rows loaded from Send to Review Engine.")
+        st.sidebar.caption(f"Source: {st.session_state.get('review_engine_source_label', 'session')}")
+        if st.sidebar.button("Clear Review Engine Session"):
+            st.session_state.review_engine_csv = ""
+            st.session_state.review_engine_source_label = ""
+            st.session_state.review_engine_loaded = False
+            st.session_state.candidate_source = _review_engine_label()
+            st.rerun()
+        if not import_text.strip():
+            st.info("No Review Engine session rows are loaded yet.")
+            st.stop()
+        try:
+            import_rows = _parse_tradingview_import_text(import_text)
+        except TradingViewImportParseError as exc:
+            st.session_state.tradingview_import_errors = exc.errors
+            import_rows = exc.rows
+        else:
+            st.session_state.tradingview_import_errors = []
+        return "Review Engine Session", None, import_rows, True
+    if source == _review_engine_label():
+        st.sidebar.caption("Paste copy/paste table text here. This is the beginner-friendly TradingView Import path.")
+        with st.sidebar.expander("Supported table fields", expanded=False):
+            for column in TRADINGVIEW_IMPORT_SUPPORTED_COLUMNS:
+                st.write(f"- {column}")
+        st.sidebar.code(TRADINGVIEW_IMPORT_EXAMPLE, language="csv")
+        import_text = st.sidebar.text_area(_review_engine_label(), height=180)
+        if not import_text.strip():
+            st.info("Paste rows into the Review Engine Paste Box to start review.")
+            st.stop()
+        try:
+            import_rows = _parse_tradingview_import_text(import_text)
+        except TradingViewImportParseError as exc:
+            st.session_state.tradingview_import_errors = exc.errors
+            import_rows = exc.rows
+        else:
+            st.session_state.tradingview_import_errors = []
+        return _review_engine_label(), None, import_rows, True
     if source == "Upload CSV":
         uploaded = st.sidebar.file_uploader("Upload CSV", type=["csv"])
         if uploaded is None:
@@ -1663,7 +1712,8 @@ def _streamlit_candidate_source(st: Any, initial_path: Path) -> tuple[str, Path 
             st.session_state.manual_candidates = []
         manual_rows = list(st.session_state.manual_candidates)
         return "Manual Entry", None, manual_rows, True
-    custom_path = st.sidebar.text_input("Custom CSV path", value=str(initial_path if index == 6 else WORKING_DATA))
+    custom_default = initial_path if default_source == "Custom CSV path" else WORKING_DATA
+    custom_path = st.sidebar.text_input("Custom CSV path", value=str(custom_default))
     path = _resolve_path(custom_path)
     return str(path), path, _load(path), True
 
@@ -1682,12 +1732,13 @@ def _streamlit_warning_lines(path: Path | None, user_supplied: bool) -> list[str
 
 
 def _show_tradingview_import_repair(st: Any, source_label: str) -> None:
-    if source_label != "TradingView Import":
+    if source_label not in {"TradingView Import", _review_engine_label(), "Review Engine Session"}:
         return
     errors = list(st.session_state.get("tradingview_import_errors", []))
     if not errors:
         return
-    st.subheader("TradingView Import Repair")
+    st.subheader("Review Engine Paste Box Repair")
+    st.caption("TradingView Import Repair is the advanced technical name for this helper.")
     st.error("Fix the import rows below, then paste again.")
     for error in errors:
         st.write(f"- {error}")
@@ -1935,13 +1986,117 @@ def _render_safety_strip(st: Any) -> None:
 
 def _beginner_term_help() -> list[dict[str, str]]:
     return [
-        {"term": "TradingView Import", "plain": "Review Engine paste box", "meaning": "Paste rows into the dashboard review engine."},
+        {"term": "TradingView Import", "plain": "Review Engine Paste Box", "meaning": "Paste rows into the dashboard review engine."},
         {"term": "CSV", "plain": "copy/paste table text", "meaning": "A simple text table you can copy between sections."},
-        {"term": "Calibration", "plain": "compare reads", "meaning": "Compare the dashboard read with your manual chart read."},
-        {"term": "Blocking issue", "plain": "fix before reviewing", "meaning": "A missing or invalid field that must be repaired first."},
-        {"term": "Alert Planner", "plain": "draft reminder plan", "meaning": "A manual draft only. No live alert is created."},
+        {"term": "Calibration", "plain": "Accuracy Review", "meaning": "Compare the dashboard read with your manual chart read."},
+        {"term": "Blocking issue", "plain": "fix-before-review problem", "meaning": "A missing or invalid field that must be repaired first."},
+        {"term": "Alert Planner", "plain": "draft reminder planner", "meaning": "A manual draft only. No live alert is created."},
+        {"term": "Pine helper", "plain": "chart value helper", "meaning": "A manual helper for chart values. It does not create alerts."},
         {"term": "Chart Workspace", "plain": "manual chart notes", "meaning": "Where you capture support, resistance, bias, and context."},
     ]
+
+
+def _review_engine_label() -> str:
+    return "Review Engine Paste Box"
+
+
+def _current_review_engine_csv(st: Any) -> str:
+    return str(st.session_state.get("review_engine_csv", "") or "").strip()
+
+
+def _has_review_engine_session_rows(st: Any) -> bool:
+    return bool(_current_review_engine_csv(st))
+
+
+def _send_rows_to_review_session(st: Any, csv_text: str, source_label: str) -> None:
+    clean_csv = str(csv_text or "").strip()
+    if not clean_csv:
+        return
+    st.session_state.review_engine_csv = clean_csv
+    st.session_state.review_engine_source_label = str(source_label or "Session Rows").strip() or "Session Rows"
+    st.session_state.review_engine_loaded = True
+    st.session_state.candidate_source = "Review Engine Session"
+
+
+def review_engine_status_summary(
+    rows: list[dict[str, Any]],
+    validation_errors: list[str],
+    validation_warnings: list[str],
+    source_label: str,
+) -> dict[str, Any]:
+    source = str(source_label or "").strip() or "unknown"
+    session_loaded = source == "Review Engine Session"
+    row_count = len(rows)
+    blocking_count = len(validation_errors)
+    if blocking_count:
+        next_step = "Fix blocking issues"
+    elif row_count:
+        next_step = "Open Daily Review / Calibration Results"
+    else:
+        next_step = "Analyze Live Market Data"
+    return {
+        "session_rows_loaded": "yes" if session_loaded and row_count else "no",
+        "source": source,
+        "row_count": row_count,
+        "blocking_issues": blocking_count,
+        "warnings": len(validation_warnings),
+        "next_step": next_step,
+        "ready_for_review": bool(row_count and not blocking_count),
+    }
+
+
+def _show_review_engine_status(
+    st: Any,
+    rows: list[dict[str, Any]],
+    validation_errors: list[str],
+    validation_warnings: list[str],
+    source_label: str,
+) -> None:
+    status = review_engine_status_summary(rows, validation_errors, validation_warnings, source_label)
+    st.subheader("Review Engine Status")
+    columns = st.columns(4)
+    columns[0].metric("Session rows loaded", status["session_rows_loaded"])
+    columns[1].metric("Source", status["source"])
+    columns[2].metric("Blocking issues", status["blocking_issues"])
+    columns[3].metric("Next step", status["next_step"])
+    if status["ready_for_review"]:
+        st.success("Rows are ready for Daily Review. Manual chart confirmation still applies.")
+    elif status["blocking_issues"]:
+        st.error("Fix blocking issues before Daily Review.")
+    else:
+        st.info("Start with Live Market Data, Market Breakdown, Chart Workspace, or the Review Engine Paste Box.")
+
+
+def _show_review_engine_explainer(st: Any) -> None:
+    st.subheader("Review Engine Paste Box")
+    st.write("Friendly name: Review Engine Paste Box.")
+    st.write("Technical name: TradingView Import.")
+    st.write("What it means: copy/paste table text goes through the same validation engine as the advanced import workflow.")
+    st.write("Nothing is written to disk. Nothing is downloaded. No orders or alerts are created.")
+
+
+def _show_start_review_flow(st: Any, provider: str, config: dict[str, str], config_errors: list[str]) -> None:
+    provider_text = _plain_live_data_provider_status(provider, config_errors)
+    st.subheader("Start Review")
+    st.caption("Analyze live market data, read plain-English cards, then send rows into the Review Engine.")
+    steps = [
+        ("Enter tickers", "Start with SPY, QQQ, AAPL or your watchlist."),
+        ("Choose timeframe", "1D is the default first-run view."),
+        ("Analyze Live Market Data", "Use read-only Polygon data when connected."),
+        ("Read cards", "Review bias, trend, momentum, levels, and risk flags."),
+        ("Send rows to Review Engine", "Load rows into validation without manual copy/paste."),
+        ("Open Daily Review / Calibration Results", "Check status, labels, and accuracy review."),
+    ]
+    for start in range(0, len(steps), 3):
+        columns = st.columns(3)
+        for offset, (title, body) in enumerate(steps[start : start + 3], start=start + 1):
+            with columns[offset - start - 1]:
+                _render_step_card(st, offset, title, body)
+    if provider_text.endswith("Polygon"):
+        st.success(provider_text)
+    else:
+        st.info("Live data is not connected. You can still use Sample data or manual import.")
+    _show_review_engine_explainer(st)
 
 
 def _render_product_card(st: Any, title: str, body: str, status: str = "info") -> None:
@@ -1968,7 +2123,7 @@ def _plain_live_data_provider_status(provider: str, config_errors: list[str]) ->
     return "Live data not connected"
 
 
-def _show_product_home(st: Any, rows: list[dict[str, Any]], sections: dict[str, list[dict[str, Any]]]) -> None:
+def _show_product_home(st: Any, rows: list[dict[str, Any]], sections: dict[str, list[dict[str, Any]]], source_label: str) -> None:
     validation_errors, validation_warnings = validate_candidate_rows(rows, ALL_CANDIDATE_COLUMNS)
     calibration_rows = _current_session_calibration_rows(st)
     batch_rows = _calibration_batch_log_rows(st)
@@ -1993,19 +2148,7 @@ def _show_product_home(st: Any, rows: list[dict[str, Any]], sections: dict[str, 
         provider_text,
     )
     _render_safety_strip(st)
-
-    st.subheader("Start Review")
-    step_columns = st.columns(5)
-    steps = [
-        ("Analyze live market data", "Use read-only Polygon rows to see what the market data says."),
-        ("Read Market Breakdown cards", "Review bias, trend, momentum, levels, and caution flags."),
-        ("Confirm chart levels", "Use Chart Workspace for support, resistance, bias, and context notes."),
-        ("Draft alert plan", "Use Alert Planner for manual draft reminders. Nothing is created."),
-        ("Review Daily / Calibration", "Paste rows into the Review Engine when you want validation and tracking."),
-    ]
-    for index, (title, body) in enumerate(steps, start=1):
-        with step_columns[index - 1]:
-            _render_step_card(st, index, title, body)
+    _show_start_review_flow(st, provider, config, config_errors)
 
     st.subheader("Beginner actions")
     action_columns = st.columns(5)
@@ -2039,6 +2182,8 @@ def _show_product_home(st: Any, rows: list[dict[str, Any]], sections: dict[str, 
     for index, (label, value) in enumerate(metrics):
         metric_columns[index % 3].metric(label, value)
 
+    _show_review_engine_status(st, rows, validation_errors, validation_warnings, source_label)
+
     status_columns = st.columns(3)
     status_columns[0].metric("Ready status", summary["ready_status"])
     status_columns[1].metric("Review Next", product_next_best_action(summary))
@@ -2064,10 +2209,10 @@ def _show_product_home(st: Any, rows: list[dict[str, Any]], sections: dict[str, 
                 "success" if str(card.get("state", "")).lower() in {"alert", "priority_watch"} else "info",
             )
     else:
-        st.info("No review cards yet. Start with Live Market Data, Market Breakdown, or TradingView Import.")
+        st.info("No review cards yet. Start with Live Market Data, Market Breakdown, or the Review Engine Paste Box.")
 
     st.subheader("Beginner translation")
-    st.caption("TradingView Import = Review Engine paste box.")
+    st.caption("TradingView Import = Review Engine Paste Box.")
     st.table(_beginner_term_help())
 
     st.subheader("Beginner help")
@@ -2091,7 +2236,7 @@ def _show_product_home(st: Any, rows: list[dict[str, Any]], sections: dict[str, 
         st.write(f"- {item}")
 
 
-def _show_daily_review(st: Any, rows: list[dict[str, Any]], sections: dict[str, list[dict[str, Any]]]) -> None:
+def _show_daily_review(st: Any, rows: list[dict[str, Any]], sections: dict[str, list[dict[str, Any]]], source_label: str) -> None:
     st.warning(DAILY_REVIEW_WARNING)
 
     validation_errors, validation_warnings = validate_candidate_rows(rows, ALL_CANDIDATE_COLUMNS)
@@ -2134,6 +2279,8 @@ def _show_daily_review(st: Any, rows: list[dict[str, Any]], sections: dict[str, 
     for index, (label, value) in enumerate(metrics):
         metric_columns[index % 3].metric(label, value)
 
+    _show_review_engine_status(st, rows, validation_errors, validation_warnings, source_label)
+
     st.subheader("Next Best Action")
     next_action = daily_review_next_action(status_summary)
     if status_summary["ready_for_review"]:
@@ -2143,10 +2290,10 @@ def _show_daily_review(st: Any, rows: list[dict[str, Any]], sections: dict[str, 
 
     st.subheader("60-second workflow")
     for step in [
-        "1. Import/paste one ticker or batch.",
+        "1. Use Send to Review Engine or paste into the Review Engine Paste Box.",
         "2. Confirm Blocking issues = 0.",
         "3. Review Top Review Summary.",
-        "4. Open Calibration Results.",
+        "4. Open Accuracy Review (Calibration Results).",
         "5. Apply labels with Calibration Labels CSV.",
         "6. Add to Calibration Batch Log.",
         "7. Open Calibration Review.",
@@ -2422,15 +2569,21 @@ def _show_home_live_market_data(st: Any, provider: str, config: dict[str, str], 
         generated_csv = st.session_state.get("home_live_market_csv", "")
         if generated_csv:
             st.subheader("Copy into Review Engine")
-            st.success("Copy this into TradingView Import to unlock Daily Review / Calibration Results.")
-            st.caption("Next: choose TradingView Import in the sidebar and paste this text. TradingView Import = Review Engine paste box.")
-            st.code(generated_csv, language="csv")
+            st.success("Rows are ready. Send them to the Review Engine to unlock Daily Review / Calibration Results.")
+            if st.button("Send to Review Engine", type="primary", key="home_send_to_review_engine"):
+                _send_rows_to_review_session(st, generated_csv, "Live Market Data")
+                st.success("Rows sent to the Review Engine. Opening the session review source.")
+                st.rerun()
+            with st.expander("Advanced: copy/paste table text", expanded=False):
+                st.caption("Optional bridge. TradingView Import = Review Engine Paste Box.")
+                st.code(generated_csv, language="csv")
 
     with st.expander("What should I click?", expanded=True):
         st.write("- Want live cards? Start with Live Market Data.")
         st.write("- Want chart notes? Chart Workspace.")
         st.write("- Want alert ideas? Alert Planner.")
-        st.write("- Want daily rows? TradingView Import / Daily Review. TradingView Import = Review Engine paste box.")
+        st.write("- Want daily rows? Send to Review Engine, then open Daily Review.")
+        st.write("- Technical name: TradingView Import = Review Engine Paste Box.")
         st.write("- Want calibration? Calibration Results / Review.")
 
 
@@ -2447,7 +2600,7 @@ def _show_market_breakdown(st: Any) -> None:
     status_columns[0].metric("Provider status", "missing" if provider != "disabled" and config_errors else provider)
     status_columns[1].metric("Mode", "Read-only")
     if provider == "disabled":
-        st.info("Polygon is not configured. Use EXAMPLE mode or manual TradingView Import.")
+        st.info("Polygon is not configured. Use EXAMPLE mode or the Review Engine Paste Box.")
     elif config_errors:
         st.error("Provider is configured but not ready.")
         for error in config_errors:
@@ -2520,13 +2673,22 @@ def _show_market_breakdown(st: Any) -> None:
         _render_breakdown_card(st, row)
 
     generated_csv = st.session_state.get("market_breakdown_import_csv", "")
-    with st.expander("Advanced CSV bridge — optional"):
-        st.caption("Most users can ignore this. It is for copying rows into the Review Engine paste box.")
-        st.caption("TradingView Import = Review Engine paste box.")
+    if generated_csv:
+        st.subheader("Send to Review")
+        st.caption("Load these rows into Candidate Validation, Daily Review, and Calibration Results without copy/paste.")
+        if st.button("Send to Review Engine", type="primary", key="market_breakdown_send_to_review_engine"):
+            _send_rows_to_review_session(st, generated_csv, "Market Breakdown")
+            st.success("Rows sent to the Review Engine. Opening the session review source.")
+            st.rerun()
+
+    with st.expander("Advanced: TradingView Import CSV", expanded=False):
+        st.caption("Advanced CSV bridge — optional")
+        st.caption("Most users can ignore this. It is for copying rows into the Review Engine Paste Box.")
+        st.caption("TradingView Import = Review Engine Paste Box.")
         if generated_csv:
             st.code(generated_csv, language="csv")
         else:
-            st.info("No CSV generated yet.")
+            st.info("No copy/paste table text generated yet.")
 
 
 def _manual_chart_review_row_from_streamlit(st: Any, default_timeframe: str) -> dict[str, str]:
@@ -2624,7 +2786,7 @@ def _show_chart_workspace(st: Any) -> None:
     ]:
         st.write(f"- {item}")
     st.caption("Examples below are examples only. Replace them with values you manually verify.")
-    st.write("- The bridge sends one execution row per ticker to TradingView Import. Context rows stay here for review.")
+    st.write("- The bridge sends one execution row per ticker to the Review Engine. Context rows stay here for review.")
     st.write("- Stop if a broker, order, alert, publish, payment, or credential screen appears.")
 
     st.subheader("Chart Review CSV Template")
@@ -2698,12 +2860,20 @@ def _show_chart_workspace(st: Any) -> None:
     ordered_rows = [{column: row.get(column, "") for column in CHART_REVIEW_COLUMNS} for row in normalized_rows]
     st.table(ordered_rows)
 
-    st.subheader("TradingView Import Bridge")
+    st.subheader("Review Engine Bridge")
+    bridge_csv = chart_review_rows_to_tradingview_import_csv(normalized_rows)
+    st.caption("TradingView Import Bridge remains available as the advanced technical path.")
     st.caption(
-        "Copy this into TradingView Import if you want validation, Daily Review, and Calibration. "
+        "Send this into the Review Engine if you want validation, Daily Review, and Accuracy Review. "
         "The bridge keeps one execution row per ticker, preferring 15m. Higher-timeframe rows remain Chart Workspace context."
     )
-    st.code(chart_review_rows_to_tradingview_import_csv(normalized_rows), language="csv")
+    if st.button("Send to Review Engine", type="primary", key="chart_workspace_send_to_review_engine"):
+        _send_rows_to_review_session(st, bridge_csv, "Chart Workspace")
+        st.success("Chart Workspace rows sent to the Review Engine.")
+        st.rerun()
+    with st.expander("Advanced: Review Engine Paste Box text", expanded=False):
+        st.caption("Technical name: TradingView Import CSV.")
+        st.code(bridge_csv, language="csv")
     st.warning("Manual chart confirmation is still required. Do not place orders from this app.")
 
 
@@ -2815,21 +2985,78 @@ def _show_alert_planner(st: Any) -> None:
             else:
                 st.info("No Market Breakdown rows found in this session.")
 
-    st.subheader("Manual Alert Plan CSV")
-    st.caption("Template only. Fill values you manually verify. Nothing is written to disk.")
-    st.code(alert_plan_template_csv(["SPY"]), language="csv")
-    pasted = st.text_area("Manual Alert Plan CSV", height=180, key="manual_alert_plan_csv")
-    if st.button("Parse Alert Plan CSV"):
-        rows, errors = parse_alert_plan_csv(pasted)
-        st.session_state.alert_plan_errors = errors
-        if rows:
+    st.subheader("Quick Draft Alert Plan")
+    st.caption("Manual draft only. This is not a live alert. This is not a trade. You manually decide later.")
+    with st.form("quick_draft_alert_plan", clear_on_submit=False):
+        ticker = st.text_input("ticker", value="", key="quick_alert_ticker")
+        timeframe = st.selectbox("timeframe", options=["15m", "1h", "4h", "1D"], index=0, key="quick_alert_timeframe")
+        setup_bias = st.selectbox(
+            "setup_bias",
+            options=["unclear", "bullish", "bearish", "neutral", "mixed"],
+            index=0,
+            key="quick_alert_setup_bias",
+        )
+        setup_type = st.selectbox(
+            "setup_type",
+            options=["watch_only", "breakout", "breakdown", "pullback", "reversal", "continuation", "unclear"],
+            index=0,
+            key="quick_alert_setup_type",
+        )
+        trigger_level = st.text_input("trigger_level", value="", key="quick_alert_trigger_level")
+        invalidation_level = st.text_input("invalidation_level", value="", key="quick_alert_invalidation_level")
+        target_1 = st.text_input("target_1", value="", key="quick_alert_target_1")
+        target_2 = st.text_input("target_2", value="", key="quick_alert_target_2")
+        chart_confirmation = st.selectbox(
+            "chart_confirmation",
+            options=["needs_manual_confirmation", "yes", "confirmed"],
+            index=0,
+            key="quick_alert_chart_confirmation",
+        )
+        fundamentals_context = st.text_area("fundamentals_context", value="", height=70, key="quick_alert_fundamentals_context")
+        macro_context = st.text_area("macro_context", value="", height=70, key="quick_alert_macro_context")
+        manual_notes = st.text_area("manual_notes", value="", height=80, key="quick_alert_manual_notes")
+        quick_submitted = st.form_submit_button("Create Draft Alert Plan")
+    if quick_submitted:
+        if not str(ticker or "").strip():
+            st.warning("Enter a ticker before creating a draft alert plan.")
+        else:
+            quick_row = normalize_alert_plan_row(
+                {
+                    "ticker": ticker,
+                    "timeframe": timeframe,
+                    "setup_bias": setup_bias,
+                    "setup_type": setup_type,
+                    "trigger_level": trigger_level,
+                    "invalidation_level": invalidation_level,
+                    "target_1": target_1,
+                    "target_2": target_2,
+                    "chart_confirmation": chart_confirmation,
+                    "fundamentals_context": fundamentals_context,
+                    "macro_context": macro_context,
+                    "manual_notes": manual_notes or "quick draft alert plan; verify chart manually; no orders",
+                }
+            )
+            rows = [row for row in st.session_state.get("alert_plan_rows", []) if isinstance(row, dict)]
+            rows.append(quick_row)
             st.session_state.alert_plan_rows = rows
-        if errors:
-            st.error("Alert plan CSV needs repair before use.")
-            for error in errors:
-                st.write(f"- {error}")
-        elif rows:
-            st.success("Alert plan rows parsed into session memory.")
+            st.session_state.alert_plan_errors = []
+            st.success("Quick draft alert plan created in session memory. No live alert was created.")
+
+    with st.expander("Advanced: paste alert-plan table text", expanded=False):
+        st.caption("Template only. Fill values you manually verify. Nothing is written to disk.")
+        st.code(alert_plan_template_csv(["SPY"]), language="csv")
+        pasted = st.text_area("Manual Alert Plan CSV", height=180, key="manual_alert_plan_csv")
+        if st.button("Parse Alert Plan CSV"):
+            rows, errors = parse_alert_plan_csv(pasted)
+            st.session_state.alert_plan_errors = errors
+            if rows:
+                st.session_state.alert_plan_rows = rows
+            if errors:
+                st.error("Alert plan table text needs repair before use.")
+                for error in errors:
+                    st.write(f"- {error}")
+            elif rows:
+                st.success("Alert plan rows parsed into session memory.")
 
     rows = st.session_state.get("alert_plan_rows", [])
     errors = st.session_state.get("alert_plan_errors", [])
@@ -2838,7 +3065,7 @@ def _show_alert_planner(st: Any) -> None:
         for error in errors:
             st.write(f"- {error}")
     if not rows:
-        st.info("Build from Chart Workspace, build from Market Breakdown, or paste the manual Alert Plan CSV.")
+        st.info("Build from Chart Workspace, build from Market Breakdown, create a Quick Draft Alert Plan, or use the advanced table-text parser.")
     else:
         normalized_rows = [normalize_alert_plan_row(row) for row in rows if isinstance(row, dict)]
         summary = alert_plan_status_summary(normalized_rows)
@@ -2924,7 +3151,7 @@ def _show_live_data_readonly(st: Any) -> None:
 
     st.subheader("Generate read-only rows")
     st.write("Copy into Review Engine, confirm Blocking issues = 0, then verify chart manually.")
-    st.caption("TradingView Import = Review Engine paste box.")
+    st.caption("TradingView Import = Review Engine Paste Box.")
     st.caption("No orders are created. Data is not persisted, downloaded, or auto-refreshed.")
 
     tickers_text = st.text_area("Tickers to fetch", height=100, key="readonly_market_data_tickers")
@@ -2952,16 +3179,22 @@ def _show_live_data_readonly(st: Any) -> None:
 
     generated_csv = st.session_state.get("readonly_market_data_csv", "")
     if generated_csv:
-        st.subheader("Generated TradingView Import CSV")
-        st.success("Provider CSV generated successfully.")
-        st.write("- Next: choose TradingView Import in the sidebar and paste this text.")
-        st.write("- TradingView Import = Review Engine paste box.")
+        st.subheader("Generated Review Engine Rows")
+        st.success("Provider rows generated successfully.")
+        st.success("Provider CSV generated successfully. Rows are ready for the Review Engine.")
+        if st.button("Send to Review Engine", type="primary", key="readonly_send_to_review_engine"):
+            _send_rows_to_review_session(st, generated_csv, "Live Data — Read Only")
+            st.success("Rows sent to the Review Engine.")
+            st.rerun()
+        st.write("- Next: Send to Review Engine or choose Review Engine Paste Box in the sidebar.")
+        st.write("- Technical name: TradingView Import = Review Engine Paste Box.")
         st.write("- Then confirm Blocking issues = 0.")
         st.write("- Then use Daily Review / Calibration Results.")
         st.write("- Verify chart manually before any decision.")
         st.write("- No orders are created.")
-        st.code(generated_csv, language="csv")
-        st.caption("Copy this into TradingView Import. Verify charts manually.")
+        with st.expander("Advanced: copy/paste table text", expanded=False):
+            st.code(generated_csv, language="csv")
+        st.caption("Copy this into the Review Engine Paste Box only if you prefer manual copy/paste. Verify charts manually.")
 
 
 def _show_help_safety(st: Any) -> None:
@@ -3004,7 +3237,7 @@ def _show_help_safety(st: Any) -> None:
         st.write(step)
 
     st.subheader("Beginner translation")
-    st.caption("TradingView Import = Review Engine paste box.")
+    st.caption("TradingView Import = Review Engine Paste Box.")
     st.table(_beginner_term_help())
 
     st.subheader("Stop if")
@@ -3309,7 +3542,7 @@ def streamlit_dashboard(path: Path = DEFAULT_DATA) -> None:
         st.caption(f"Candidate source: {source_label}")
     for warning in _streamlit_warning_lines(selected_path, user_supplied):
         st.warning(warning)
-    if source_label == "TradingView Import":
+    if source_label in {"TradingView Import", _review_engine_label(), "Review Engine Session"}:
         st.warning(TRADINGVIEW_IMPORT_WARNING)
     st.caption("Decision support only. No broker connection or order execution.")
     view_mode = st.radio(
@@ -3352,7 +3585,7 @@ def streamlit_dashboard(path: Path = DEFAULT_DATA) -> None:
     for tab, name in zip(tabs, tab_names):
         with tab:
             if name == "Home":
-                _show_product_home(st, rows, sections)
+                _show_product_home(st, rows, sections, source_label)
             elif name == "Market Breakdown":
                 _show_market_breakdown(st)
             elif name == "Chart Workspace":
@@ -3360,7 +3593,7 @@ def streamlit_dashboard(path: Path = DEFAULT_DATA) -> None:
             elif name == "Alert Planner":
                 _show_alert_planner(st)
             elif name == "Daily Review":
-                _show_daily_review(st, rows, sections)
+                _show_daily_review(st, rows, sections, source_label)
             elif name == "Live Data — Read Only":
                 _show_live_data_readonly(st)
             elif name == "Calibration Guide":

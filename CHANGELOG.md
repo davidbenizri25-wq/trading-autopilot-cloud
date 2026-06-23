@@ -1,5 +1,21 @@
 # Changelog
 
+## v1.5.2-mobile-first-run-one-click-review-dev
+
+- Added mobile-first first-run workflow polish.
+- Added clearer Start Review path from Home.
+- Added session-only Send to Review Engine workflow where possible.
+- Added beginner-friendly Review Engine wording for TradingView Import.
+- Reduced CSV-first friction in Beginner mode.
+- Improved Alert Planner manual-entry flow without requiring CSV first.
+- Improved mobile card spacing and next-action guidance.
+- Preserved Advanced mode and existing technical workflows.
+- Preserved existing scoring logic.
+- Preserved read-only market-data behavior.
+- Preserved no broker/order/trade execution.
+- Preserved no automatic TradingView alert creation.
+- Preserved no secrets or real data commits.
+
 ## v1.5.1-wow-ui-alert-planner-polish-dev
 
 - Added a more polished product-style Home experience.
