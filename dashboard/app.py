@@ -48,7 +48,7 @@ from tools.validate_candidates import ALL_CANDIDATE_COLUMNS, validate_candidate_
 from shares_filter import filter_share_candidates
 
 
-APP_VERSION = "1.4.1-chart-workspace-real-session-polish-dev"
+APP_VERSION = "1.4.2-live-market-data-first-run-ux-dev"
 SAMPLE_WARNING = "SAMPLE/EXAMPLE DATA ONLY — NOT LIVE MARKET DATA"
 LEGACY_SAMPLE_WARNING = "SAMPLE DATA ONLY — NOT LIVE MARKET DATA"
 USER_SUPPLIED_WARNING = "USER-SUPPLIED DATA — VERIFY MANUALLY BEFORE ANY TRADING DECISION"
@@ -1174,15 +1174,15 @@ def product_next_best_action(summary: dict[str, Any]) -> str:
     if int(summary.get("candidate_count", 0) or 0) == 0:
         provider = str(summary.get("provider_status", "") or "").strip().lower()
         if provider == "polygon":
-            return "Start with Market Breakdown, then use Chart Workspace for manual levels."
-        return "Start with Market Breakdown EXAMPLE mode, Chart Workspace, or TradingView Import."
+            return "Start with Live Market Data or Market Breakdown."
+        return "Live data is not connected. Use Sample data, manual import, or Market Breakdown EXAMPLE mode."
     if int(summary.get("blocking_issues", 0) or 0) > 0:
         return "Fix blocking validation issues before reviewing."
     provider = str(summary.get("provider_status", "") or "").strip().lower()
     if provider == "disabled":
         return "Manual import works. Add provider secrets only if you want read-only live data."
     if provider == "polygon":
-        return "Live Data is connected. Review Market Breakdown and capture manual chart notes."
+        return "Live data is connected. Review Market Breakdown cards and capture manual chart notes."
     if int(summary.get("calibration_results_rows", 0) or 0) == 0:
         return "Open Calibration Results after importing rows."
     if int(summary.get("batch_log_rows", 0) or 0) == 0:
@@ -1621,8 +1621,11 @@ def _streamlit_warning_lines(path: Path | None, user_supplied: bool) -> list[str
     if user_supplied:
         return [USER_SUPPLIED_WARNING]
     if path is None:
-        return [SAMPLE_WARNING]
-    return _warning_lines(path)
+        return [SAMPLE_WARNING, "To use live market data, open Market Breakdown or Live Data — Read Only."]
+    lines = _warning_lines(path)
+    if path.name in SAMPLE_DATA_NAMES:
+        lines.append("To use live market data, open Market Breakdown or Live Data — Read Only.")
+    return lines
 
 
 def _show_tradingview_import_repair(st: Any, source_label: str) -> None:
@@ -1691,6 +1694,13 @@ def _render_product_card(st: Any, title: str, body: str, status: str = "info") -
         """,
         unsafe_allow_html=True,
     )
+
+
+def _plain_live_data_provider_status(provider: str, config_errors: list[str]) -> str:
+    clean_provider = str(provider or "disabled").strip().lower() or "disabled"
+    if clean_provider == "polygon" and not config_errors:
+        return "Live data connected: Polygon"
+    return "Live data not connected"
 
 
 def _show_product_home(st: Any, rows: list[dict[str, Any]], sections: dict[str, list[dict[str, Any]]]) -> None:
@@ -1770,6 +1780,8 @@ def _show_product_home(st: Any, rows: list[dict[str, Any]], sections: dict[str, 
     status_columns[2].metric("Live Data", summary["live_data_status"])
     st.caption("Ready means the current rows have no blocking validation issues. Manual Confirmation Required always applies.")
 
+    _show_home_live_market_data(st, provider, config, config_errors)
+
     st.subheader("60-second workflow")
     workflow_columns = st.columns(5)
     for index, step in enumerate(
@@ -1791,8 +1803,8 @@ def _show_product_home(st: Any, rows: list[dict[str, Any]], sections: dict[str, 
     with card_columns[0]:
         _render_product_card(
             st,
-            "Start with Market Breakdown",
-            "Enter your watchlist and get plain-English breakdown cards.",
+            "Start with Live Market Data",
+            "Use Polygon-powered cards from Home or Market Breakdown.",
             "success" if summary["provider_status"] == "polygon" else "info",
         )
     with card_columns[1]:
@@ -1816,7 +1828,7 @@ def _show_product_home(st: Any, rows: list[dict[str, Any]], sections: dict[str, 
                 "success" if str(card.get("state", "")).lower() in {"alert", "priority_watch"} else "info",
             )
     else:
-        st.info("No review cards yet. Start with Market Breakdown or TradingView Import.")
+        st.info("No review cards yet. Start with Live Market Data, Market Breakdown, or TradingView Import.")
 
     st.subheader("What this app will not do")
     for item in [
@@ -1830,7 +1842,8 @@ def _show_product_home(st: Any, rows: list[dict[str, Any]], sections: dict[str, 
 
     st.subheader("Beginner help")
     st.write("- Start on Home.")
-    st.write("- Open Market Breakdown first for plain-English ticker explanations.")
+    st.write("- Use Start with Live Market Data if Polygon is connected.")
+    st.write("- Open Market Breakdown when you want the same plain-English cards in a dedicated tab.")
     st.write("- Use Chart Workspace when you want to capture manual TradingView chart notes.")
     st.write("- If Live Data says polygon, Market Breakdown can analyze a watchlist from read-only provider rows.")
     st.write("- If Live Data is disabled, manual import still works.")
@@ -1854,7 +1867,7 @@ def _show_daily_review(st: Any, rows: list[dict[str, Any]], sections: dict[str, 
 
     st.subheader("Today’s Review Flow")
     for step in [
-        "Use Market Breakdown first if you want Plain-English ticker explanations.",
+        "Use Start with Live Market Data or Market Breakdown first if you want plain-English ticker explanations.",
         "Use Chart Workspace to capture manual support/resistance, bias, fundamentals, and macro notes.",
         "Import row.",
         "Fix blocking issues.",
@@ -2096,6 +2109,83 @@ def _render_breakdown_card(st: Any, row: dict[str, Any]) -> None:
         st.write(f"- {bullet}")
     st.write("What I’d check next")
     st.info(str(row.get("next_action", "Verify chart manually before any decision.")))
+
+
+def _show_home_live_market_data(st: Any, provider: str, config: dict[str, str], config_errors: list[str]) -> None:
+    st.subheader("Start with Live Market Data")
+    st.caption("Type a watchlist, analyze with Polygon, read the cards, then verify charts manually.")
+
+    provider_text = _plain_live_data_provider_status(provider, config_errors)
+    if provider_text.endswith("Polygon"):
+        st.success(provider_text)
+    else:
+        st.info(provider_text)
+        st.write("Live data is not connected. You can still use Sample data or manual import.")
+
+    input_columns = st.columns([2, 1])
+    watchlist = input_columns[0].text_area(
+        "Enter tickers",
+        value="SPY, QQQ, AAPL",
+        height=90,
+        key="home_live_market_watchlist",
+        help="Comma- or line-separated ticker symbols. Limited to 20.",
+    )
+    timeframe = input_columns[1].selectbox(
+        "Timeframe",
+        options=["15m", "1h", "4h", "1D"],
+        index=0,
+        key="home_live_market_timeframe",
+    )
+
+    analyze_clicked = st.button("Analyze with Polygon", type="primary", key="home_analyze_with_polygon")
+    if analyze_clicked:
+        tickers = parse_watchlist_text(watchlist, limit=20)
+        if not tickers:
+            st.warning("Enter at least one ticker.")
+            st.session_state.home_live_market_rows = []
+            st.session_state.home_live_market_csv = ""
+            st.session_state.home_live_market_errors = []
+        elif provider != "polygon" or config_errors:
+            st.warning("Live data is not connected. You can still use Sample data or manual import.")
+            st.session_state.home_live_market_rows = []
+            st.session_state.home_live_market_csv = ""
+            st.session_state.home_live_market_errors = list(config_errors)
+        else:
+            rows, errors = _market_breakdown_rows_from_provider(tickers, timeframe, config)
+            st.session_state.home_live_market_rows = rows
+            st.session_state.home_live_market_csv = _breakdown_rows_to_import_csv(rows) if rows else ""
+            st.session_state.home_live_market_errors = errors
+
+    errors = st.session_state.get("home_live_market_errors", [])
+    if errors:
+        with st.expander("Provider messages", expanded=True):
+            for error in errors:
+                st.write(f"- {error}")
+
+    rows = st.session_state.get("home_live_market_rows", [])
+    if rows:
+        summary = market_breakdown_summary(rows)
+        metric_columns = st.columns(5)
+        metric_columns[0].metric("Tickers analyzed", summary["total"])
+        metric_columns[1].metric("Bullish", summary["bullish"])
+        metric_columns[2].metric("Bearish", summary["bearish"])
+        metric_columns[3].metric("Neutral/Mixed", summary["neutral_mixed"])
+        metric_columns[4].metric("Needs manual confirmation", summary["needs_manual_confirmation"])
+
+        st.subheader("Live Market Breakdown Cards")
+        for row in rows:
+            _render_breakdown_card(st, row)
+
+        generated_csv = st.session_state.get("home_live_market_csv", "")
+        if generated_csv:
+            st.subheader("TradingView Import CSV")
+            st.success("Copy this into TradingView Import to unlock Daily Review / Calibration Results.")
+            st.code(generated_csv, language="csv")
+
+    with st.expander("What should I click?", expanded=True):
+        st.write("- Want live market cards? Market Breakdown.")
+        st.write("- Want rows for Daily Review? Live Data — Read Only → TradingView Import.")
+        st.write("- Want manual chart notes? Chart Workspace.")
 
 
 def _show_market_breakdown(st: Any) -> None:

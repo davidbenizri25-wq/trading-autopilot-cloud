@@ -1,5 +1,19 @@
 # Changelog
 
+## v1.4.2-live-market-data-first-run-ux-dev
+
+- Added a Home tab "Start with Live Market Data" first-run path.
+- Added Home watchlist input, timeframe selector, and Analyze with Polygon button.
+- Added plain-English provider status on Home.
+- Added Home-generated Market Breakdown cards from read-only Polygon data.
+- Added Home-generated TradingView Import CSV bridge with clear Daily Review / Calibration next step.
+- Reduced sample-data confusion by pointing users to Market Breakdown and Live Data — Read Only.
+- Preserved Sample data, Advanced mode, and all existing workflows.
+- Preserved existing scoring logic.
+- Preserved read-only market-data behavior.
+- Preserved no broker/order/alert/payment automation.
+- Preserved no secrets or real data commits.
+
 ## v1.4.1-chart-workspace-real-session-polish-dev
 
 - Polished Chart Workspace after real-session smoke testing.

@@ -1,4 +1,4 @@
-# Trading Autopilot v1.4.1-chart-workspace-real-session-polish-dev
+# Trading Autopilot v1.4.2-live-market-data-first-run-ux-dev
 
 Trading Autopilot is a decision-support dashboard for scanner ranking, watchlist review, helper levels, review planning, and journaling.
 
@@ -22,7 +22,7 @@ python3 tools/generate_pine_levels.py
 
 ## Review Surfaces
 
-- `Home` tab: product UI for non-coders with status cards, Next Best Action, review cards, and beginner safety guidance.
+- `Home` tab: product UI for non-coders with Start with Live Market Data, status cards, Next Best Action, review cards, and beginner safety guidance.
 - `Market Breakdown` tab: enter a watchlist and get plain-English breakdown cards with bias, confidence, trend, momentum, levels, risk flags, and next action.
 - `Chart Workspace` tab: capture manual TradingView chart review notes, multi-timeframe levels, fundamentals, and macro context.
 - Beginner mode is the default and shows only the core daily-use tabs.
@@ -76,6 +76,11 @@ python3 tools/generate_pine_levels.py
 - Live Market Breakdown guide: `docs/live_market_breakdown.md`.
 - Non-coder market review: `docs/non_coder_market_review.md`.
 - Use Home first.
+- Start with Live Market Data exists on Home.
+- Home includes watchlist input, timeframe selector, and Analyze with Polygon.
+- Home shows `Live data connected: Polygon` or `Live data not connected`.
+- Live data is not connected means you can still use Sample data or manual import.
+- Home-generated CSV says: Copy this into TradingView Import to unlock Daily Review / Calibration Results.
 - Home tab exists.
 - Market Breakdown tab exists.
 - Chart Workspace tab exists.
@@ -101,6 +106,7 @@ python3 tools/generate_pine_levels.py
 ## Live Data — Read Only
 
 - Dashboard tab: `Live Data — Read Only`.
+- Start with Live Market Data is the clearest first-run Home path when Polygon is configured.
 - For a more user-friendly explanation, use `Market Breakdown` first.
 - Market-data provider support is read-only.
 - Provider config uses Streamlit secrets or environment variables.
@@ -118,6 +124,7 @@ python3 tools/generate_pine_levels.py
 - TradingView Import CSV remains an optional advanced/debug bridge.
 - Advanced CSV bridge is optional; most users can ignore it unless they are doing validation/calibration.
 - Home shows Live Data as a simple product feature while preserving advanced tabs.
+- Home can generate Market Breakdown cards and a TradingView Import CSV from read-only Polygon data.
 - No broker/order/alert/payment automation.
 - No TradingView scraping or sync.
 - Do not commit API keys.
