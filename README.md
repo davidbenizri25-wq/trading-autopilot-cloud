@@ -1,4 +1,4 @@
-# Trading Autopilot v1.5.2-mobile-first-run-one-click-review-dev
+# Trading Autopilot v1.5.3-mobile-sidebar-post-handoff-polish-dev
 
 Trading Autopilot is a decision-support dashboard for scanner ranking, watchlist review, helper levels, review planning, and journaling.
 
@@ -73,6 +73,7 @@ python3 tools/generate_pine_levels.py
 - Product UI guide: `docs/product_ui.md`.
 - Wow UI product polish: `docs/wow_ui_product_polish.md`.
 - Mobile first-run one-click review: `docs/mobile_first_run_one_click_review.md`.
+- Mobile/sidebar post-handoff polish: `docs/mobile_sidebar_post_handoff_polish.md`.
 - Market Breakdown mobile polish: `docs/market_breakdown_mobile_polish.md`.
 - TradingView Chart Workspace guide: `docs/tradingview_chart_workspace.md`.
 - Alert Planner guide: `docs/alert_planner.md`.
@@ -91,7 +92,9 @@ python3 tools/generate_pine_levels.py
 - Live data is not connected means you can still use Sample data or manual import.
 - Home-generated rows can use `Send to Review Engine` to unlock Daily Review / Calibration Results without manual copy/paste.
 - Beginner translation explains TradingView Import = Review Engine Paste Box.
-- Review Engine Status shows whether session rows are loaded, source, blocking issues, and next step.
+- Review Engine Status shows whether session rows are loaded, source, row count, blocking issues, warnings, and next step.
+- Phone tip explains how to collapse the sidebar when it covers the page.
+- Rows sent to Review Engine show a clear success state and point to Daily Review / Calibration Results.
 - Home tab exists.
 - Market Breakdown tab exists.
 - Chart Workspace tab exists.

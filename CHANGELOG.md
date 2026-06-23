@@ -1,5 +1,20 @@
 # Changelog
 
+## v1.5.3-mobile-sidebar-post-handoff-polish-dev
+
+- Added clearer mobile/sidebar guidance for first-run users.
+- Improved Send to Review Engine success confirmation.
+- Improved Review Engine Status and next-step messaging.
+- Added post-handoff guidance to open Daily Review and Calibration Results.
+- Reduced sidebar confusion in Beginner mode.
+- Improved mobile spacing for Home and Alert Planner quick draft areas.
+- Preserved Advanced mode and existing technical workflows.
+- Preserved existing scoring logic.
+- Preserved read-only market-data behavior.
+- Preserved no broker/order/trade execution.
+- Preserved no automatic TradingView alert creation.
+- Preserved no secrets or real data commits.
+
 ## v1.5.2-mobile-first-run-one-click-review-dev
 
 - Added mobile-first first-run workflow polish.
