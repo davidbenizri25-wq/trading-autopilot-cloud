@@ -1,5 +1,21 @@
 # Changelog
 
+## v1.5.1-wow-ui-alert-planner-polish-dev
+
+- Added a more polished product-style Home experience.
+- Added a clearer beginner "Start Review" path.
+- Improved live-market-data first-run workflow and plain-English copy.
+- Improved Alert Planner guidance and draft-only safety language.
+- Improved decision-support cards and next-action language.
+- Added beginner-friendly labels for technical workflows.
+- Reduced CSV-first friction in beginner mode.
+- Preserved advanced mode and all existing workflows.
+- Preserved existing scoring logic.
+- Preserved read-only market-data behavior.
+- Preserved no broker/order/trade execution.
+- Preserved no automatic TradingView alert creation.
+- Preserved no secrets or real data commits.
+
 ## v1.5.0-alert-planning-decision-support-dev
 
 - Added Alert Planning workflow for TradingView-ready decision-support alerts.

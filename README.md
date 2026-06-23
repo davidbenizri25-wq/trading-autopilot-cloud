@@ -1,4 +1,4 @@
-# Trading Autopilot v1.5.0-alert-planning-decision-support-dev
+# Trading Autopilot v1.5.1-wow-ui-alert-planner-polish-dev
 
 Trading Autopilot is a decision-support dashboard for scanner ranking, watchlist review, helper levels, review planning, and journaling.
 
@@ -69,6 +69,7 @@ python3 tools/generate_pine_levels.py
 - Deploy troubleshooting: `docs/streamlit_deploy_troubleshooting.md`.
 - Post-deploy operator checklist: `docs/post_deploy_operator_checklist.md`.
 - Product UI guide: `docs/product_ui.md`.
+- Wow UI product polish: `docs/wow_ui_product_polish.md`.
 - Market Breakdown mobile polish: `docs/market_breakdown_mobile_polish.md`.
 - TradingView Chart Workspace guide: `docs/tradingview_chart_workspace.md`.
 - Alert Planner guide: `docs/alert_planner.md`.
@@ -80,16 +81,19 @@ python3 tools/generate_pine_levels.py
 - Live Market Breakdown guide: `docs/live_market_breakdown.md`.
 - Non-coder market review: `docs/non_coder_market_review.md`.
 - Use Home first.
+- Home includes a product-style Start Review flow.
 - Start with Live Market Data exists on Home.
-- Home includes watchlist input, timeframe selector, and Analyze with Polygon.
+- Home includes watchlist input, timeframe selector, Analyze Live Market Data, and the compatibility phrase Analyze with Polygon.
 - Home shows `Live data connected: Polygon` or `Live data not connected`.
 - Live data is not connected means you can still use Sample data or manual import.
 - Home-generated CSV says: Copy this into TradingView Import to unlock Daily Review / Calibration Results.
+- Beginner translation explains TradingView Import = Review Engine paste box.
 - Home tab exists.
 - Market Breakdown tab exists.
 - Chart Workspace tab exists.
 - Alert Planner tab exists.
 - TradingView alert message drafts exist.
+- Alert Planner is draft-only and says no alerts are created.
 - Alert Plan CSV template exists.
 - Beginner mode is default.
 - Advanced mode keeps all tabs.
@@ -102,6 +106,7 @@ python3 tools/generate_pine_levels.py
 - Optional advanced CSV bridge exists.
 - Product UI for non-coders.
 - Next Best Action guidance exists.
+- Start Review guidance exists.
 - Advanced tabs remain available.
 - Daily Review tab now includes status summary and next best action.
 - Use fake EXAMPLE row for cloud smoke test.
@@ -159,6 +164,8 @@ python3 tools/generate_pine_levels.py
 
 - Dashboard tab: `Alert Planner`.
 - Use it after Market Breakdown and Chart Workspace to draft manual alert ideas.
+- Alert Planner shows `ALERT PLANNING ONLY — NO ALERTS ARE CREATED`.
+- Alert Planner uses decision-support cards and final manual confirmation reminders.
 - Fields include ticker, timeframe, setup bias, setup type, trigger, invalidation, targets, risk/reward note, chart confirmation, fundamentals context, macro context, news catalyst, volume confirmation, manual notes, and status.
 - Alert Planner can build draft rows from Chart Workspace or Market Breakdown session rows.
 - Alert Planner includes a Manual Alert Plan CSV template and parser.

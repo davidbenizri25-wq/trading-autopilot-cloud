@@ -23,6 +23,7 @@ from alert_planning import (
     alert_plan_status_summary,
     alert_plan_template_csv,
     alert_plan_to_tradingview_message,
+    build_decision_support_card,
     build_alert_plan_from_chart_review,
     build_alert_plan_from_market_breakdown,
     normalize_alert_plan_row,
@@ -59,7 +60,7 @@ from tools.validate_candidates import ALL_CANDIDATE_COLUMNS, validate_candidate_
 from shares_filter import filter_share_candidates
 
 
-APP_VERSION = "1.5.0-alert-planning-decision-support-dev"
+APP_VERSION = "1.5.1-wow-ui-alert-planner-polish-dev"
 SAMPLE_WARNING = "SAMPLE/EXAMPLE DATA ONLY — NOT LIVE MARKET DATA"
 LEGACY_SAMPLE_WARNING = "SAMPLE DATA ONLY — NOT LIVE MARKET DATA"
 USER_SUPPLIED_WARNING = "USER-SUPPLIED DATA — VERIFY MANUALLY BEFORE ANY TRADING DECISION"
@@ -1635,6 +1636,8 @@ def _streamlit_warning_lines(path: Path | None, user_supplied: bool) -> list[str
         return [USER_SUPPLIED_WARNING]
     if path is None:
         return [SAMPLE_WARNING, "To use live market data, open Market Breakdown or Live Data — Read Only."]
+    if path.name in SAMPLE_DATA_NAMES:
+        return [SAMPLE_WARNING, "To use live market data, open Market Breakdown or Live Data — Read Only."]
     lines = _warning_lines(path)
     if path.name in SAMPLE_DATA_NAMES:
         lines.append("To use live market data, open Market Breakdown or Live Data — Read Only.")
@@ -1692,6 +1695,218 @@ def _show_top_review_summary(st: Any, summary: dict[str, Any]) -> None:
         st.caption("No ranked non-context candidates.")
 
 
+def _inject_product_styles(st: Any) -> None:
+    st.markdown(
+        """
+        <style>
+        :root {
+            --ta-card-bg: rgba(15, 23, 42, 0.58);
+            --ta-card-border: rgba(148, 163, 184, 0.28);
+            --ta-text-soft: rgba(226, 232, 240, 0.76);
+            --ta-success: #22c55e;
+            --ta-info: #38bdf8;
+            --ta-warning: #f59e0b;
+            --ta-danger: #ef4444;
+        }
+        .block-container {
+            padding-top: 2rem;
+            max-width: 1180px;
+        }
+        .ta-hero {
+            border: 1px solid rgba(56, 189, 248, 0.28);
+            border-radius: 8px;
+            padding: 1.25rem;
+            margin: 0 0 1rem 0;
+            background:
+                linear-gradient(135deg, rgba(14, 165, 233, 0.16), rgba(34, 197, 94, 0.08)),
+                rgba(15, 23, 42, 0.52);
+        }
+        .ta-hero-kicker {
+            color: var(--ta-info);
+            font-size: 0.82rem;
+            font-weight: 800;
+            letter-spacing: 0;
+            text-transform: uppercase;
+            margin-bottom: 0.35rem;
+        }
+        .ta-hero-title {
+            font-size: clamp(2rem, 5vw, 3.35rem);
+            font-weight: 850;
+            line-height: 1.03;
+            margin-bottom: 0.45rem;
+        }
+        .ta-hero-subtitle {
+            color: var(--ta-text-soft);
+            font-size: 1.05rem;
+            max-width: 840px;
+            line-height: 1.45;
+        }
+        .ta-badge-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.5rem;
+            margin-top: 0.95rem;
+        }
+        .ta-badge {
+            border: 1px solid var(--ta-card-border);
+            border-radius: 999px;
+            padding: 0.34rem 0.62rem;
+            background: rgba(15, 23, 42, 0.62);
+            font-size: 0.84rem;
+            font-weight: 700;
+        }
+        .ta-badge-success { border-color: rgba(34, 197, 94, 0.55); color: #bbf7d0; }
+        .ta-badge-info { border-color: rgba(56, 189, 248, 0.55); color: #bae6fd; }
+        .ta-badge-warning { border-color: rgba(245, 158, 11, 0.55); color: #fde68a; }
+        .ta-badge-neutral { color: #e2e8f0; }
+        .ta-safety-strip {
+            border: 1px solid rgba(245, 158, 11, 0.32);
+            border-left: 4px solid var(--ta-warning);
+            border-radius: 8px;
+            padding: 0.8rem 0.9rem;
+            margin: 0.85rem 0;
+            background: rgba(245, 158, 11, 0.09);
+            color: #fde68a;
+            font-weight: 650;
+        }
+        .product-card, .ta-step-card, .ta-feature-card, .breakdown-card {
+            border: 1px solid var(--ta-card-border);
+            border-radius: 8px;
+            padding: 0.95rem;
+            min-height: 118px;
+            margin-bottom: 0.75rem;
+            background: var(--ta-card-bg);
+            box-shadow: 0 12px 36px rgba(2, 6, 23, 0.18);
+        }
+        .product-card-title, .ta-card-title, .breakdown-card-title {
+            font-weight: 800;
+            margin-bottom: 0.35rem;
+        }
+        .product-card-body, .ta-card-body, .breakdown-card-meta {
+            color: var(--ta-text-soft);
+            line-height: 1.45;
+        }
+        .ta-step-number {
+            width: 2rem;
+            height: 2rem;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 999px;
+            margin-bottom: 0.5rem;
+            background: rgba(56, 189, 248, 0.16);
+            color: #bae6fd;
+            font-weight: 800;
+        }
+        .ta-action-hint {
+            color: #bae6fd;
+            font-weight: 750;
+            margin-top: 0.45rem;
+        }
+        .product-card-success, .ta-card-success { border-left: 4px solid var(--ta-success); }
+        .product-card-warning, .ta-card-warning { border-left: 4px solid var(--ta-warning); }
+        .product-card-error, .ta-card-error { border-left: 4px solid var(--ta-danger); }
+        .product-card-info, .ta-card-info { border-left: 4px solid var(--ta-info); }
+        .stAlert {
+            border-radius: 8px;
+        }
+        div[data-testid="stMetric"] {
+            border: 1px solid var(--ta-card-border);
+            border-radius: 8px;
+            padding: 0.7rem 0.8rem;
+            background: rgba(15, 23, 42, 0.38);
+        }
+        @media (max-width: 700px) {
+            .block-container { padding-left: 1rem; padding-right: 1rem; }
+            .ta-hero { padding: 1rem; }
+            .ta-hero-title { font-size: 2rem; }
+            .ta-step-card, .ta-feature-card, .product-card { min-height: unset; }
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _status_class(status: str) -> str:
+    return {
+        "success": "success",
+        "warning": "warning",
+        "error": "error",
+    }.get(status, "info")
+
+
+def _render_hero(st: Any, title: str, subtitle: str, status_text: str) -> None:
+    st.markdown(
+        f"""
+        <div class="ta-hero">
+          <div class="ta-hero-kicker">Start Review</div>
+          <div class="ta-hero-title">{html.escape(title)}</div>
+          <div class="ta-hero-subtitle">{html.escape(subtitle)}</div>
+          <div class="ta-badge-row">
+            <span class="ta-badge ta-badge-success">{html.escape(status_text)}</span>
+            <span class="ta-badge ta-badge-info">Decision-support only</span>
+            <span class="ta-badge ta-badge-warning">No broker connected</span>
+            <span class="ta-badge ta-badge-neutral">Manual confirmation required</span>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _render_status_badge(st: Any, label: str, value: str, status: str = "info") -> None:
+    badge_class = f"ta-badge-{_status_class(status)}"
+    st.markdown(
+        f"<span class='ta-badge {badge_class}'>{html.escape(label)}: {html.escape(str(value))}</span>",
+        unsafe_allow_html=True,
+    )
+
+
+def _render_step_card(st: Any, step_number: int, title: str, body: str) -> None:
+    st.markdown(
+        f"""
+        <div class="ta-step-card ta-card-info">
+          <div class="ta-step-number">{step_number}</div>
+          <div class="ta-card-title">{html.escape(title)}</div>
+          <div class="ta-card-body">{html.escape(body)}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _render_feature_card(st: Any, title: str, body: str, action_hint: str, status: str = "info") -> None:
+    st.markdown(
+        f"""
+        <div class="ta-feature-card ta-card-{_status_class(status)}">
+          <div class="ta-card-title">{html.escape(title)}</div>
+          <div class="ta-card-body">{html.escape(body)}</div>
+          <div class="ta-action-hint">{html.escape(action_hint)}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _render_safety_strip(st: Any) -> None:
+    st.markdown(
+        "<div class='ta-safety-strip'>Decision-support only. No broker connection, no orders, no automatic alerts, no payment workflows.</div>",
+        unsafe_allow_html=True,
+    )
+
+
+def _beginner_term_help() -> list[dict[str, str]]:
+    return [
+        {"term": "TradingView Import", "plain": "Review Engine paste box", "meaning": "Paste rows into the dashboard review engine."},
+        {"term": "CSV", "plain": "copy/paste table text", "meaning": "A simple text table you can copy between sections."},
+        {"term": "Calibration", "plain": "compare reads", "meaning": "Compare the dashboard read with your manual chart read."},
+        {"term": "Blocking issue", "plain": "fix before reviewing", "meaning": "A missing or invalid field that must be repaired first."},
+        {"term": "Alert Planner", "plain": "draft reminder plan", "meaning": "A manual draft only. No live alert is created."},
+        {"term": "Chart Workspace", "plain": "manual chart notes", "meaning": "Where you capture support, resistance, bias, and context."},
+    ]
+
+
 def _render_product_card(st: Any, title: str, body: str, status: str = "info") -> None:
     status_class = {
         "success": "product-card-success",
@@ -1717,42 +1932,6 @@ def _plain_live_data_provider_status(provider: str, config_errors: list[str]) ->
 
 
 def _show_product_home(st: Any, rows: list[dict[str, Any]], sections: dict[str, list[dict[str, Any]]]) -> None:
-    st.markdown(
-        """
-        <style>
-        .product-hero {
-            padding: 1rem 0 0.5rem 0;
-        }
-        .product-kicker {
-            color: #6b7280;
-            font-size: 0.95rem;
-            margin-bottom: 0.25rem;
-        }
-        .product-card {
-            border: 1px solid rgba(148, 163, 184, 0.35);
-            border-radius: 8px;
-            padding: 0.95rem;
-            min-height: 120px;
-            margin-bottom: 0.75rem;
-            background: rgba(255, 255, 255, 0.03);
-        }
-        .product-card-title {
-            font-weight: 700;
-            margin-bottom: 0.35rem;
-        }
-        .product-card-body {
-            color: inherit;
-            line-height: 1.45;
-        }
-        .product-card-success { border-left: 4px solid #16a34a; }
-        .product-card-warning { border-left: 4px solid #f59e0b; }
-        .product-card-error { border-left: 4px solid #dc2626; }
-        .product-card-info { border-left: 4px solid #2563eb; }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
     validation_errors, validation_warnings = validate_candidate_rows(rows, ALL_CANDIDATE_COLUMNS)
     calibration_rows = _current_session_calibration_rows(st)
     batch_rows = _calibration_batch_log_rows(st)
@@ -1768,12 +1947,48 @@ def _show_product_home(st: Any, rows: list[dict[str, Any]], sections: dict[str, 
         batch_rows,
         provider_status,
     )
+    provider_text = _plain_live_data_provider_status(provider, config_errors)
 
-    st.markdown('<div class="product-hero">', unsafe_allow_html=True)
-    st.markdown('<div class="product-kicker">Simple daily decision-support dashboard.</div>', unsafe_allow_html=True)
-    st.header("Trading Autopilot")
-    st.caption("No broker connection. No orders. Manual chart confirmation required.")
-    st.markdown("</div>", unsafe_allow_html=True)
+    _render_hero(
+        st,
+        "Trading Autopilot",
+        "Live market data, chart review, alert planning, and daily decision support — without broker connection or order execution.",
+        provider_text,
+    )
+    _render_safety_strip(st)
+
+    st.subheader("Start Review")
+    step_columns = st.columns(5)
+    steps = [
+        ("Analyze live market data", "Use read-only Polygon rows to see what the market data says."),
+        ("Read Market Breakdown cards", "Review bias, trend, momentum, levels, and caution flags."),
+        ("Confirm chart levels", "Use Chart Workspace for support, resistance, bias, and context notes."),
+        ("Draft alert plan", "Use Alert Planner for manual draft reminders. Nothing is created."),
+        ("Review Daily / Calibration", "Paste rows into the Review Engine when you want validation and tracking."),
+    ]
+    for index, (title, body) in enumerate(steps, start=1):
+        with step_columns[index - 1]:
+            _render_step_card(st, index, title, body)
+
+    st.subheader("Beginner actions")
+    action_columns = st.columns(5)
+    action_cards = [
+        (
+            "Start with Live Market Data",
+            "Analyze SPY, QQQ, AAPL with Polygon.",
+            "Use Home or Market Breakdown.",
+            "success" if summary["provider_status"] == "polygon" else "info",
+        ),
+        ("Open Market Breakdown", "Plain-English ticker cards.", "Use the Market Breakdown tab.", "info"),
+        ("Open Chart Workspace", "Capture support, resistance, bias, and notes.", "Use Chart Workspace.", "info"),
+        ("Open Alert Planner", "Draft manual alert plans. No alerts are created.", "Use Alert Planner.", "warning"),
+        ("Open Daily Review", "Review validated rows.", "Use Daily Review after paste/validation.", "info"),
+    ]
+    for column, (title, body, action_hint, status) in zip(action_columns, action_cards):
+        with column:
+            _render_feature_card(st, title, body, action_hint, status)
+
+    st.caption("Use the tabs below: Market Breakdown / Chart Workspace / Alert Planner / Daily Review.")
 
     metric_columns = st.columns(3)
     metrics = [
@@ -1795,37 +2010,8 @@ def _show_product_home(st: Any, rows: list[dict[str, Any]], sections: dict[str, 
 
     _show_home_live_market_data(st, provider, config, config_errors)
 
-    st.subheader("60-second workflow")
-    workflow_columns = st.columns(5)
-    for index, step in enumerate(
-        [
-            "1. Get data",
-            "2. Review Market Breakdown",
-            "3. Capture Chart Workspace notes",
-            "4. Draft Alert Plan",
-            "5. Decide manually",
-        ]
-    ):
-        workflow_columns[index].write(step)
-
     st.subheader("Next Best Action")
     st.info(product_next_best_action(summary))
-
-    st.subheader("Quick actions")
-    card_columns = st.columns(4)
-    with card_columns[0]:
-        _render_product_card(
-            st,
-            "Start with Live Market Data",
-            "Use Polygon-powered cards from Home or Market Breakdown.",
-            "success" if summary["provider_status"] == "polygon" else "info",
-        )
-    with card_columns[1]:
-        _render_product_card(st, "Chart Workspace", "Capture manual levels, bias, fundamentals, and macro context.", "info")
-    with card_columns[2]:
-        _render_product_card(st, "Alert Planner", "Draft manual TradingView alert ideas after chart confirmation.", "info")
-    with card_columns[3]:
-        _render_product_card(st, "Safety", "Decision-support only. No orders.", "warning")
 
     st.subheader("Top Review Cards")
     cards = build_product_review_cards(rows, sections, limit=6)
@@ -1843,15 +2029,9 @@ def _show_product_home(st: Any, rows: list[dict[str, Any]], sections: dict[str, 
     else:
         st.info("No review cards yet. Start with Live Market Data, Market Breakdown, or TradingView Import.")
 
-    st.subheader("What this app will not do")
-    for item in [
-        "Place trades.",
-        "Connect brokers.",
-        "Create alerts.",
-        "Manage payments.",
-        "Replace chart confirmation.",
-    ]:
-        st.write(f"- {item}")
+    st.subheader("Beginner translation")
+    st.caption("TradingView Import = Review Engine paste box.")
+    st.table(_beginner_term_help())
 
     st.subheader("Beginner help")
     st.write("- Start on Home.")
@@ -1862,6 +2042,16 @@ def _show_product_home(st: Any, rows: list[dict[str, Any]], sections: dict[str, 
     st.write("- If Live Data says polygon, Market Breakdown can analyze a watchlist from read-only provider rows.")
     st.write("- If Live Data is disabled, manual import still works.")
     st.write("- Do not worry about advanced tabs at first; they remain available for deeper review.")
+
+    st.subheader("What this app will not do")
+    for item in [
+        "Place trades.",
+        "Connect brokers.",
+        "Create alerts automatically.",
+        "Manage payments.",
+        "Replace chart confirmation.",
+    ]:
+        st.write(f"- {item}")
 
 
 def _show_daily_review(st: Any, rows: list[dict[str, Any]], sections: dict[str, list[dict[str, Any]]]) -> None:
@@ -2128,7 +2318,7 @@ def _render_breakdown_card(st: Any, row: dict[str, Any]) -> None:
 
 def _show_home_live_market_data(st: Any, provider: str, config: dict[str, str], config_errors: list[str]) -> None:
     st.subheader("Start with Live Market Data")
-    st.caption("Type a watchlist, analyze with Polygon, read the cards, then verify charts manually.")
+    st.caption("This uses read-only Polygon data. Type a watchlist, read the cards, then verify charts manually.")
 
     provider_text = _plain_live_data_provider_status(provider, config_errors)
     if provider_text.endswith("Polygon"):
@@ -2148,11 +2338,12 @@ def _show_home_live_market_data(st: Any, provider: str, config: dict[str, str], 
     timeframe = input_columns[1].selectbox(
         "Timeframe",
         options=["15m", "1h", "4h", "1D"],
-        index=0,
+        index=3,
         key="home_live_market_timeframe",
     )
 
-    analyze_clicked = st.button("Analyze with Polygon", type="primary", key="home_analyze_with_polygon")
+    st.caption("Compatibility note: Analyze with Polygon = Analyze Live Market Data.")
+    analyze_clicked = st.button("Analyze Live Market Data", type="primary", key="home_analyze_with_polygon")
     if analyze_clicked:
         tickers = parse_watchlist_text(watchlist, limit=20)
         if not tickers:
@@ -2193,15 +2384,16 @@ def _show_home_live_market_data(st: Any, provider: str, config: dict[str, str], 
 
         generated_csv = st.session_state.get("home_live_market_csv", "")
         if generated_csv:
-            st.subheader("TradingView Import CSV")
+            st.subheader("Copy into Review Engine")
             st.success("Copy this into TradingView Import to unlock Daily Review / Calibration Results.")
+            st.caption("Next: choose TradingView Import in the sidebar and paste this text. TradingView Import = Review Engine paste box.")
             st.code(generated_csv, language="csv")
 
     with st.expander("What should I click?", expanded=True):
         st.write("- Want live cards? Start with Live Market Data.")
         st.write("- Want chart notes? Chart Workspace.")
         st.write("- Want alert ideas? Alert Planner.")
-        st.write("- Want daily rows? TradingView Import / Daily Review.")
+        st.write("- Want daily rows? TradingView Import / Daily Review. TradingView Import = Review Engine paste box.")
         st.write("- Want calibration? Calibration Results / Review.")
 
 
@@ -2230,7 +2422,7 @@ def _show_market_breakdown(st: Any) -> None:
 
     st.caption("Beginner flow: type tickers, analyze, read cards, then verify charts manually.")
     watchlist = st.text_area("Enter tickers", value="SPY, QQQ, AAPL", height=90, key="market_breakdown_watchlist")
-    timeframe = st.selectbox("Breakdown timeframe", options=["15m", "1h", "4h", "1D"], index=0, key="market_breakdown_timeframe")
+    timeframe = st.selectbox("Breakdown timeframe", options=["15m", "1h", "4h", "1D"], index=3, key="market_breakdown_timeframe")
 
     analyze_clicked = st.button("Analyze Watchlist", type="primary")
     example_clicked = st.button("Generate EXAMPLE Breakdown")
@@ -2292,7 +2484,8 @@ def _show_market_breakdown(st: Any) -> None:
 
     generated_csv = st.session_state.get("market_breakdown_import_csv", "")
     with st.expander("Advanced CSV bridge — optional"):
-        st.caption("Most users can ignore this. It is for copying rows into the advanced calibration workflow.")
+        st.caption("Most users can ignore this. It is for copying rows into the Review Engine paste box.")
+        st.caption("TradingView Import = Review Engine paste box.")
         if generated_csv:
             st.code(generated_csv, language="csv")
         else:
@@ -2369,12 +2562,31 @@ def _show_chart_workspace(st: Any) -> None:
     st.warning(CHART_WORKSPACE_WARNING)
     st.header("Chart Workspace")
     st.caption("Manual TradingView chart review capture. Decision-support only. No downloads, no persistence.")
-    st.info("Default execution/review timeframe is 15m. Use 1h, 4h, and 1D for context.")
+    st.info("1D/4H/1H are context. 15m is usually the execution row.")
 
     st.subheader("Start Chart Review")
-    st.write("- Open SPY/QQQ/your ticker in TradingView manually.")
-    st.write("- Use the read-only helper or your chart to copy price, moving averages, MACD, support, and resistance.")
-    st.write("- Enter one `15m` execution row per ticker, plus optional `1h`, `4h`, or `1D` context rows.")
+    guide_columns = st.columns(4)
+    with guide_columns[0]:
+        _render_step_card(st, 1, "1D", "Main bias and broad market context.")
+    with guide_columns[1]:
+        _render_step_card(st, 2, "4H", "Structure, trend, and larger support/resistance.")
+    with guide_columns[2]:
+        _render_step_card(st, 3, "1H", "Setup quality and near-term structure.")
+    with guide_columns[3]:
+        _render_step_card(st, 4, "15m", "Trigger row for review and alert planning.")
+
+    st.subheader("Copy values from TradingView helper")
+    for item in [
+        "Ticker and timeframe.",
+        "Current price.",
+        "EMA9, EMA21, WMA50, WMA200, and SMA200 when visible.",
+        "Recent support and resistance.",
+        "Breakout, breakdown, and invalidation levels.",
+        "MACD histogram and volume context.",
+        "Manual chart bias and notes.",
+    ]:
+        st.write(f"- {item}")
+    st.caption("Examples below are examples only. Replace them with values you manually verify.")
     st.write("- The bridge sends one execution row per ticker to TradingView Import. Context rows stay here for review.")
     st.write("- Stop if a broker, order, alert, publish, payment, or credential screen appears.")
 
@@ -2475,6 +2687,7 @@ def _alert_plan_rows_from_market_breakdown(st: Any) -> list[dict[str, str]]:
 def _render_alert_plan_card(st: Any, row: dict[str, Any]) -> None:
     normalized = normalize_alert_plan_row(row)
     decision = setup_decision_support(normalized)
+    card = build_decision_support_card(normalized)
     ticker = html.escape(normalized.get("ticker", "UNKNOWN"))
     meta = html.escape(
         f"{normalized.get('timeframe', '15m')} · {normalized.get('setup_bias', 'unclear')} · "
@@ -2497,34 +2710,52 @@ def _render_alert_plan_card(st: Any, row: dict[str, Any]) -> None:
     columns[2].caption("Targets")
     columns[2].info(decision["target_summary"])
 
-    st.caption("Fundamentals / macro context")
-    st.write(
-        " | ".join(
-            [
-                f"fundamentals: {normalized.get('fundamentals_context') or 'manual check'}",
-                f"macro: {normalized.get('macro_context') or 'manual check'}",
-                f"news: {normalized.get('news_catalyst') or 'unknown'}",
-            ]
-        )
+    st.table(
+        [
+            {
+                "ticker/timeframe": f"{card['ticker']} {card['timeframe']}",
+                "setup": card["setup"],
+                "confidence": card["confidence"],
+                "status": card["status"],
+                "next_action": card["next_action"],
+            }
+        ]
     )
+
+    st.caption("Fundamentals / macro context")
+    st.write(card["context"])
     warnings = decision["safety_warnings"]
     if warnings:
         st.warning("Safety warnings: " + " | ".join(str(item) for item in warnings))
     st.write("Next action")
     st.info(decision["next_action"])
     st.write("TradingView alert message draft")
+    st.caption("Final manual confirmation required. This is not a trade. This is not an order. This is not a live alert. This is a draft reminder plan.")
     message = alert_plan_to_tradingview_message(normalized)
     st.code(message)
-    st.caption("Copy manually into TradingView only after chart confirmation and final user approval.")
+    st.caption(card["final_reminder"])
 
 
 def _show_alert_planner(st: Any) -> None:
     st.warning(ALERT_PLANNER_WARNING)
-    st.header("TradingView Alert Planner")
-    st.caption("Draft alert plans only. Decision-support only. No live alerts are created.")
+    st.header("Alert Planner")
+    st.caption("Draft manual TradingView alert ideas. Nothing is created automatically.")
+    _render_safety_strip(st)
 
-    st.subheader("Start here")
-    st.write("- This creates draft alert plans. It does not create TradingView alerts.")
+    st.subheader("How this works")
+    how_columns = st.columns(5)
+    how_steps = [
+        ("Build from Chart Workspace or paste a template.", "Use only values you verified."),
+        ("Confirm chart levels manually.", "Support, resistance, trigger, invalidation."),
+        ("Review trigger / invalidation / targets.", "Check the draft plan before copying."),
+        ("Copy the draft message only if you choose.", "No browser automation is used here."),
+        ("You manually decide later.", "No alert is created by this app."),
+    ]
+    for index, (title, body) in enumerate(how_steps, start=1):
+        with how_columns[index - 1]:
+            _render_step_card(st, index, title, body)
+
+    st.info("This is not a trade. This is not an order. This is not a live alert. This is a draft reminder plan.")
     st.write("- You must manually verify the chart and give final confirmation before creating any alert.")
     st.write("- Stop if a broker, order, alert, publish, payment, or credential screen appears.")
 
@@ -2655,7 +2886,8 @@ def _show_live_data_readonly(st: Any) -> None:
             st.caption("Only polygon read-only fetch is implemented for the current provider path.")
 
     st.subheader("Generate read-only rows")
-    st.write("Copy into TradingView Import, confirm Blocking issues = 0, then verify chart manually.")
+    st.write("Copy into Review Engine, confirm Blocking issues = 0, then verify chart manually.")
+    st.caption("TradingView Import = Review Engine paste box.")
     st.caption("No orders are created. Data is not persisted, downloaded, or auto-refreshed.")
 
     tickers_text = st.text_area("Tickers to fetch", height=100, key="readonly_market_data_tickers")
@@ -2685,7 +2917,8 @@ def _show_live_data_readonly(st: Any) -> None:
     if generated_csv:
         st.subheader("Generated TradingView Import CSV")
         st.success("Provider CSV generated successfully.")
-        st.write("- Next: copy into TradingView Import.")
+        st.write("- Next: choose TradingView Import in the sidebar and paste this text.")
+        st.write("- TradingView Import = Review Engine paste box.")
         st.write("- Then confirm Blocking issues = 0.")
         st.write("- Then use Daily Review / Calibration Results.")
         st.write("- Verify chart manually before any decision.")
@@ -2732,6 +2965,10 @@ def _show_help_safety(st: Any) -> None:
         "8. Use Calibration Review if tracking accuracy.",
     ]:
         st.write(step)
+
+    st.subheader("Beginner translation")
+    st.caption("TradingView Import = Review Engine paste box.")
+    st.table(_beginner_term_help())
 
     st.subheader("Stop if")
     for item in [
@@ -3021,12 +3258,14 @@ def streamlit_dashboard(path: Path = DEFAULT_DATA) -> None:
 
     st.set_page_config(page_title="Trading Autopilot", layout="wide")
     _require_streamlit_access(st)
+    _inject_product_styles(st)
 
     source_label, selected_path, rows, user_supplied = _streamlit_candidate_source(st, path)
     sections = build_dashboard_sections(rows)
     summary = build_top_review_summary(rows, sections)
 
-    st.title(f"Trading Autopilot {APP_VERSION}")
+    st.title("Trading Autopilot")
+    st.caption(f"Version: {APP_VERSION}")
     if selected_path is not None:
         st.caption(f"Candidate file: {selected_path}")
     else:

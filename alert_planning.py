@@ -394,3 +394,33 @@ def setup_decision_support(row: dict[str, Any]) -> dict[str, Any]:
         ],
         "safety_warnings": warnings,
     }
+
+
+def build_decision_support_card(row: dict[str, Any]) -> dict[str, Any]:
+    normalized = normalize_alert_plan_row(row)
+    decision = setup_decision_support(normalized)
+    cautions = list(decision["safety_warnings"])
+    context_parts = [
+        f"fundamentals: {normalized.get('fundamentals_context') or 'manual check'}",
+        f"macro: {normalized.get('macro_context') or 'manual check'}",
+        f"news: {normalized.get('news_catalyst') or 'unknown'}",
+        f"volume: {normalized.get('volume_confirmation') or 'manual check'}",
+    ]
+    if normalized["status"] == "needs_chart_confirmation":
+        final_reminder = "Final manual confirmation required before any TradingView alert is created."
+    else:
+        final_reminder = "Draft only. Do not create an alert until final confirmation."
+    return {
+        "ticker": normalized["ticker"],
+        "timeframe": normalized["timeframe"],
+        "setup": f"{normalized['setup_type']} / {normalized['setup_bias']}",
+        "current_read": normalized["setup_bias"],
+        "trigger": normalized["trigger_level"] or "mark manually",
+        "invalidation": normalized["invalidation_level"] or "mark manually",
+        "caution_flags": cautions,
+        "context": " | ".join(context_parts),
+        "confidence": normalized["confidence"],
+        "status": normalized["status"],
+        "next_action": decision["next_action"],
+        "final_reminder": final_reminder,
+    }
