@@ -95,9 +95,15 @@ from options_filter import filter_options_candidates
 from scoring import load_candidates_csv, rank_candidates
 from tools.validate_candidates import ALL_CANDIDATE_COLUMNS, validate_candidate_rows
 from shares_filter import filter_share_candidates
+from tradingview_integration import (
+    candidate_tradingview_symbol,
+    tradingview_chart_url,
+    tradingview_widget_html,
+)
 
 
-APP_VERSION = "1.5.3-mobile-sidebar-post-handoff-polish-dev"
+APP_VERSION = "1.5.4-mobile-calibration-warning-polish-dev"
+APP_DISPLAY_VERSION = "1.5.4"
 SAMPLE_WARNING = "SAMPLE/EXAMPLE DATA ONLY — NOT LIVE MARKET DATA"
 LEGACY_SAMPLE_WARNING = "SAMPLE DATA ONLY — NOT LIVE MARKET DATA"
 USER_SUPPLIED_WARNING = "USER-SUPPLIED DATA — VERIFY MANUALLY BEFORE ANY TRADING DECISION"
@@ -219,6 +225,14 @@ BEGINNER_TAB_NAMES = [
     "Calibration Review",
     "Help / Safety",
 ]
+BEGINNER_PAGE_NAMES = ["Dashboard", "Analyze", "Charts", "Review", "Journal"]
+BEGINNER_PAGE_SLUGS = {
+    "Dashboard": "dashboard",
+    "Analyze": "analyze",
+    "Charts": "charts",
+    "Review": "review",
+    "Journal": "journal",
+}
 ADVANCED_TAB_NAMES = ["Home", "Market Breakdown", "Chart Workspace", "Alert Planner", "Daily Review", "Live Data — Read Only"] + DASHBOARD_SECTION_NAMES + [
     "Calibration Guide",
     "Calibration Results",
@@ -370,7 +384,11 @@ def _optional_import_int(row: dict[str, Any], key: str, default: int) -> int:
         raise ValueError(f"{key} is not numeric: {row.get(key)}") from exc
 
 
-def _candidate_from_tradingview_import_row(row: dict[str, Any]) -> dict[str, Any]:
+def _candidate_from_tradingview_import_row(
+    row: dict[str, Any],
+    *,
+    preserve_missing_as_zero: bool = False,
+) -> dict[str, Any]:
     ticker = _import_text_value(row, "ticker").upper()
     if not ticker:
         raise ValueError("missing ticker/symbol")
@@ -389,22 +407,26 @@ def _candidate_from_tradingview_import_row(row: dict[str, Any]) -> dict[str, Any
     if notes:
         watchlist_parts.append(f"notes={notes}")
 
-    ema9 = _optional_import_float(row, "ema9", close)
-    ema21 = _optional_import_float(row, "ema21", close)
-    wma50 = _optional_import_float(row, "wma50", close)
-    wma200 = _optional_import_float(row, "wma200", close)
-    sma200 = _optional_import_float(row, "sma200", close)
-    support1 = _optional_import_float(row, "support1", close)
-    support2 = _optional_import_float(row, "support2", close)
-    resistance1 = _optional_import_float(row, "resistance1", close)
-    resistance2 = _optional_import_float(row, "resistance2", close)
-    breakout = _optional_import_float(row, "breakout", close)
-    breakdown = _optional_import_float(row, "breakdown", close)
-    invalid = _optional_import_float(row, "invalid", close)
-    bullish_trigger = _optional_import_float(row, "bullish_trigger", close)
-    bearish_trigger = _optional_import_float(row, "bearish_trigger", close)
-    bullish_invalid = _optional_import_float(row, "bullish_invalid", close)
-    bearish_invalid = _optional_import_float(row, "bearish_invalid", close)
+    # The new guided intake keeps unknown values at 0 so it never invents
+    # alignment or chart levels. The legacy import bridge retains its historic
+    # close-price fallback for backward compatibility with existing exports.
+    missing_default = 0.0 if preserve_missing_as_zero else close
+    ema9 = _optional_import_float(row, "ema9", missing_default)
+    ema21 = _optional_import_float(row, "ema21", missing_default)
+    wma50 = _optional_import_float(row, "wma50", missing_default)
+    wma200 = _optional_import_float(row, "wma200", missing_default)
+    sma200 = _optional_import_float(row, "sma200", missing_default)
+    support1 = _optional_import_float(row, "support1", missing_default)
+    support2 = _optional_import_float(row, "support2", missing_default)
+    resistance1 = _optional_import_float(row, "resistance1", missing_default)
+    resistance2 = _optional_import_float(row, "resistance2", missing_default)
+    breakout = _optional_import_float(row, "breakout", missing_default)
+    breakdown = _optional_import_float(row, "breakdown", missing_default)
+    invalid = _optional_import_float(row, "invalid", missing_default)
+    bullish_trigger = _optional_import_float(row, "bullish_trigger", missing_default)
+    bearish_trigger = _optional_import_float(row, "bearish_trigger", missing_default)
+    bullish_invalid = _optional_import_float(row, "bullish_invalid", missing_default)
+    bearish_invalid = _optional_import_float(row, "bearish_invalid", missing_default)
     avg_volume = _optional_import_int(row, "avg_volume", 0)
     relative_volume = _optional_import_float(row, "relative_volume", 1.0)
     macd_hist = _optional_import_float(row, "macd_hist", 0.0)
@@ -446,7 +468,11 @@ def _candidate_from_tradingview_import_row(row: dict[str, Any]) -> dict[str, Any
     return candidate
 
 
-def _parse_tradingview_import_text(text: str) -> list[dict[str, Any]]:
+def _parse_tradingview_import_text(
+    text: str,
+    *,
+    preserve_missing_as_zero: bool = False,
+) -> list[dict[str, Any]]:
     clean_lines = [line for line in str(text or "").replace("\r\n", "\n").splitlines() if line.strip()]
     if not clean_lines:
         return []
@@ -474,7 +500,12 @@ def _parse_tradingview_import_text(text: str) -> list[dict[str, Any]]:
             if not any(str(value or "").strip() for value in normalized_row.values()):
                 continue
             try:
-                rows.append(_candidate_from_tradingview_import_row(normalized_row))
+                rows.append(
+                    _candidate_from_tradingview_import_row(
+                        normalized_row,
+                        preserve_missing_as_zero=preserve_missing_as_zero,
+                    )
+                )
             except ValueError as exc:
                 errors.append(f"row {row_number}: {exc}")
     except csv.Error as exc:
@@ -1005,6 +1036,7 @@ def _show_validation_feedback(st: Any, rows: list[dict[str, Any]], user_supplied
     columns = st.columns(2)
     columns[0].metric("Blocking issues", len(errors))
     columns[1].metric("Warnings", len(warnings))
+    render_validation_health_message(st, len(errors), len(warnings), bool(rows))
     if errors:
         st.error("Validation found issues. Repair them before using these rows for decision support.")
         for error in errors:
@@ -1012,9 +1044,7 @@ def _show_validation_feedback(st: Any, rows: list[dict[str, Any]], user_supplied
     else:
         st.success("Candidate validation found no blocking errors.")
     if warnings:
-        with st.expander("Validation warnings", expanded=bool(errors)):
-            for warning in warnings:
-                st.write(f"- {warning}")
+        _show_warning_plain_english_details(st, warnings, expanded=bool(errors))
 
     st.subheader("How to fix this")
     if errors:
@@ -1034,6 +1064,111 @@ def _show_download(st: Any, rows: list[dict[str, Any]], user_supplied: bool) -> 
         mime="text/csv",
         help="Browser-only export. The app does not write this CSV to disk.",
     )
+
+
+def classify_validation_warning(warning: str) -> str:
+    lowered = str(warning or "").lower()
+    if any(term in lowered for term in ["manual", "confirm", "confirmation", "verify chart"]):
+        return "manual_confirmation"
+    if any(term in lowered for term in ["sample", "example", "not live"]):
+        return "sample_or_example_notice"
+    if any(term in lowered for term in ["provider", "polygon", "delayed", "market data", "readonly", "read-only"]):
+        return "provider_context"
+    if any(term in lowered for term in ["missing", "optional", "relative_volume", "volume", "notes", "macd", "support", "resistance"]):
+        return "optional_field_missing"
+    if any(term in lowered for term in ["format", "parse", "number", "numeric", "unknown"]):
+        return "format_warning"
+    if any(term in lowered for term in ["caution", "risk", "review", "check"]):
+        return "caution_note"
+    return "other"
+
+
+def validation_warning_plain_english_summary(warnings: list[str]) -> dict[str, Any]:
+    groups = {
+        "optional_field_missing": 0,
+        "manual_confirmation": 0,
+        "provider_context": 0,
+        "sample_or_example_notice": 0,
+        "caution_note": 0,
+        "format_warning": 0,
+        "other": 0,
+    }
+    for warning in warnings:
+        groups[classify_validation_warning(warning)] += 1
+    return {
+        "total": len(warnings),
+        "groups": groups,
+        "grouped_counts": {
+            "Optional context": groups["optional_field_missing"],
+            "Manual confirmation": groups["manual_confirmation"],
+            "Provider notes": groups["provider_context"],
+            "Sample/example notices": groups["sample_or_example_notice"],
+            "Format/caution": groups["format_warning"] + groups["caution_note"],
+            "Other": groups["other"],
+        },
+    }
+
+
+def workflow_readiness_status(
+    row_count: int,
+    blocking_count: int,
+    warning_count: int,
+) -> dict[str, str]:
+    if row_count <= 0:
+        return {
+            "tone": "info",
+            "label": "Waiting for data",
+            "headline": "Add review data to begin.",
+            "body": "Analyze a watchlist, upload a CSV, or add a manual row.",
+        }
+    if blocking_count > 0:
+        return {
+            "tone": "error",
+            "label": "Blocked",
+            "headline": f"{blocking_count} blocking issue{'s' if blocking_count != 1 else ''} must be fixed.",
+            "body": "These rows should not be used for review until the required fields are repaired.",
+        }
+    if warning_count > 0:
+        return {
+            "tone": "warning",
+            "label": "Reviewable with warnings",
+            "headline": f"0 blockers · {warning_count} review note{'s' if warning_count != 1 else ''}.",
+            "body": "You can continue, but read the warning summary and confirm the chart manually.",
+        }
+    return {
+        "tone": "success",
+        "label": "Ready for review",
+        "headline": "0 blockers · 0 warnings.",
+        "body": "The data checks passed. Manual chart confirmation still applies.",
+    }
+
+
+def render_validation_health_message(
+    st: Any,
+    blocking_count: int,
+    warning_count: int,
+    has_rows: bool = True,
+) -> None:
+    status = workflow_readiness_status(int(bool(has_rows)), blocking_count, warning_count)
+    st.markdown(
+        f"""
+        <div class="ta-status-banner {html.escape(status['tone'])}">
+          <div class="ta-status-headline">{html.escape(status['headline'])}</div>
+          <div class="ta-status-copy">{html.escape(status['body'])}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _show_warning_plain_english_details(st: Any, warnings: list[str], expanded: bool = False) -> None:
+    summary = validation_warning_plain_english_summary(warnings)
+    nonzero = [f"{label}: {count}" for label, count in summary["grouped_counts"].items() if count]
+    st.caption("Warnings are review notes, not blockers. " + " · ".join(nonzero))
+    with st.expander("Review warning details", expanded=expanded):
+        st.write("Missing optional context and manual-confirmation reminders do not stop the workflow.")
+        for warning in warnings:
+            st.write(f"- {warning}")
 
 
 def _rows_from_editor_output(edited_rows: Any) -> list[dict[str, Any]]:
@@ -1593,18 +1728,26 @@ def _require_streamlit_access(st: Any) -> None:
         st.stop()
 
 
-def _streamlit_candidate_source(st: Any, initial_path: Path) -> tuple[str, Path | None, list[dict[str, Any]], bool]:
+def _streamlit_candidate_source(
+    st: Any,
+    initial_path: Path,
+    view_mode: str = "Beginner",
+) -> tuple[str, Path | None, list[dict[str, Any]], bool]:
     initial_path = _resolve_path(initial_path)
-    source_options = [
-        "Sample data",
-        "real_candidates_template.csv",
-        _review_engine_label(),
-        "Upload CSV",
-        "Paste CSV",
-        "TradingView Import",
-        "Manual Entry",
-        "Custom CSV path",
-    ]
+    source_options = ["Sample data", "Upload CSV", "Manual Entry"]
+    if str(view_mode).strip().lower() == "advanced":
+        source_options = [
+            "Sample data",
+            "real_candidates_template.csv",
+            _review_engine_label(),
+            "Upload CSV",
+            "Paste CSV",
+            "TradingView Import",
+            "Manual Entry",
+        ]
+        allow_local_path = str(os.environ.get("TRADING_AUTOPILOT_ALLOW_LOCAL_PATHS", "")).strip().lower()
+        if allow_local_path in {"1", "true", "yes"}:
+            source_options.append("Custom CSV path")
     if _has_review_engine_session_rows(st):
         source_options.insert(2, "Review Engine Session")
 
@@ -1625,9 +1768,10 @@ def _streamlit_candidate_source(st: Any, initial_path: Path) -> tuple[str, Path 
         st.session_state.candidate_source = default_source
 
     source = st.sidebar.radio(
-        "Candidate source",
+        "Review data",
         source_options,
         key="candidate_source",
+        help="Choose the rows used by Review and Journal. Live watchlist analysis is available on Analyze.",
     )
     st.session_state.tradingview_import_errors = []
     if source == "Sample data":
@@ -1649,8 +1793,8 @@ def _streamlit_candidate_source(st: Any, initial_path: Path) -> tuple[str, Path 
             st.session_state.review_engine_loaded_row_count = 0
             st.rerun()
         if not import_text.strip():
-            st.info("No Review Engine session rows are loaded yet.")
-            st.stop()
+            st.sidebar.info("No Review Engine session rows are loaded yet.")
+            return "Review Engine Session", None, [], True
         try:
             import_rows = _parse_tradingview_import_text(import_text)
         except TradingViewImportParseError as exc:
@@ -1668,8 +1812,8 @@ def _streamlit_candidate_source(st: Any, initial_path: Path) -> tuple[str, Path 
         st.sidebar.code(TRADINGVIEW_IMPORT_EXAMPLE, language="csv")
         import_text = st.sidebar.text_area(_review_engine_label(), height=180)
         if not import_text.strip():
-            st.info("Paste rows into the Review Engine Paste Box to start review.")
-            st.stop()
+            st.sidebar.info("Paste rows here, or use the full-width import on Analyze.")
+            return _review_engine_label(), None, [], True
         try:
             import_rows = _parse_tradingview_import_text(import_text)
         except TradingViewImportParseError as exc:
@@ -1681,14 +1825,14 @@ def _streamlit_candidate_source(st: Any, initial_path: Path) -> tuple[str, Path 
     if source == "Upload CSV":
         uploaded = st.sidebar.file_uploader("Upload CSV", type=["csv"])
         if uploaded is None:
-            st.info("Upload a CSV to review candidates.")
-            st.stop()
+            st.sidebar.info("Choose a CSV. You can still use Analyze and Charts while this is empty.")
+            return "Upload CSV", None, [], True
         return str(uploaded.name or "uploaded CSV"), None, _load_csv_bytes(uploaded.getvalue()), True
     if source == "Paste CSV":
         pasted = st.sidebar.text_area("Paste CSV", height=180)
         if not pasted.strip():
-            st.info("Paste CSV text to review candidates.")
-            st.stop()
+            st.sidebar.info("Paste CSV text here, or use the guided importer on Analyze.")
+            return "Paste CSV", None, [], True
         return "pasted CSV", None, _load_csv_text(pasted), True
     if source == "TradingView Import":
         st.sidebar.caption("Paste copied/exported TradingView or scanner-style CSV rows. Session-only.")
@@ -1698,8 +1842,8 @@ def _streamlit_candidate_source(st: Any, initial_path: Path) -> tuple[str, Path 
         st.sidebar.code(TRADINGVIEW_IMPORT_EXAMPLE, language="csv")
         import_text = st.sidebar.text_area("TradingView Import", height=180)
         if not import_text.strip():
-            st.info("Paste TradingView or scanner rows to start import.")
-            st.stop()
+            st.sidebar.info("Paste TradingView/scanner rows here, or use the guided importer on Analyze.")
+            return "TradingView Import", None, [], True
         try:
             import_rows = _parse_tradingview_import_text(import_text)
         except TradingViewImportParseError as exc:
@@ -1724,7 +1868,12 @@ def _streamlit_candidate_source(st: Any, initial_path: Path) -> tuple[str, Path 
     custom_default = initial_path if default_source == "Custom CSV path" else WORKING_DATA
     custom_path = st.sidebar.text_input("Custom CSV path", value=str(custom_default))
     path = _resolve_path(custom_path)
-    return str(path), path, _load(path), True
+    try:
+        custom_rows = _load(path)
+    except (FileNotFoundError, IsADirectoryError, PermissionError, OSError) as exc:
+        st.sidebar.error(f"Local CSV could not be opened: {exc}")
+        return "Custom CSV path", None, [], True
+    return "Local CSV", path, custom_rows, True
 
 
 def _streamlit_warning_lines(path: Path | None, user_supplied: bool) -> list[str]:
@@ -1797,26 +1946,144 @@ def _inject_product_styles(st: Any) -> None:
         """
         <style>
         :root {
-            --ta-card-bg: rgba(15, 23, 42, 0.58);
-            --ta-card-border: rgba(148, 163, 184, 0.28);
-            --ta-text-soft: rgba(226, 232, 240, 0.76);
-            --ta-success: #22c55e;
-            --ta-info: #38bdf8;
-            --ta-warning: #f59e0b;
-            --ta-danger: #ef4444;
+            --ta-bg: #050b14;
+            --ta-panel: rgba(9, 20, 36, 0.88);
+            --ta-card-bg: linear-gradient(145deg, rgba(15, 31, 51, 0.96), rgba(8, 19, 33, 0.92));
+            --ta-card-border: rgba(125, 163, 196, 0.20);
+            --ta-text: #f4f8fb;
+            --ta-text-soft: #9fb2c4;
+            --ta-success: #2ee59d;
+            --ta-info: #55c8ff;
+            --ta-warning: #ffbd59;
+            --ta-danger: #ff6b7d;
+            --ta-purple: #9d8cff;
+        }
+        html { scroll-behavior: smooth; }
+        [data-testid="stAppViewContainer"] {
+            background:
+                radial-gradient(circle at 82% -8%, rgba(49, 129, 208, 0.18), transparent 31rem),
+                radial-gradient(circle at 8% 4%, rgba(46, 229, 157, 0.10), transparent 28rem),
+                var(--ta-bg);
+        }
+        [data-testid="stHeader"] { background: transparent; }
+        [data-testid="stSidebar"] {
+            background: rgba(5, 12, 22, 0.98);
+            border-right: 1px solid rgba(125, 163, 196, 0.14);
+        }
+        #MainMenu, footer, [data-testid="stDeployButton"], [data-testid="stStatusWidget"] {
+            visibility: hidden;
         }
         .block-container {
-            padding-top: 2rem;
-            max-width: 1180px;
+            padding-top: 1.15rem;
+            padding-bottom: 4rem;
+            max-width: 1280px;
+        }
+        h1, h2, h3 { color: var(--ta-text); letter-spacing: -0.025em; }
+        p, li, label { color: #dbe6ef; }
+        .ta-app-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 1rem;
+            padding: 0.25rem 0 1rem;
+        }
+        .ta-wordmark { display: flex; align-items: center; gap: 0.8rem; }
+        .ta-mark {
+            width: 2.55rem;
+            height: 2.55rem;
+            display: grid;
+            place-items: center;
+            border-radius: 12px;
+            background: linear-gradient(145deg, #46d3ff, #2ee59d);
+            color: #03111b;
+            font-weight: 950;
+            box-shadow: 0 10px 28px rgba(46, 229, 157, 0.22);
+        }
+        .ta-wordmark-title { color: var(--ta-text); font-size: 1.15rem; font-weight: 850; }
+        .ta-wordmark-subtitle { color: var(--ta-text-soft); font-size: 0.78rem; }
+        .ta-version { color: var(--ta-text-soft); font-size: 0.8rem; white-space: nowrap; }
+        .ta-page-kicker {
+            color: var(--ta-info);
+            text-transform: uppercase;
+            font-size: 0.72rem;
+            font-weight: 850;
+            letter-spacing: 0.11em;
+            margin-bottom: 0.35rem;
+        }
+        .ta-page-title {
+            color: var(--ta-text);
+            font-size: clamp(2rem, 5vw, 3.45rem);
+            font-weight: 880;
+            line-height: 1.02;
+            letter-spacing: -0.055em;
+        }
+        .ta-page-subtitle {
+            color: var(--ta-text-soft);
+            font-size: 1.03rem;
+            line-height: 1.55;
+            max-width: 780px;
+            margin-top: 0.55rem;
+        }
+        .ta-status-bar {
+            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap: 0.65rem;
+            margin: 1rem 0 1.15rem;
+        }
+        .ta-status-item {
+            border: 1px solid var(--ta-card-border);
+            background: rgba(8, 20, 34, 0.72);
+            border-radius: 13px;
+            padding: 0.7rem 0.8rem;
+        }
+        .ta-status-label { color: var(--ta-text-soft); font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.06em; }
+        .ta-status-value { color: var(--ta-text); font-weight: 800; margin-top: 0.15rem; overflow-wrap: anywhere; }
+        .ta-status-success .ta-status-value { color: #8cf3c9; }
+        .ta-status-warning .ta-status-value { color: #ffd993; }
+        .ta-status-error .ta-status-value { color: #ff9aa7; }
+        .ta-status-banner {
+            border: 1px solid var(--ta-card-border);
+            border-left: 4px solid var(--ta-info);
+            border-radius: 14px;
+            padding: 0.9rem 1rem;
+            margin: 0.85rem 0;
+            background: rgba(10, 24, 41, 0.84);
+        }
+        .ta-status-banner.success { border-left-color: var(--ta-success); }
+        .ta-status-banner.warning { border-left-color: var(--ta-warning); }
+        .ta-status-banner.error { border-left-color: var(--ta-danger); }
+        .ta-status-headline { color: var(--ta-text); font-weight: 820; }
+        .ta-status-copy { color: var(--ta-text-soft); margin-top: 0.25rem; line-height: 1.45; }
+        .ta-candidate-card {
+            border: 1px solid var(--ta-card-border);
+            border-radius: 16px;
+            padding: 1rem;
+            margin: 0.65rem 0;
+            background: var(--ta-card-bg);
+            box-shadow: 0 18px 48px rgba(0, 0, 0, 0.20);
+        }
+        .ta-candidate-top { display: flex; justify-content: space-between; align-items: flex-start; gap: 1rem; }
+        .ta-candidate-symbol { color: var(--ta-text); font-size: 1.3rem; font-weight: 900; }
+        .ta-candidate-meta { color: var(--ta-text-soft); font-size: 0.86rem; margin-top: 0.2rem; }
+        .ta-score { color: var(--ta-info); font-size: 1.25rem; font-weight: 900; text-align: right; }
+        .ta-score-label { color: var(--ta-text-soft); font-size: 0.7rem; text-transform: uppercase; }
+        .ta-chip-row { display: flex; flex-wrap: wrap; gap: 0.42rem; margin-top: 0.8rem; }
+        .ta-chip {
+            color: #cfe0ec;
+            border: 1px solid rgba(125, 163, 196, 0.24);
+            border-radius: 999px;
+            padding: 0.27rem 0.52rem;
+            background: rgba(4, 12, 22, 0.44);
+            font-size: 0.75rem;
         }
         .ta-hero {
             border: 1px solid rgba(56, 189, 248, 0.28);
-            border-radius: 8px;
-            padding: 1.25rem;
+            border-radius: 18px;
+            padding: 1.4rem;
             margin: 0 0 1rem 0;
             background:
-                linear-gradient(135deg, rgba(14, 165, 233, 0.16), rgba(34, 197, 94, 0.08)),
-                rgba(15, 23, 42, 0.52);
+                linear-gradient(135deg, rgba(38, 147, 215, 0.18), rgba(46, 229, 157, 0.09)),
+                rgba(7, 18, 31, 0.82);
         }
         .ta-hero-kicker {
             color: var(--ta-info);
@@ -1859,7 +2126,7 @@ def _inject_product_styles(st: Any) -> None:
         .ta-safety-strip {
             border: 1px solid rgba(245, 158, 11, 0.32);
             border-left: 4px solid var(--ta-warning);
-            border-radius: 8px;
+            border-radius: 12px;
             padding: 0.8rem 0.9rem;
             margin: 0.85rem 0;
             background: rgba(245, 158, 11, 0.09);
@@ -1868,8 +2135,8 @@ def _inject_product_styles(st: Any) -> None:
         }
         .product-card, .ta-step-card, .ta-feature-card, .breakdown-card {
             border: 1px solid var(--ta-card-border);
-            border-radius: 8px;
-            padding: 0.95rem;
+            border-radius: 15px;
+            padding: 1rem;
             min-height: 118px;
             margin-bottom: 0.75rem;
             background: var(--ta-card-bg);
@@ -1905,19 +2172,52 @@ def _inject_product_styles(st: Any) -> None:
         .product-card-error, .ta-card-error { border-left: 4px solid var(--ta-danger); }
         .product-card-info, .ta-card-info { border-left: 4px solid var(--ta-info); }
         .stAlert {
-            border-radius: 8px;
+            border-radius: 13px;
         }
         div[data-testid="stMetric"] {
             border: 1px solid var(--ta-card-border);
-            border-radius: 8px;
-            padding: 0.7rem 0.8rem;
-            background: rgba(15, 23, 42, 0.38);
+            border-radius: 13px;
+            padding: 0.75rem 0.85rem;
+            background: rgba(8, 20, 34, 0.72);
         }
-        @media (max-width: 700px) {
-            .block-container { padding-left: 1rem; padding-right: 1rem; }
+        div[data-testid="stMetricLabel"] { white-space: normal; }
+        div[data-testid="stMetricValue"] { color: var(--ta-text); }
+        div.stButton > button, div.stLinkButton > a, div.stDownloadButton > button {
+            border-radius: 11px;
+            min-height: 2.7rem;
+            font-weight: 760;
+            border-color: rgba(125, 163, 196, 0.28);
+        }
+        div.stButton > button[kind="primary"] {
+            background: linear-gradient(135deg, #2d9ed5, #1aa975);
+            border: none;
+            color: white;
+            box-shadow: 0 10px 24px rgba(26, 169, 117, 0.18);
+        }
+        [data-testid="stDataFrame"], [data-testid="stTable"] {
+            border: 1px solid var(--ta-card-border);
+            border-radius: 14px;
+            overflow: hidden;
+        }
+        div[role="radiogroup"] { gap: 0.4rem; }
+        div[role="radiogroup"] > label {
+            border: 1px solid rgba(125, 163, 196, 0.20);
+            border-radius: 999px;
+            padding: 0.25rem 0.6rem;
+            background: rgba(8, 20, 34, 0.56);
+        }
+        @media (max-width: 760px) {
+            .block-container { padding: 0.7rem 0.8rem 3rem; }
+            .ta-app-header { align-items: flex-start; }
+            .ta-version { display: none; }
+            .ta-status-bar { grid-template-columns: repeat(2, minmax(0, 1fr)); }
             .ta-hero { padding: 1rem; }
             .ta-hero-title { font-size: 2rem; }
             .ta-step-card, .ta-feature-card, .product-card { min-height: unset; }
+            .ta-page-title { font-size: 2.15rem; }
+            .ta-page-subtitle { font-size: 0.95rem; }
+            .ta-candidate-top { gap: 0.5rem; }
+            div[data-testid="stHorizontalBlock"] { gap: 0.55rem; }
         }
         </style>
         """,
@@ -1931,6 +2231,174 @@ def _status_class(status: str) -> str:
         "warning": "warning",
         "error": "error",
     }.get(status, "info")
+
+
+def _public_source_label(source_label: str) -> str:
+    label = str(source_label or "").strip()
+    if not label:
+        return "No data"
+    if label.startswith(("/", "~")) or "\\" in label:
+        return "Local CSV"
+    aliases = {
+        "real_candidates_template.csv": "Example template",
+        "Review Engine Paste Box": "Pasted review data",
+        "TradingView Import": "Pasted TradingView data",
+    }
+    return aliases.get(label, label)
+
+
+def _render_app_header(st: Any) -> None:
+    st.markdown(
+        f"""
+        <div class="ta-app-header">
+          <div class="ta-wordmark">
+            <div class="ta-mark">TA</div>
+            <div>
+              <div class="ta-wordmark-title">Trading Autopilot</div>
+              <div class="ta-wordmark-subtitle">Chart-first decision support</div>
+            </div>
+          </div>
+          <div class="ta-version">v{html.escape(APP_DISPLAY_VERSION)}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _render_page_heading(st: Any, kicker: str, title: str, subtitle: str) -> None:
+    st.markdown(
+        f"""
+        <div class="ta-page-kicker">{html.escape(kicker)}</div>
+        <div class="ta-page-title">{html.escape(title)}</div>
+        <div class="ta-page-subtitle">{html.escape(subtitle)}</div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _render_compact_status_bar(
+    st: Any,
+    *,
+    source_label: str,
+    row_count: int,
+    blocking_count: int,
+    warning_count: int,
+    provider: str,
+) -> None:
+    readiness = workflow_readiness_status(row_count, blocking_count, warning_count)
+    provider_value = "Polygon live" if str(provider).lower() == "polygon" else "Manual / sample"
+    items = [
+        ("Data", _public_source_label(source_label), "info"),
+        ("Candidates", str(row_count), "info"),
+        ("Review status", readiness["label"], readiness["tone"]),
+        ("Market feed", provider_value, "success" if str(provider).lower() == "polygon" else "info"),
+    ]
+    cards = "".join(
+        (
+            f"<div class='ta-status-item ta-status-{html.escape(tone)}'>"
+            f"<div class='ta-status-label'>{html.escape(label)}</div>"
+            f"<div class='ta-status-value'>{html.escape(value)}</div></div>"
+        )
+        for label, value, tone in items
+    )
+    st.markdown(f"<div class='ta-status-bar'>{cards}</div>", unsafe_allow_html=True)
+
+
+def _format_candidate_number(value: Any) -> str:
+    try:
+        number = float(str(value or "").replace(",", "").strip())
+    except (TypeError, ValueError):
+        return "—"
+    if number == 0:
+        return "—"
+    if abs(number) >= 1000:
+        return f"{number:,.2f}"
+    return f"{number:.2f}".rstrip("0").rstrip(".")
+
+
+def _unique_ranked_candidates(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for row in rank_candidates(rows):
+        ticker = str(row.get("ticker", "") or "").strip().upper()
+        if not ticker or ticker in seen:
+            continue
+        seen.add(ticker)
+        candidates.append(row)
+    return candidates
+
+
+def _render_candidate_card(st: Any, row: dict[str, Any], *, show_levels: bool = True) -> None:
+    ticker = str(row.get("ticker", "UNKNOWN") or "UNKNOWN").strip().upper()
+    bias = str(row.get("bias", "unclear") or "unclear").replace("_", " ")
+    state = str(row.get("state", "watch") or "watch").replace("_", " ")
+    grade = str(row.get("grade", "—") or "—")
+    score = str(row.get("score", "—") or "—")
+    timeframe = str(row.get("timeframe", "—") or "—")
+    price = _format_candidate_number(row.get("close") or row.get("price"))
+    chips = [bias.title(), state.title(), timeframe]
+    if show_levels:
+        support = _format_candidate_number(row.get("support1") or row.get("support"))
+        resistance = _format_candidate_number(row.get("resistance1") or row.get("resistance"))
+        chips.extend([f"Support {support}", f"Resistance {resistance}"])
+    chip_html = "".join(f"<span class='ta-chip'>{html.escape(chip)}</span>" for chip in chips)
+    st.markdown(
+        f"""
+        <div class="ta-candidate-card">
+          <div class="ta-candidate-top">
+            <div>
+              <div class="ta-candidate-symbol">{html.escape(ticker)}</div>
+              <div class="ta-candidate-meta">Price {html.escape(price)} · {html.escape(grade)} grade</div>
+            </div>
+            <div><div class="ta-score">{html.escape(score)}</div><div class="ta-score-label">Autopilot score</div></div>
+          </div>
+          <div class="ta-chip-row">{chip_html}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _candidate_next_action(row: dict[str, Any]) -> str:
+    state = str(row.get("state", "") or "").strip().lower()
+    if state == "avoid":
+        return "Stand aside. Review the risk flags and wait for the setup to repair."
+    if state in {"priority_watch", "alert"}:
+        return "Open the chart, confirm the trigger and invalidation, then decide whether this stays on watch."
+    if state.startswith("context"):
+        return "Use this as market context, not as a standalone trade candidate."
+    return "Open the chart and wait for clearer confirmation before planning anything."
+
+
+def _render_candidate_details(st: Any, row: dict[str, Any]) -> None:
+    _render_candidate_card(st, row)
+    level_columns = st.columns(4)
+    for column, label, key in [
+        (level_columns[0], "Trigger up", "bullish_trigger"),
+        (level_columns[1], "Trigger down", "bearish_trigger"),
+        (level_columns[2], "Invalidation", "invalid"),
+        (level_columns[3], "Relative volume", "relative_volume"),
+    ]:
+        column.metric(label, _format_candidate_number(row.get(key)))
+
+    reasons = row.get("reasons") if isinstance(row.get("reasons"), list) else []
+    risks = row.get("risk_flags") if isinstance(row.get("risk_flags"), list) else []
+    left, right = st.columns(2)
+    with left:
+        st.markdown("**Why it scored this way**")
+        if reasons:
+            for reason in reasons[:5]:
+                st.write(f"- {str(reason).replace('_', ' ')}")
+        else:
+            st.caption("No scoring explanation is available for this row.")
+    with right:
+        st.markdown("**Risk check**")
+        if risks:
+            for risk in risks[:5]:
+                st.write(f"- {str(risk).replace('_', ' ')}")
+        else:
+            st.success("No row-level risk flags from the available fields.")
+    st.info(_candidate_next_action(row))
 
 
 def _render_hero(st: Any, title: str, subtitle: str, status_text: str) -> None:
@@ -2062,16 +2530,19 @@ def review_engine_status_summary(
     source_label: str,
 ) -> dict[str, Any]:
     source = str(source_label or "").strip() or "unknown"
-    session_loaded = source == "Review Engine Session"
     row_count = len(rows)
     blocking_count = len(validation_errors)
+    warning_count = len(validation_warnings)
+    readiness = workflow_readiness_status(row_count, blocking_count, warning_count)
     summary = {
-        "session_rows_loaded": "yes" if session_loaded and row_count else "no",
-        "source": source,
+        "session_rows_loaded": "yes" if row_count else "no",
+        "source": _public_source_label(source),
         "row_count": row_count,
         "blocking_issues": blocking_count,
-        "warnings": len(validation_warnings),
+        "warnings": warning_count,
         "ready_for_review": bool(row_count and not blocking_count),
+        "readiness_label": readiness["label"],
+        "readiness_tone": readiness["tone"],
     }
     summary["next_step"] = review_engine_next_step(summary)
     return summary
@@ -2087,20 +2558,19 @@ def _show_review_engine_status(
     status = review_engine_status_summary(rows, validation_errors, validation_warnings, source_label)
     st.subheader("Review Engine Status")
     columns = st.columns(5)
-    columns[0].metric("Session rows loaded", status["session_rows_loaded"])
+    columns[0].metric("Rows available", status["session_rows_loaded"])
     columns[1].metric("Source", status["source"])
     columns[2].metric("Rows", status["row_count"])
     columns[3].metric("Blocking issues", status["blocking_issues"])
     columns[4].metric("Warnings", status["warnings"])
-    if status["ready_for_review"]:
-        st.success("Ready for Daily Review. Manual chart confirmation still applies.")
-        st.info("What to click now: Open Daily Review. Then open Calibration Results if you want label templates.")
-    elif status["blocking_issues"]:
-        st.error("Fix blocking issues before Daily Review.")
-        st.info("What to click now: fix Candidate Validation blocking issues first.")
-    else:
-        st.info("Start with Live Market Data, Market Breakdown, Chart Workspace, or the Review Engine Paste Box.")
-        st.info("What to click now: Analyze Live Market Data first.")
+    render_validation_health_message(
+        st,
+        int(status["blocking_issues"]),
+        int(status["warnings"]),
+        bool(status["row_count"]),
+    )
+    if status["warnings"]:
+        _show_warning_plain_english_details(st, validation_warnings)
     st.caption(f"Next step: {status['next_step']}.")
 
 
@@ -2115,8 +2585,10 @@ def _show_review_engine_handoff_success(st: Any, status: dict[str, Any]) -> None
     columns[1].metric("Rows loaded", row_count)
     columns[2].metric("Blocking issues", status.get("blocking_issues", 0))
     columns[3].metric("Next step", "Open Daily Review")
-    if status.get("ready_for_review"):
-        st.info("Use the Daily Review tab below. Then open Calibration Results if you want label templates.")
+    if status.get("ready_for_review") and not status.get("warnings"):
+        st.info("Open Review, then Journal if you want to calibrate this row.")
+    elif status.get("ready_for_review"):
+        st.warning("Rows are reviewable with warnings. Read the warning summary before continuing.")
     else:
         st.warning("Fix blocking issues before Daily Review.")
     st.session_state.review_engine_just_loaded = False
@@ -2365,10 +2837,14 @@ def _show_daily_review(st: Any, rows: list[dict[str, Any]], sections: dict[str, 
     metric_columns = st.columns(2)
     metric_columns[0].metric("Blocking issues", len(validation_errors))
     metric_columns[1].metric("Warnings", len(validation_warnings))
-    if validation_errors:
-        st.error("Fix blocking validation issues before review.")
-    else:
-        st.success("Ready for review. Still verify charts manually.")
+    render_validation_health_message(
+        st,
+        len(validation_errors),
+        len(validation_warnings),
+        bool(rows),
+    )
+    if validation_warnings:
+        _show_warning_plain_english_details(st, validation_warnings)
 
     st.subheader("Review Cards")
     cards = build_daily_review_cards(rows, sections)
@@ -3357,7 +3833,86 @@ def _calibration_results_signature(rows: list[dict[str, Any]]) -> str:
     return "\n".join(parts)
 
 
-def _show_calibration_results(st: Any, rows: list[dict[str, Any]], sections: dict[str, list[dict[str, Any]]]) -> None:
+def _level_value_from_key_levels(key_levels: str, label: str) -> str:
+    text = str(key_levels or "")
+    marker = f"{label} "
+    if marker not in text:
+        return ""
+    tail = text.split(marker, 1)[1]
+    for separator in [" / ", ";", ","]:
+        if separator in tail:
+            tail = tail.split(separator, 1)[0]
+    return tail.strip()
+
+
+def _calibration_card_next_action(row: dict[str, Any]) -> str:
+    issue_type = str(row.get("issue_type", "") or "").strip().lower()
+    match_status = str(row.get("match_status", "") or "").strip().lower()
+    if issue_type and issue_type not in {"none", "needs_manual_chart_confirmation"}:
+        return "Review the issue before changing any scoring rule."
+    if match_status and match_status not in {"match", "unclear"}:
+        return "Document why the dashboard and chart disagree."
+    if issue_type == "needs_manual_chart_confirmation" or match_status in {"", "unclear"}:
+        return "Confirm the chart, then label this row."
+    return "Add the confirmed row to the Batch Log."
+
+
+def build_calibration_mobile_cards(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    cards: list[dict[str, Any]] = []
+    for row in rows:
+        key_levels = str(row.get("key_levels", "") or "").strip()
+        issue_type = str(row.get("issue_type", "") or "").strip() or "needs_manual_chart_confirmation"
+        cards.append(
+            {
+                "ticker": str(row.get("ticker", "") or "").strip().upper(),
+                "timeframe": str(row.get("timeframe_checked", "") or "").strip(),
+                "score": str(row.get("dashboard_score", "") or "").strip(),
+                "grade": str(row.get("dashboard_grade", "") or "").strip(),
+                "state": str(row.get("dashboard_state", "") or "").strip(),
+                "bucket": str(row.get("dashboard_bucket", "") or "").strip(),
+                "manual_chart_bias": str(row.get("manual_chart_bias", "") or "unclear").strip() or "unclear",
+                "match_status": str(row.get("match_status", "") or "unclear").strip() or "unclear",
+                "issue_type": issue_type,
+                "support": _level_value_from_key_levels(key_levels, "support"),
+                "resistance": _level_value_from_key_levels(key_levels, "resistance"),
+                "key_levels": key_levels,
+                "next_action": _calibration_card_next_action(row),
+            }
+        )
+    return cards
+
+
+def _render_calibration_mobile_card(st: Any, card: dict[str, Any]) -> None:
+    st.markdown(
+        f"""
+        <div class="ta-candidate-card">
+          <div class="ta-candidate-top">
+            <div>
+              <div class="ta-candidate-symbol">{html.escape(card.get('ticker') or 'UNKNOWN')}</div>
+              <div class="ta-candidate-meta">{html.escape(card.get('timeframe') or 'Timeframe n/a')} · {html.escape(card.get('bucket') or 'Unbucketed')}</div>
+            </div>
+            <div><div class="ta-score">{html.escape(card.get('score') or '—')}</div><div class="ta-score-label">{html.escape(card.get('grade') or 'No grade')}</div></div>
+          </div>
+          <div class="ta-chip-row">
+            <span class="ta-chip">{html.escape((card.get('state') or 'watch').replace('_', ' ').title())}</span>
+            <span class="ta-chip">Chart: {html.escape((card.get('manual_chart_bias') or 'unclear').title())}</span>
+            <span class="ta-chip">Match: {html.escape((card.get('match_status') or 'unclear').replace('_', ' '))}</span>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    if card.get("key_levels"):
+        st.caption(f"Levels: {card['key_levels']}")
+    st.info(card.get("next_action") or "Confirm the chart manually.")
+
+
+def _show_calibration_results(
+    st: Any,
+    rows: list[dict[str, Any]],
+    sections: dict[str, list[dict[str, Any]]],
+    view_mode: str = "Beginner",
+) -> None:
     st.warning(CALIBRATION_RESULTS_WARNING)
     base_rows = build_calibration_result_rows(rows, sections)
     if not base_rows:
@@ -3376,15 +3931,37 @@ def _show_calibration_results(st: Any, rows: list[dict[str, Any]], sections: dic
             "issue_type": st.column_config.SelectboxColumn("issue_type", options=CALIBRATION_ISSUE_TYPES),
         }
 
-    edited_rows = st.data_editor(
-        st.session_state.calibration_results_rows,
-        column_order=CALIBRATION_RESULT_COLUMNS,
-        width="stretch",
-        hide_index=True,
-        num_rows="fixed",
-        column_config=column_config,
-        height=360,
-    )
+    validation_errors, validation_warnings = validate_candidate_rows(rows, ALL_CANDIDATE_COLUMNS)
+    render_validation_health_message(st, len(validation_errors), len(validation_warnings), bool(rows))
+    if validation_warnings:
+        _show_warning_plain_english_details(st, validation_warnings, expanded=False)
+
+    st.subheader("Calibration cards")
+    for card in build_calibration_mobile_cards(st.session_state.calibration_results_rows):
+        _render_calibration_mobile_card(st, card)
+
+    def render_advanced_editor() -> Any:
+        return st.data_editor(
+            st.session_state.calibration_results_rows,
+            column_order=CALIBRATION_RESULT_COLUMNS,
+            width="stretch",
+            hide_index=True,
+            num_rows="fixed",
+            column_config=column_config,
+            height=360,
+        )
+
+    if str(view_mode).lower() == "beginner":
+        show_editor = st.toggle(
+            "Show advanced editable grid",
+            value=False,
+            key="show_calibration_editor",
+            help="Turn this on only when you want spreadsheet-style calibration editing.",
+        )
+        edited_rows = render_advanced_editor() if show_editor else st.session_state.calibration_results_rows
+    else:
+        st.subheader("Advanced editable grid")
+        edited_rows = render_advanced_editor()
     st.session_state.calibration_results_rows = _rows_from_editor_output(edited_rows)
     st.download_button(
         "Download Calibration CSV",
@@ -3592,43 +4169,552 @@ def _show_calibration_review(st: Any) -> None:
     _show_scoring_adjustment_proposal(st, rows)
 
 
+def _queue_beginner_page(st: Any, page: str) -> None:
+    if page in BEGINNER_PAGE_NAMES:
+        st.session_state.pending_beginner_page = page
+
+
+def _render_beginner_navigation(st: Any) -> str:
+    slug_to_page = {slug: page for page, slug in BEGINNER_PAGE_SLUGS.items()}
+    pending = st.session_state.pop("pending_beginner_page", None)
+    if pending in BEGINNER_PAGE_NAMES:
+        st.session_state.beginner_page = pending
+        st.query_params["page"] = BEGINNER_PAGE_SLUGS[pending]
+        st.session_state.last_beginner_query_slug = BEGINNER_PAGE_SLUGS[pending]
+
+    query_slug = str(st.query_params.get("page", "") or "").strip().lower()
+    last_slug = str(st.session_state.get("last_beginner_query_slug", "") or "")
+    if query_slug in slug_to_page and query_slug != last_slug:
+        st.session_state.beginner_page = slug_to_page[query_slug]
+    if st.session_state.get("beginner_page") not in BEGINNER_PAGE_NAMES:
+        st.session_state.beginner_page = "Dashboard"
+
+    selected = st.radio(
+        "Workspace",
+        BEGINNER_PAGE_NAMES,
+        horizontal=True,
+        key="beginner_page",
+        label_visibility="collapsed",
+    )
+    selected_slug = BEGINNER_PAGE_SLUGS[selected]
+    if query_slug != selected_slug:
+        st.query_params["page"] = selected_slug
+    st.session_state.last_beginner_query_slug = selected_slug
+    return selected
+
+
+def _show_dashboard_watchlist(
+    st: Any,
+    provider: str,
+    config: dict[str, str],
+    config_errors: list[str],
+) -> None:
+    st.subheader("Scan your watchlist")
+    st.caption("Read-only market data. Nothing here creates an order or a TradingView alert.")
+    with st.form("dashboard_watchlist_form"):
+        input_columns = st.columns([2.2, 0.8])
+        tickers_text = input_columns[0].text_input(
+            "Tickers",
+            value="SPY, QQQ, AAPL",
+            help="Comma- or space-separated tickers, up to 20.",
+        )
+        timeframe = input_columns[1].selectbox("Timeframe", ["15m", "1h", "4h", "1D"], index=3)
+        submitted = st.form_submit_button("Analyze watchlist", type="primary")
+
+    if submitted:
+        tickers = parse_watchlist_text(tickers_text, limit=20)
+        if not tickers:
+            st.warning("Enter at least one ticker.")
+        elif provider != "polygon" or config_errors:
+            st.session_state.dashboard_watchlist_errors = list(config_errors) or ["Polygon is not configured."]
+            st.session_state.dashboard_watchlist_rows = []
+        else:
+            with st.spinner("Reading the latest available market bars…"):
+                breakdown_rows, errors = _market_breakdown_rows_from_provider(tickers, timeframe, config)
+            st.session_state.dashboard_watchlist_rows = breakdown_rows
+            st.session_state.dashboard_watchlist_errors = errors
+
+    errors = st.session_state.get("dashboard_watchlist_errors", [])
+    if errors:
+        st.warning("Live data is not available right now. Sample/manual review still works.")
+        with st.expander("Connection details", expanded=False):
+            for error in errors:
+                st.write(f"- {error}")
+
+    breakdown_rows = st.session_state.get("dashboard_watchlist_rows", [])
+    if not isinstance(breakdown_rows, list) or not breakdown_rows:
+        return
+    st.success(f"Analyzed {len(breakdown_rows)} ticker{'s' if len(breakdown_rows) != 1 else ''}.")
+    for row in breakdown_rows[:3]:
+        _render_breakdown_card(st, row)
+    generated_csv = _breakdown_rows_to_import_csv(breakdown_rows)
+    action_columns = st.columns(2)
+    if action_columns[0].button("Use these rows in Review", type="primary", key="dashboard_send_to_review"):
+        _send_rows_to_review_session(st, generated_csv, "Dashboard watchlist")
+        _queue_beginner_page(st, "Review")
+        st.rerun()
+    if action_columns[1].button("Open the chart desk", key="dashboard_open_charts"):
+        _queue_beginner_page(st, "Charts")
+        st.rerun()
+
+
+def _show_command_center(
+    st: Any,
+    rows: list[dict[str, Any]],
+    sections: dict[str, list[dict[str, Any]]],
+    source_label: str,
+) -> None:
+    _render_page_heading(
+        st,
+        "Command center",
+        "From watchlist to chart — in one clean flow.",
+        "Analyze the market, open the exact symbol in TradingView, review the setup, and keep a calibration trail.",
+    )
+    quick_columns = st.columns(4)
+    quick_actions = [
+        ("Analyze", "Scan live tickers", "Analyze"),
+        ("Charts", "Open TradingView", "Charts"),
+        ("Review", "Check the queue", "Review"),
+        ("Journal", "Track accuracy", "Journal"),
+    ]
+    for column, (label, help_text, page) in zip(quick_columns, quick_actions):
+        column.button(
+            f"{label}\n\n{help_text}",
+            key=f"dashboard_quick_{page.lower()}",
+            on_click=_queue_beginner_page,
+            args=(st, page),
+            use_container_width=True,
+        )
+
+    config = _market_data_config_from_streamlit(st)
+    provider = configured_market_data_provider(config)
+    config_errors = market_data_config_errors(config)
+    _show_dashboard_watchlist(st, provider, config, config_errors)
+
+    st.subheader("Current review board")
+    candidates = _unique_ranked_candidates(rows)
+    if not candidates:
+        st.info("No review rows are loaded. Analyze a watchlist or choose a review-data source in the sidebar.")
+        return
+    focus_options = [str(row.get("ticker", "")).upper() for row in candidates]
+    focus = st.selectbox("Focus ticker", focus_options, key="dashboard_focus_ticker")
+    selected = next(row for row in candidates if str(row.get("ticker", "")).upper() == focus)
+    detail, actions = st.columns([1.65, 0.75])
+    with detail:
+        _render_candidate_details(st, selected)
+    with actions:
+        st.markdown("**Chart handoff**")
+        tv_symbol = candidate_tradingview_symbol(selected)
+        st.link_button(
+            f"Open {focus} in TradingView ↗",
+            tradingview_chart_url(tv_symbol),
+            use_container_width=True,
+        )
+        st.caption("Uses your signed-in TradingView browser session when available. No account credentials are shared with this app.")
+        if st.button("View embedded chart", type="primary", key="dashboard_view_embedded", use_container_width=True):
+            st.session_state.chart_focus_ticker = focus
+            _queue_beginner_page(st, "Charts")
+            st.rerun()
+
+    st.subheader("Top setups")
+    for candidate in candidates[:5]:
+        _render_candidate_card(st, candidate)
+
+
+def _show_guided_import(st: Any) -> None:
+    st.subheader("Paste TradingView or scanner data")
+    st.caption("Paste table/CSV text here. It stays in this browser session and is never sent to a broker.")
+    with st.expander("See a valid example", expanded=False):
+        st.code(TRADINGVIEW_IMPORT_EXAMPLE, language="csv")
+    import_text = st.text_area(
+        "TradingView or scanner rows",
+        height=210,
+        key="guided_tradingview_import",
+        placeholder="ticker,price,timeframe,bias_note,key_level_note\nSPY,500,1D,bullish,support 495",
+    )
+    if st.button("Validate pasted rows", type="primary", key="guided_import_validate"):
+        try:
+            parsed_rows = _parse_tradingview_import_text(import_text, preserve_missing_as_zero=True)
+        except TradingViewImportParseError as exc:
+            st.session_state.guided_import_rows = exc.rows
+            st.session_state.guided_import_errors = exc.errors
+        else:
+            st.session_state.guided_import_rows = parsed_rows
+            st.session_state.guided_import_errors = []
+
+    errors = st.session_state.get("guided_import_errors", [])
+    if errors:
+        st.error("Repair the pasted rows before continuing.")
+        for error in errors:
+            st.write(f"- {error}")
+    parsed_rows = st.session_state.get("guided_import_rows", [])
+    if not isinstance(parsed_rows, list) or not parsed_rows:
+        return
+    validation_errors, validation_warnings = validate_candidate_rows(parsed_rows, ALL_CANDIDATE_COLUMNS)
+    render_validation_health_message(st, len(validation_errors), len(validation_warnings), True)
+    st.dataframe(
+        [
+            {
+                "Ticker": row.get("ticker", ""),
+                "Price": row.get("close", ""),
+                "Timeframe": row.get("timeframe", ""),
+                "Support": row.get("support1", ""),
+                "Resistance": row.get("resistance1", ""),
+            }
+            for row in parsed_rows
+        ],
+        width="stretch",
+        hide_index=True,
+    )
+    if validation_errors:
+        return
+    if st.button("Use validated rows in Review", type="primary", key="guided_import_send"):
+        _send_rows_to_review_session(st, _candidate_csv_text(parsed_rows), "TradingView / scanner paste")
+        _queue_beginner_page(st, "Review")
+        st.rerun()
+
+
+def _show_quick_manual_intake(st: Any) -> None:
+    st.subheader("Quick manual row")
+    st.caption("Use only values you have verified. Unknown optional levels can stay blank.")
+    with st.form("quick_manual_intake"):
+        first = st.columns(3)
+        ticker = first[0].text_input("Ticker")
+        price = first[1].number_input("Price", min_value=0.0, value=0.0, step=0.01)
+        timeframe = first[2].selectbox("Timeframe", ["15m", "30m", "1h", "4h", "1D"], index=0)
+        second = st.columns(3)
+        bias = second[0].selectbox("Chart bias", ["unclear", "bullish", "bearish", "neutral", "mixed"])
+        support = second[1].number_input("Support", min_value=0.0, value=0.0, step=0.01)
+        resistance = second[2].number_input("Resistance", min_value=0.0, value=0.0, step=0.01)
+        notes = st.text_area("Notes", height=90)
+        submitted = st.form_submit_button("Add row to Review", type="primary")
+    if not submitted:
+        return
+    if not ticker.strip() or price <= 0:
+        st.error("Ticker and a price above 0 are required.")
+        return
+    candidate = _candidate_from_tradingview_import_row(
+        {
+            "ticker": ticker,
+            "close": price,
+            "timeframe": timeframe,
+            "bias_note": bias,
+            "support1": support,
+            "resistance1": resistance,
+            "notes": notes,
+        },
+        preserve_missing_as_zero=True,
+    )
+    _send_rows_to_review_session(st, _candidate_csv_text([candidate]), "Quick manual row")
+    _queue_beginner_page(st, "Review")
+    st.rerun()
+
+
+def _show_analyze_center(st: Any) -> None:
+    _render_page_heading(
+        st,
+        "Analyze",
+        "Bring in a watchlist without wrestling with CSVs.",
+        "Use live Polygon data, paste TradingView/scanner rows, or add one verified ticker manually.",
+    )
+    mode = st.radio(
+        "Input method",
+        ["Live watchlist", "Paste TradingView data", "Quick manual row"],
+        horizontal=True,
+        key="analyze_input_method",
+    )
+    if mode == "Live watchlist":
+        _show_market_breakdown(st)
+    elif mode == "Paste TradingView data":
+        _show_guided_import(st)
+    else:
+        _show_quick_manual_intake(st)
+
+
+def _append_compact_chart_note(st: Any, ticker: str, timeframe: str) -> None:
+    with st.form("compact_chart_note"):
+        top = st.columns(3)
+        bias = top[0].selectbox("Chart bias", ["unclear", "bullish", "bearish", "neutral", "mixed"])
+        support = top[1].text_input("Support")
+        resistance = top[2].text_input("Resistance")
+        middle = st.columns(3)
+        breakout = middle[0].text_input("Breakout trigger")
+        breakdown = middle[1].text_input("Breakdown trigger")
+        invalidation = middle[2].text_input("Invalidation")
+        notes = st.text_area("Chart notes", height=90)
+        submitted = st.form_submit_button("Save chart note to this session", type="primary")
+    if not submitted:
+        return
+    row = normalize_chart_review_row(
+        {
+            "ticker": ticker,
+            "timeframe": timeframe,
+            "chart_bias": bias,
+            "support": support,
+            "resistance": resistance,
+            "breakout": breakout,
+            "breakdown": breakdown,
+            "invalid": invalidation,
+            "manual_notes": notes,
+            "source": "embedded_tradingview_desk",
+        }
+    )
+    chart_rows = [item for item in st.session_state.get("chart_workspace_rows", []) if isinstance(item, dict)]
+    chart_rows.append(row)
+    st.session_state.chart_workspace_rows = chart_rows
+    st.success("Chart note saved in this session. You can use it to build a manual alert plan later.")
+
+
+def _show_tradingview_desk(
+    st: Any,
+    rows: list[dict[str, Any]],
+    *,
+    include_advanced_workspace: bool = False,
+) -> None:
+    _render_page_heading(
+        st,
+        "Charts",
+        "TradingView, finally inside the workflow.",
+        "The selected Autopilot ticker and timeframe drive the embedded chart. Open the full chart to use your signed-in TradingView layouts and indicators.",
+    )
+    candidates = _unique_ranked_candidates(rows)
+    if not candidates:
+        fallback_rows = st.session_state.get("market_breakdown_rows", []) or st.session_state.get("dashboard_watchlist_rows", [])
+        if isinstance(fallback_rows, list):
+            candidates = [dict(row) for row in fallback_rows if isinstance(row, dict)]
+    if not candidates:
+        st.info("Analyze a watchlist or load review data first.")
+        if st.button("Go to Analyze", type="primary"):
+            _queue_beginner_page(st, "Analyze")
+            st.rerun()
+        return
+
+    ticker_rows: dict[str, dict[str, Any]] = {}
+    for row in candidates:
+        ticker = str(row.get("ticker", "") or "").strip().upper()
+        if ticker and ticker not in ticker_rows:
+            ticker_rows[ticker] = row
+    options = list(ticker_rows)
+    requested = str(st.session_state.get("chart_focus_ticker", "") or "").upper()
+    if requested not in options:
+        requested = options[0]
+    selected_index = options.index(requested)
+    controls = st.columns([1.35, 0.65, 0.55])
+    ticker = controls[0].selectbox("Chart ticker", options, index=selected_index, key="chart_desk_ticker")
+    row = ticker_rows[ticker]
+    timeframe_options = ["15m", "30m", "1h", "4h", "1D", "1W"]
+    row_timeframe = str(row.get("timeframe", "1D") or "1D")
+    timeframe_index = timeframe_options.index(row_timeframe) if row_timeframe in timeframe_options else 4
+    timeframe = controls[1].selectbox("Timeframe", timeframe_options, index=timeframe_index, key="chart_desk_timeframe")
+    compact = controls[2].toggle("Compact", value=False, help="Hides the TradingView side toolbar.")
+    st.session_state.chart_focus_ticker = ticker
+
+    tv_symbol = candidate_tradingview_symbol(row)
+    watchlist = [candidate_tradingview_symbol(item) for item in candidates[:20]]
+    chart_column, detail_column = st.columns([2.2, 0.8])
+    with chart_column:
+        st.iframe(
+            tradingview_widget_html(tv_symbol, timeframe, watchlist=watchlist, compact=compact),
+            height=560 if compact else 690,
+            width="stretch",
+        )
+    with detail_column:
+        st.markdown(f"### {ticker}")
+        st.caption(f"{timeframe} · {tv_symbol}")
+        if "score" in row:
+            st.metric("Autopilot score", row.get("score", "—"))
+            st.metric("Bias", str(row.get("bias", "unclear")).title())
+            st.metric("State", str(row.get("state", "watch")).replace("_", " ").title())
+        st.metric("Support", _format_candidate_number(row.get("support1") or row.get("support")))
+        st.metric("Resistance", _format_candidate_number(row.get("resistance1") or row.get("resistance")))
+        st.link_button(
+            f"Open {ticker} in TradingView ↗",
+            tradingview_chart_url(tv_symbol),
+            type="primary",
+            use_container_width=True,
+        )
+        st.caption("The full link uses your existing TradingView browser session. The embedded widget does not receive your private layouts or credentials.")
+
+    st.info("One-way sync: Autopilot → chart. The embedded chart is for visual confirmation and is never used as the scoring data source.")
+    st.subheader("Save the chart read")
+    _append_compact_chart_note(st, ticker, timeframe)
+
+    with st.expander("TradingView Pine helper", expanded=False):
+        pine_path = ROOT / "tradingview" / "trading_autopilot_chart_helper_v150.pine"
+        pine_text = pine_path.read_text(encoding="utf-8") if pine_path.exists() else ""
+        st.write("Download the helper, paste it into Pine Editor yourself, and add it to the chart manually.")
+        st.write("It is indicator-only. This app does not publish it or create TradingView alerts.")
+        st.download_button(
+            "Download Pine helper",
+            data=pine_text,
+            file_name="trading_autopilot_chart_helper_v150.pine",
+            mime="text/plain",
+        )
+
+    if include_advanced_workspace:
+        with st.expander("Advanced chart-review workspace", expanded=False):
+            _show_chart_workspace(st)
+
+
+def _show_review_center(
+    st: Any,
+    rows: list[dict[str, Any]],
+    sections: dict[str, list[dict[str, Any]]],
+    source_label: str,
+    user_supplied: bool,
+) -> None:
+    _render_page_heading(
+        st,
+        "Review",
+        "One queue. Clear warnings. No contradictory status.",
+        "Review candidates one at a time, confirm the chart, and move to alert planning only when the setup is coherent.",
+    )
+    mode = st.radio("Review workspace", ["Candidate queue", "Alert plans"], horizontal=True, key="review_workspace")
+    if mode == "Alert plans":
+        _show_alert_planner(st)
+        return
+
+    validation_errors, validation_warnings = validate_candidate_rows(rows, ALL_CANDIDATE_COLUMNS)
+    readiness = workflow_readiness_status(len(rows), len(validation_errors), len(validation_warnings))
+    render_validation_health_message(st, len(validation_errors), len(validation_warnings), bool(rows))
+    if validation_warnings:
+        _show_warning_plain_english_details(st, validation_warnings, expanded=True)
+    if validation_errors:
+        st.markdown("**Fix these blockers**")
+        for error in validation_errors:
+            st.write(f"- {error}")
+        for tip in _validation_fix_guidance(validation_errors + validation_warnings):
+            st.info(tip)
+        return
+    candidates = _unique_ranked_candidates(rows)
+    if not candidates:
+        st.info("No candidate rows are loaded. Analyze a watchlist or choose review data in the sidebar.")
+        return
+
+    st.subheader("Focus review")
+    options = [str(row.get("ticker", "")).upper() for row in candidates]
+    ticker = st.selectbox("Ticker to review", options, key="review_focus_ticker")
+    selected = next(row for row in candidates if str(row.get("ticker", "")).upper() == ticker)
+    _render_candidate_details(st, selected)
+    tv_symbol = candidate_tradingview_symbol(selected)
+    action_columns = st.columns(3)
+    action_columns[0].link_button(
+        f"Open {ticker} in TradingView ↗",
+        tradingview_chart_url(tv_symbol),
+        type="primary",
+        use_container_width=True,
+    )
+    if action_columns[1].button("Open embedded chart", use_container_width=True):
+        st.session_state.chart_focus_ticker = ticker
+        _queue_beginner_page(st, "Charts")
+        st.rerun()
+    if action_columns[2].button("Plan a manual alert", use_container_width=True):
+        st.session_state.review_workspace = "Alert plans"
+        st.rerun()
+
+    st.subheader("Queue")
+    queue_rows = [
+        {
+            "Ticker": row.get("ticker", ""),
+            "Bias": row.get("bias", ""),
+            "Score": row.get("score", ""),
+            "Grade": row.get("grade", ""),
+            "State": str(row.get("state", "")).replace("_", " "),
+            "Next": _candidate_next_action(row),
+        }
+        for row in candidates
+    ]
+    st.dataframe(queue_rows, width="stretch", hide_index=True)
+    if user_supplied:
+        _show_download(st, rows, True)
+    st.caption(f"Status: {readiness['label']} · Source: {_public_source_label(source_label)}")
+
+
+def _show_journal_center(
+    st: Any,
+    rows: list[dict[str, Any]],
+    sections: dict[str, list[dict[str, Any]]],
+) -> None:
+    _render_page_heading(
+        st,
+        "Journal",
+        "Turn chart reviews into evidence.",
+        "Label what matched, what failed, and what the scoring engine should learn from—without changing formulas on weak evidence.",
+    )
+    mode = st.radio(
+        "Journal workspace",
+        ["Calibration results", "Batch log", "Calibration review"],
+        horizontal=True,
+        key="journal_workspace",
+    )
+    if mode == "Calibration results":
+        _show_calibration_results(st, rows, sections, "Beginner")
+    elif mode == "Batch log":
+        _show_calibration_batch_log(st)
+    else:
+        _show_calibration_review(st)
+
+
+def _render_advanced_page(
+    st: Any,
+    name: str,
+    rows: list[dict[str, Any]],
+    sections: dict[str, list[dict[str, Any]]],
+    source_label: str,
+) -> None:
+    if name == "Home":
+        _show_product_home(st, rows, sections, source_label)
+    elif name == "Market Breakdown":
+        _show_market_breakdown(st)
+    elif name == "Chart Workspace":
+        _show_tradingview_desk(st, rows, include_advanced_workspace=True)
+    elif name == "Alert Planner":
+        _show_alert_planner(st)
+    elif name == "Daily Review":
+        _show_daily_review(st, rows, sections, source_label)
+    elif name == "Live Data — Read Only":
+        _show_live_data_readonly(st)
+    elif name == "Calibration Guide":
+        _show_calibration_guide(st)
+    elif name == "Calibration Results":
+        _show_calibration_results(st, rows, sections, "Advanced")
+    elif name == "Calibration Batch Log":
+        _show_calibration_batch_log(st)
+    elif name == "Calibration Review":
+        _show_calibration_review(st)
+    elif name == "Help / Safety":
+        _show_help_safety(st)
+    else:
+        st.dataframe(sections.get(name, []), width="stretch", hide_index=True)
+
+
 def streamlit_dashboard(path: Path = DEFAULT_DATA) -> None:
     import streamlit as st
 
-    st.set_page_config(page_title="Trading Autopilot", layout="wide")
+    st.set_page_config(
+        page_title="Trading Autopilot",
+        page_icon="📈",
+        layout="wide",
+        initial_sidebar_state="collapsed",
+    )
     _require_streamlit_access(st)
     _inject_product_styles(st)
 
-    source_label, selected_path, rows, user_supplied = _streamlit_candidate_source(st, path)
-    sections = build_dashboard_sections(rows)
-    summary = build_top_review_summary(rows, sections)
-
-    st.title("Trading Autopilot")
-    st.caption(f"Version: {APP_VERSION}")
-    if selected_path is not None:
-        st.caption(f"Candidate file: {selected_path}")
-    else:
-        st.caption(f"Candidate source: {source_label}")
-    for warning in _streamlit_warning_lines(selected_path, user_supplied):
-        st.warning(warning)
-    if source_label in {"TradingView Import", _review_engine_label(), "Review Engine Session"}:
-        st.warning(TRADINGVIEW_IMPORT_WARNING)
-    st.caption("Decision support only. No broker connection or order execution.")
-    view_mode = st.radio(
-        "View mode",
+    st.sidebar.markdown("### Trading Autopilot")
+    st.sidebar.caption("Chart-first decision support")
+    view_mode = st.sidebar.radio(
+        "Experience",
         options=["Beginner", "Advanced"],
         index=0,
-        horizontal=True,
-        help="Beginner mode shows the few tabs most people need. Advanced mode shows all technical review tabs. Switching modes does not change data or scoring.",
+        key="view_mode",
+        help="Beginner is the clean daily workflow. Advanced exposes every technical bucket one page at a time.",
     )
-    if view_mode == "Beginner":
-        st.caption("Beginner mode shows the few tabs most people need.")
-    else:
-        st.caption("Advanced mode shows all technical review tabs.")
-    _show_phone_workflow(st, source_label, user_supplied)
-    _show_tradingview_import_repair(st, source_label)
+    st.sidebar.divider()
 
-    if source_label == "Manual Entry":
+    source_label, selected_path, rows, user_supplied = _streamlit_candidate_source(st, path, view_mode)
+    sections = build_dashboard_sections(rows)
+
+    if source_label == "Manual Entry" and view_mode == "Advanced":
         if rows:
             edited_rows = st.data_editor(
                 rows,
@@ -3641,42 +4727,69 @@ def streamlit_dashboard(path: Path = DEFAULT_DATA) -> None:
             st.session_state.manual_candidates = _rows_from_editor_output(edited_rows)
             rows = list(st.session_state.manual_candidates)
             sections = build_dashboard_sections(rows)
-            summary = build_top_review_summary(rows, sections)
         else:
             _show_manual_entry_empty_state(st)
 
-    _show_validation_feedback(st, rows, user_supplied)
-    _show_download(st, rows, user_supplied)
-    _show_top_review_summary(st, summary)
+    validation_errors, validation_warnings = validate_candidate_rows(rows, ALL_CANDIDATE_COLUMNS)
+    config = _market_data_config_from_streamlit(st)
+    provider = configured_market_data_provider(config)
+    provider_errors = market_data_config_errors(config)
+    provider_status = provider if not provider_errors else "missing"
 
-    tab_names = dashboard_tab_names_for_mode(view_mode)
-    tabs = st.tabs(tab_names)
-    for tab, name in zip(tabs, tab_names):
-        with tab:
-            if name == "Home":
-                _show_product_home(st, rows, sections, source_label)
-            elif name == "Market Breakdown":
-                _show_market_breakdown(st)
-            elif name == "Chart Workspace":
-                _show_chart_workspace(st)
-            elif name == "Alert Planner":
-                _show_alert_planner(st)
-            elif name == "Daily Review":
-                _show_daily_review(st, rows, sections, source_label)
-            elif name == "Live Data — Read Only":
-                _show_live_data_readonly(st)
-            elif name == "Calibration Guide":
-                _show_calibration_guide(st)
-            elif name == "Calibration Results":
-                _show_calibration_results(st, rows, sections)
-            elif name == "Calibration Batch Log":
-                _show_calibration_batch_log(st)
-            elif name == "Calibration Review":
-                _show_calibration_review(st)
-            elif name == "Help / Safety":
-                _show_help_safety(st)
-            else:
-                st.dataframe(sections[name], width="stretch")
+    _render_app_header(st)
+    _render_compact_status_bar(
+        st,
+        source_label=source_label,
+        row_count=len(rows),
+        blocking_count=len(validation_errors),
+        warning_count=len(validation_warnings),
+        provider=provider_status,
+    )
+
+    if selected_path is not None and selected_path.name in SAMPLE_DATA_NAMES:
+        st.caption("Example data is loaded for demonstration. Use Analyze for live or user-supplied rows.")
+    elif user_supplied:
+        st.caption("User-supplied session data. Verify every chart manually before making a decision.")
+
+    if view_mode == "Beginner":
+        selected_page = _render_beginner_navigation(st)
+        if selected_page == "Dashboard":
+            _show_command_center(st, rows, sections, source_label)
+        elif selected_page == "Analyze":
+            _show_analyze_center(st)
+            _show_tradingview_import_repair(st, source_label)
+        elif selected_page == "Charts":
+            _show_tradingview_desk(st, rows)
+        elif selected_page == "Review":
+            _show_review_center(st, rows, sections, source_label, user_supplied)
+        else:
+            _show_journal_center(st, rows, sections)
+    else:
+        st.query_params["page"] = "advanced"
+        st.session_state.last_beginner_query_slug = "advanced"
+        _render_page_heading(
+            st,
+            "Advanced",
+            "Technical workspace",
+            "One surface at a time—every legacy bucket remains available without rendering a 24-tab wall.",
+        )
+        advanced_page = st.selectbox(
+            "Advanced workspace",
+            ADVANCED_TAB_NAMES + ["Help / Safety"],
+            key="advanced_page",
+        )
+        with st.expander("Data validation and export", expanded=False):
+            _show_validation_feedback(st, rows, user_supplied)
+            _show_download(st, rows, user_supplied)
+        _render_advanced_page(st, advanced_page, rows, sections, source_label)
+
+    st.sidebar.divider()
+    st.sidebar.caption(f"v{APP_DISPLAY_VERSION} · {_public_source_label(source_label)}")
+    with st.sidebar.expander("Safety", expanded=False):
+        st.write("Decision support only.")
+        st.write("No broker connection or order execution.")
+        st.write("No automatic TradingView alerts.")
+        st.write("Manual chart confirmation is required.")
 
 
 def main() -> None:
