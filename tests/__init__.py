@@ -1,0 +1,2 @@
+"""Trading Autopilot tests."""
+
