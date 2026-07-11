@@ -1,6 +1,18 @@
-# Trading Autopilot v1.5.3-mobile-sidebar-post-handoff-polish-dev
+# Trading Autopilot v1.5.4
 
 Trading Autopilot is a decision-support dashboard for scanner ranking, watchlist review, helper levels, review planning, and journaling.
+
+## Daily Workflow
+
+The streamlined interface has five mobile-friendly workspaces:
+
+1. `Dashboard` — scan a watchlist and focus the current setup.
+2. `Analyze` — use read-only Polygon data, paste TradingView/scanner rows, or add a manual row.
+3. `Charts` — view the selected ticker in an embedded TradingView chart and open the full signed-in TradingView chart.
+4. `Review` — see blockers and warnings clearly, review one candidate at a time, and draft manual alert plans.
+5. `Journal` — capture calibration labels, batch evidence, and scoring-review notes.
+
+The TradingView integration is one-way and read-only. It never requests TradingView credentials, syncs private layouts, creates alerts, connects a broker, or places orders.
 
 ## Sample Data Warning
 
