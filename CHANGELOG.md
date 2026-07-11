@@ -1,5 +1,18 @@
 # Changelog
 
+## v1.5.4-cloud-experience-upgrade
+
+- Replaced the 9/24-tab interface with five single-render workflow pages.
+- Added an embedded read-only TradingView chart synchronized to the selected ticker and timeframe.
+- Added full TradingView chart links that reuse the user's signed-in browser session without sharing credentials.
+- Added a guided full-width TradingView/scanner import workflow.
+- Replaced contradictory ready/not-ready states with Blocked, Reviewable with warnings, and Ready for review.
+- Added mobile candidate and calibration cards, cleaner status surfaces, and bookmarkable page URLs.
+- Hid internal server paths and disabled public custom-path entry by default.
+- Kept unknown imported indicators and levels at zero instead of inventing values from current price.
+- Preserved scoring formulas, filters, risk rules, session-only data handling, and read-only market data.
+- Preserved no broker/order execution and no automatic TradingView alert creation.
+
 ## v1.5.3-mobile-sidebar-post-handoff-polish-dev
 
 - Added clearer mobile/sidebar guidance for first-run users.
