@@ -1,0 +1,66 @@
+//@version=5
+indicator("Trading Autopilot | David", overlay=true, max_lines_count=50, max_labels_count=50)
+
+showMAs = input.bool(true, "Show David's moving averages")
+showVWAP = input.bool(true, "Show intraday VWAP")
+showPlan = input.bool(true, "Show transferred trade plan")
+trigger = input.float(0.0, "Trigger", step=0.01)
+entryLow = input.float(0.0, "Entry zone low", step=0.01)
+entryHigh = input.float(0.0, "Entry zone high", step=0.01)
+invalidation = input.float(0.0, "Invalidation", step=0.01)
+target1 = input.float(0.0, "Target 1", step=0.01)
+target2 = input.float(0.0, "Target 2", step=0.01)
+stretchTarget = input.float(0.0, "Stretch target", step=0.01)
+
+ema9 = ta.ema(close, 9)
+wma21 = ta.wma(close, 21)
+wma50 = ta.wma(close, 50)
+wma200 = ta.wma(close, 200)
+sma200 = ta.sma(close, 200)
+sessionVWAP = ta.vwap(hlc3)
+[macdLine, signalLine, macdHist] = ta.macd(close, 12, 26, 9)
+
+plot(showMAs ? ema9 : na, "9 EMA", color=color.rgb(248, 250, 252), linewidth=1)
+plot(showMAs ? wma21 : na, "21 WMA", color=color.rgb(56, 189, 248), linewidth=2)
+plot(showMAs ? wma50 : na, "50 WMA", color=color.rgb(245, 158, 11), linewidth=2)
+plot(showMAs ? wma200 : na, "200 WMA", color=color.rgb(167, 139, 250), linewidth=2)
+plot(showMAs ? sma200 : na, "200 SMA", color=color.rgb(148, 163, 184), linewidth=1)
+plot(showVWAP and timeframe.isintraday ? sessionVWAP : na, "VWAP", color=color.rgb(236, 72, 153), linewidth=1)
+
+plot(showPlan and trigger > 0 ? trigger : na, "Trigger / BOS", color=color.rgb(129, 140, 248), linewidth=2, style=plot.style_linebr)
+entryLowPlot = plot(showPlan and entryLow > 0 ? entryLow : na, "Entry low", color=color.new(color.rgb(14, 165, 233), 35), style=plot.style_linebr)
+entryHighPlot = plot(showPlan and entryHigh > 0 ? entryHigh : na, "Entry high", color=color.new(color.rgb(14, 165, 233), 35), style=plot.style_linebr)
+fill(entryLowPlot, entryHighPlot, color=color.new(color.rgb(14, 165, 233), 86), title="Entry zone")
+plot(showPlan and invalidation > 0 ? invalidation : na, "Invalidation", color=color.rgb(127, 29, 29), linewidth=2, style=plot.style_linebr)
+plot(showPlan and target1 > 0 ? target1 : na, "Target 1", color=color.rgb(52, 211, 153), style=plot.style_linebr)
+plot(showPlan and target2 > 0 ? target2 : na, "Target 2", color=color.rgb(110, 231, 183), style=plot.style_linebr)
+plot(showPlan and stretchTarget > 0 ? stretchTarget : na, "Stretch target", color=color.rgb(167, 243, 208), style=plot.style_linebr)
+
+bullishStack = close > ema9 and ema9 > wma21 and wma21 > wma50
+bearishStack = close < ema9 and ema9 < wma21 and wma21 < wma50
+bullishTrigger = trigger > 0 and ta.crossover(close, trigger) and bullishStack
+bearishTrigger = trigger > 0 and ta.crossunder(close, trigger) and bearishStack
+invalidated = invalidation > 0 and ta.cross(close, invalidation)
+
+alertcondition(bullishTrigger, "Bullish trigger candidate", "Trading Autopilot bullish trigger candidate. Verify the 15m close and retest manually. No order is placed.")
+alertcondition(bearishTrigger, "Bearish trigger candidate", "Trading Autopilot bearish trigger candidate. Verify the 15m close and retest manually. No order is placed.")
+alertcondition(invalidated, "Plan invalidation candidate", "Trading Autopilot plan invalidation candidate. Review the thesis manually. No order is placed.")
+
+var table status = table.new(position.top_right, 2, 8, border_width=0)
+if barstate.islast
+    table.cell(status, 0, 0, "Trading Autopilot", text_color=color.white, bgcolor=color.rgb(15, 23, 42))
+    table.cell(status, 1, 0, "David", text_color=color.rgb(56, 189, 248), bgcolor=color.rgb(15, 23, 42))
+    table.cell(status, 0, 1, "9 EMA")
+    table.cell(status, 1, 1, str.tostring(ema9, format.mintick))
+    table.cell(status, 0, 2, "21 WMA")
+    table.cell(status, 1, 2, str.tostring(wma21, format.mintick))
+    table.cell(status, 0, 3, "50 / 200 WMA")
+    table.cell(status, 1, 3, str.tostring(wma50, format.mintick) + " / " + str.tostring(wma200, format.mintick))
+    table.cell(status, 0, 4, "200 SMA")
+    table.cell(status, 1, 4, str.tostring(sma200, format.mintick))
+    table.cell(status, 0, 5, "MACD 12/26/9")
+    table.cell(status, 1, 5, str.tostring(macdHist, "#.####"))
+    table.cell(status, 0, 6, "Structure")
+    table.cell(status, 1, 6, bullishStack ? "bullish" : bearishStack ? "bearish" : "mixed")
+    table.cell(status, 0, 7, "Safety")
+    table.cell(status, 1, 7, "Decision support only")

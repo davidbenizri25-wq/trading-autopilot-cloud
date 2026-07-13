@@ -18,6 +18,8 @@ class TradingViewIntegrationTests(unittest.TestCase):
     def test_symbol_normalization_preserves_explicit_exchange(self) -> None:
         self.assertEqual(normalize_tradingview_symbol(" nasdaq:aapl "), "NASDAQ:AAPL")
         self.assertEqual(normalize_tradingview_symbol("AAPL", "NASDAQ"), "NASDAQ:AAPL")
+        self.assertEqual(normalize_tradingview_symbol("AAPL", "XNAS"), "NASDAQ:AAPL")
+        self.assertEqual(normalize_tradingview_symbol("SPY", "ARCX"), "AMEX:SPY")
 
     def test_symbol_normalization_removes_markup(self) -> None:
         value = normalize_tradingview_symbol('AAPL\"><script>alert(1)</script>')
@@ -46,6 +48,10 @@ class TradingViewIntegrationTests(unittest.TestCase):
             tradingview_chart_url("NASDAQ:AAPL"),
             "https://www.tradingview.com/chart/?symbol=NASDAQ%3AAAPL",
         )
+        self.assertEqual(
+            tradingview_chart_url("NASDAQ:AAPL", "15m"),
+            "https://www.tradingview.com/chart/?symbol=NASDAQ%3AAAPL&interval=15",
+        )
 
     def test_widget_config_deduplicates_and_limits_watchlist(self) -> None:
         config = build_tradingview_widget_config("AAPL", "4h", watchlist=["AAPL", "MSFT", "MSFT"])
@@ -66,4 +72,3 @@ class TradingViewIntegrationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

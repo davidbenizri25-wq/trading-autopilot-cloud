@@ -30,6 +30,19 @@ TRADINGVIEW_INTERVALS = {
     "1w": "W",
     "1mo": "M",
 }
+TRADINGVIEW_EXCHANGES = {
+    "XNAS": "NASDAQ",
+    "XNGS": "NASDAQ",
+    "XNCM": "NASDAQ",
+    "NASDAQGS": "NASDAQ",
+    "NASDAQGM": "NASDAQ",
+    "NASDAQCM": "NASDAQ",
+    "XNYS": "NYSE",
+    "ARCX": "AMEX",
+    "XASE": "AMEX",
+    "NYSEARCA": "AMEX",
+    "BATS": "CBOE",
+}
 
 
 def _safe_symbol_piece(value: Any, *, allow_colon: bool = True) -> str:
@@ -60,9 +73,11 @@ def normalize_tradingview_symbol(
     if ":" in symbol:
         exchange_part, ticker_part = symbol.split(":", 1)
         exchange_part = _safe_symbol_piece(exchange_part, allow_colon=False)
+        exchange_part = TRADINGVIEW_EXCHANGES.get(exchange_part, exchange_part)
         ticker_part = _safe_symbol_piece(ticker_part, allow_colon=False)
         return f"{exchange_part}:{ticker_part}" if exchange_part and ticker_part else safe_fallback
     exchange_part = _safe_symbol_piece(exchange, allow_colon=False)
+    exchange_part = TRADINGVIEW_EXCHANGES.get(exchange_part, exchange_part)
     return f"{exchange_part}:{symbol}" if exchange_part else symbol
 
 
@@ -95,11 +110,14 @@ def tradingview_interval(timeframe: Any) -> str:
     return TRADINGVIEW_INTERVALS.get(aliases.get(value, value), "D")
 
 
-def tradingview_chart_url(symbol: Any) -> str:
+def tradingview_chart_url(symbol: Any, timeframe: Any = None) -> str:
     """Build a full TradingView chart handoff URL."""
 
     safe_symbol = normalize_tradingview_symbol(symbol)
-    return "https://www.tradingview.com/chart/?" + urlencode({"symbol": safe_symbol})
+    query = {"symbol": safe_symbol}
+    if timeframe not in (None, ""):
+        query["interval"] = tradingview_interval(timeframe)
+    return "https://www.tradingview.com/chart/?" + urlencode(query)
 
 
 def _safe_watchlist(symbols: Iterable[Any], selected_symbol: str) -> list[str]:
@@ -185,4 +203,3 @@ def tradingview_widget_html(
     </div>
   </body>
 </html>"""
-

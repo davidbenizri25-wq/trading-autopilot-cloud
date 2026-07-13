@@ -1,18 +1,106 @@
-# Trading Autopilot v1.5.4
+# Trading Autopilot
+
+Trading Autopilot is David's read-only trading decision cockpit. One ticker search resolves the exact US security and exchange, retrieves authorized Polygon market data, evaluates SPY/QQQ and sector context, runs the multi-timeframe evidence engine, draws the trade plan, and returns one calm outcome: **ENTER**, **WAIT FOR CONFIRMATION**, or **PASS**.
+
+It never connects to a broker, places an order, or spends money.
+
+## Daily workflow
+
+1. Open the app.
+2. Enter a ticker or an exchange-qualified ticker such as `NASDAQ:AAPL`.
+3. Review the decision card and one-sentence instruction.
+4. Inspect the synchronized chart, trigger, entry zone, invalidation, targets, and evidence.
+5. Mark the setup as entered, watching, passed, or closed when useful.
+
+No CSV, manual indicator entry, manual level entry, source selector, or sample workflow is required on the main screen.
+
+## What the cockpit evaluates
+
+- Monthly, Weekly, Daily, 4H, 1H, 15m, and 5m evidence, with Weekly/Daily/4H/15m weighted most heavily.
+- The saved chart baseline: 9 EMA, **21 WMA**, 50 WMA, 200 WMA, 200 SMA, MACD 12/26/9, and intraday VWAP.
+- SPY, QQQ, the relevant sector ETF, relative strength, liquidity, data freshness, earnings availability, news, structure, momentum, volume, extension, and reward-to-risk.
+- A six-state explainable setup model: BLOCKED, FORMING, ARMED, ENTER, EXTENDED, and INVALIDATED.
+- Real Polygon option snapshots only after the underlying setup clears its own gates. Missing or stale Greeks, quotes, liquidity, chain completeness, or earnings context cannot be promoted into a recommendation.
+
+Every visible conclusion is derived from provider observations or explicitly labelled as calculated. Missing inputs stay unavailable.
+
+## TradingView
+
+The app provides:
+
+- An app-native annotated candlestick and MACD chart using the saved methodology baseline.
+- Exact symbol, exchange, and 15-minute handoff to the signed-in TradingView browser session.
+- An official embedded TradingView view in Advanced.
+- The indicator-only `tradingview/trading_autopilot_sol_ultra.pine` helper for consistent indicators and transferred plan levels.
+
+Private TradingView layouts and drawings are not exposed through the public widget API and are never claimed as synchronized. The original TradingView layout must not be modified; any account-side rollout belongs in a duplicate layout named `Trading Autopilot | David`.
+
+## Personal state and monitoring
+
+The cockpit records recent searches, watchlist choices, saved analyses and plans, tracked positions, in-app state changes, alerts, journal actions, calibration data, and UI preferences.
+
+- With `APP_ACCESS_CODE` configured, the app uses a private server-side state file by default.
+- `AUTOPILOT_STATE_PATH` and `AUTOPILOT_STATE_ALLOWED_ROOT` can override that location.
+- Without private access configuration, state stays session-only so a public visitor cannot inherit or overwrite personal data.
+- Provider keys and other credentials are rejected from saved state.
+
+Monitoring runs when the app refreshes a tracked symbol. Only meaningful transitions such as FORMING → ARMED, ARMED → ENTER, target reached, or invalidation reached create events; ordinary price noise does not.
+
+## Data configuration
+
+Production secrets belong in Streamlit's secret manager, never in Git:
+
+```toml
+MARKET_DATA_PROVIDER = "polygon"
+POLYGON_API_KEY = "..."
+APP_ACCESS_CODE = "..." # recommended for durable personal state
+```
+
+The app distinguishes Real-time, Delayed, Last close, Stale, and Unavailable data with exact timestamps. Provider errors are sanitized before display. Stale, future-dated, incomplete, or currently forming bars cannot create an ENTER result.
+
+## Run locally
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+.venv/bin/streamlit run dashboard/app.py
+```
+
+Run the complete verification suite:
+
+```bash
+.venv/bin/python -m pytest -q
+```
+
+## Repository ownership and cloud release
+
+`davidbenizri25-wq/trading-elite-system` is the canonical private source of truth. `davidbenizri25-wq/trading-autopilot-cloud` is a generated public deployment mirror containing only the explicit allowlist in `deploy/cloud_manifest.txt`.
+
+Check or update the public mirror from the canonical repository:
+
+```bash
+python3 tools/sync_cloud_mirror.py --target /absolute/path/to/trading-autopilot-cloud --mode check
+python3 tools/sync_cloud_mirror.py --target /absolute/path/to/trading-autopilot-cloud --mode apply
+```
+
+The sync tool refuses unsafe targets, never copies Git metadata or secrets, and only removes files previously recorded as managed. See `docs/SOURCE_OF_TRUTH.md` for the branch, review, deployment, and rollback procedure.
+
+## Safety boundary
+
+- Decision support only; no orders or broker connection.
+- No credentials in source, logs, browser output, exported state, or error text.
+- No invented prices, candles, levels, options data, news, or private TradingView synchronization.
+- No ENTER from incomplete required timeframes, stale evidence, an unfinished trigger candle, or conflicting higher-timeframe structure.
+- A PASS is a successful outcome when the evidence is weak.
+
+<details>
+<summary>Historical v1.x compatibility documentation</summary>
+
+The material below is retained only as an auditable record for the frozen v1.x regression suite. It does not describe the default 2.0 cockpit workflow.
+
+# Trading Autopilot v1.5.4-mobile-calibration-warning-polish-dev
 
 Trading Autopilot is a decision-support dashboard for scanner ranking, watchlist review, helper levels, review planning, and journaling.
-
-## Daily Workflow
-
-The streamlined interface has five mobile-friendly workspaces:
-
-1. `Dashboard` — scan a watchlist and focus the current setup.
-2. `Analyze` — use read-only Polygon data, paste TradingView/scanner rows, or add a manual row.
-3. `Charts` — view the selected ticker in an embedded TradingView chart and open the full signed-in TradingView chart.
-4. `Review` — see blockers and warnings clearly, review one candidate at a time, and draft manual alert plans.
-5. `Journal` — capture calibration labels, batch evidence, and scoring-review notes.
-
-The TradingView integration is one-way and read-only. It never requests TradingView credentials, syncs private layouts, creates alerts, connects a broker, or places orders.
 
 ## Sample Data Warning
 
@@ -86,6 +174,7 @@ python3 tools/generate_pine_levels.py
 - Wow UI product polish: `docs/wow_ui_product_polish.md`.
 - Mobile first-run one-click review: `docs/mobile_first_run_one_click_review.md`.
 - Mobile/sidebar post-handoff polish: `docs/mobile_sidebar_post_handoff_polish.md`.
+- Mobile Calibration Results warning polish: `docs/mobile_calibration_warning_polish.md`.
 - Market Breakdown mobile polish: `docs/market_breakdown_mobile_polish.md`.
 - TradingView Chart Workspace guide: `docs/tradingview_chart_workspace.md`.
 - Alert Planner guide: `docs/alert_planner.md`.
@@ -107,6 +196,9 @@ python3 tools/generate_pine_levels.py
 - Review Engine Status shows whether session rows are loaded, source, row count, blocking issues, warnings, and next step.
 - Phone tip explains how to collapse the sidebar when it covers the page.
 - Rows sent to Review Engine show a clear success state and point to Daily Review / Calibration Results.
+- Calibration Results mobile cards summarize ticker, bias, score, grade, state, levels, and next action without horizontal scrolling.
+- warnings versus blocking issues are explained in plain English so users know warnings are review notes, not stop signs.
+- The Advanced editable grid remains available for full calibration editing.
 - Home tab exists.
 - Market Breakdown tab exists.
 - Chart Workspace tab exists.
@@ -424,3 +516,5 @@ This version keeps the v0.1.2 directional-conflict baseline and adds repo hygien
 - Use `docs/codex_task_prompts.md` for future ready-to-copy Codex task prompts.
 - Codex Cloud repo: `davidbenizri25-wq/trading-elite-system`.
 - Branch: `main`.
+
+</details>

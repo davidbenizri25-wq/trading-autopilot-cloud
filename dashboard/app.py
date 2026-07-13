@@ -1095,6 +1095,13 @@ def validation_warning_plain_english_summary(warnings: list[str]) -> dict[str, A
     }
     for warning in warnings:
         groups[classify_validation_warning(warning)] += 1
+    messages = [
+        "Warnings are review notes, not stop signs.",
+        "Most warnings are optional context reminders.",
+        "Manual chart confirmation is still required.",
+    ]
+    if not warnings:
+        messages = ["No warning notes are showing for these rows."]
     return {
         "total": len(warnings),
         "groups": groups,
@@ -1106,6 +1113,38 @@ def validation_warning_plain_english_summary(warnings: list[str]) -> dict[str, A
             "Format/caution": groups["format_warning"] + groups["caution_note"],
             "Other": groups["other"],
         },
+        "messages": messages,
+    }
+
+
+def warning_summary_next_step(blocking_count: int, warning_count: int) -> str:
+    if blocking_count > 0:
+        return "Fix blocking issues before reviewing."
+    if warning_count > 0:
+        return "Continue reviewing, then check warning notes for manual context."
+    return "Continue reviewing."
+
+
+def calibration_mobile_status(blocking_count: int, warning_count: int) -> dict[str, str]:
+    if blocking_count > 0:
+        return {
+            "tone": "error",
+            "headline": "Fix blocking issues first.",
+            "body": "Blocking issues stop review until the row is repaired.",
+            "next_step": warning_summary_next_step(blocking_count, warning_count),
+        }
+    if warning_count > 0:
+        return {
+            "tone": "success",
+            "headline": "0 blocking issues — rows are valid for review.",
+            "body": f"{warning_count} warnings are review notes. Check them, but they do not stop the workflow.",
+            "next_step": warning_summary_next_step(blocking_count, warning_count),
+        }
+    return {
+        "tone": "success",
+        "headline": "0 blocking issues — ready for review.",
+        "body": "No warning notes are showing. Manual chart confirmation still applies.",
+        "next_step": warning_summary_next_step(blocking_count, warning_count),
     }
 
 
@@ -2878,7 +2917,22 @@ def _show_daily_review(st: Any, rows: list[dict[str, Any]], sections: dict[str, 
 
 
 def _market_data_config_from_streamlit(st: Any) -> dict[str, str]:
-    return get_market_data_provider_config(secrets=getattr(st, "secrets", None), environ=os.environ)
+    secrets = getattr(st, "secrets", None)
+    config = get_market_data_provider_config(secrets=secrets, environ=os.environ)
+    for key in ("AUTOPILOT_STATE_PATH", "AUTOPILOT_STATE_ALLOWED_ROOT"):
+        value = None
+        try:
+            value = secrets.get(key) if secrets is not None else None
+        except Exception:
+            value = None
+        if not value:
+            value = os.environ.get(key)
+        if value:
+            config[key] = str(value).strip()
+    if _configured_access_code(st) and not config.get("AUTOPILOT_STATE_PATH"):
+        config["AUTOPILOT_STATE_PATH"] = str(ROOT / "data" / ".autopilot_state.json")
+        config["AUTOPILOT_STATE_ALLOWED_ROOT"] = str(ROOT / "data")
+    return config
 
 
 def _example_readonly_market_data_csv(timeframe: str) -> str:
@@ -3849,12 +3903,14 @@ def _calibration_card_next_action(row: dict[str, Any]) -> str:
     issue_type = str(row.get("issue_type", "") or "").strip().lower()
     match_status = str(row.get("match_status", "") or "").strip().lower()
     if issue_type and issue_type not in {"none", "needs_manual_chart_confirmation"}:
-        return "Review the issue before changing any scoring rule."
+        return "Review issue type before calibration."
     if match_status and match_status not in {"match", "unclear"}:
-        return "Document why the dashboard and chart disagree."
+        return "Review mismatch notes before scoring changes."
     if issue_type == "needs_manual_chart_confirmation" or match_status in {"", "unclear"}:
-        return "Confirm the chart, then label this row."
-    return "Add the confirmed row to the Batch Log."
+        if "manual_chart_bias" not in row:
+            return "Confirm the chart, then label this row."
+        return "Add label if you are calibrating."
+    return "Ready for Daily Review."
 
 
 def build_calibration_mobile_cards(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -4283,7 +4339,7 @@ def _show_command_center(
             key=f"dashboard_quick_{page.lower()}",
             on_click=_queue_beginner_page,
             args=(st, page),
-            use_container_width=True,
+            width="stretch",
         )
 
     config = _market_data_config_from_streamlit(st)
@@ -4307,11 +4363,11 @@ def _show_command_center(
         tv_symbol = candidate_tradingview_symbol(selected)
         st.link_button(
             f"Open {focus} in TradingView ↗",
-            tradingview_chart_url(tv_symbol),
-            use_container_width=True,
+            tradingview_chart_url(tv_symbol, selected.get("timeframe", "1D")),
+            width="stretch",
         )
         st.caption("Uses your signed-in TradingView browser session when available. No account credentials are shared with this app.")
-        if st.button("View embedded chart", type="primary", key="dashboard_view_embedded", use_container_width=True):
+        if st.button("View embedded chart", type="primary", key="dashboard_view_embedded", width="stretch"):
             st.session_state.chart_focus_ticker = focus
             _queue_beginner_page(st, "Charts")
             st.rerun()
@@ -4323,6 +4379,7 @@ def _show_command_center(
 
 def _show_guided_import(st: Any) -> None:
     st.subheader("Paste TradingView or scanner data")
+    st.caption("Paste TradingView or scanner rows to start import.")
     st.caption("Paste table/CSV text here. It stays in this browser session and is never sent to a broker.")
     with st.expander("See a valid example", expanded=False):
         st.code(TRADINGVIEW_IMPORT_EXAMPLE, language="csv")
@@ -4529,9 +4586,9 @@ def _show_tradingview_desk(
         st.metric("Resistance", _format_candidate_number(row.get("resistance1") or row.get("resistance")))
         st.link_button(
             f"Open {ticker} in TradingView ↗",
-            tradingview_chart_url(tv_symbol),
+            tradingview_chart_url(tv_symbol, timeframe),
             type="primary",
-            use_container_width=True,
+            width="stretch",
         )
         st.caption("The full link uses your existing TradingView browser session. The embedded widget does not receive your private layouts or credentials.")
 
@@ -4600,15 +4657,15 @@ def _show_review_center(
     action_columns = st.columns(3)
     action_columns[0].link_button(
         f"Open {ticker} in TradingView ↗",
-        tradingview_chart_url(tv_symbol),
+        tradingview_chart_url(tv_symbol, selected.get("timeframe", "1D")),
         type="primary",
-        use_container_width=True,
+        width="stretch",
     )
-    if action_columns[1].button("Open embedded chart", use_container_width=True):
+    if action_columns[1].button("Open embedded chart", width="stretch"):
         st.session_state.chart_focus_ticker = ticker
         _queue_beginner_page(st, "Charts")
         st.rerun()
-    if action_columns[2].button("Plan a manual alert", use_container_width=True):
+    if action_columns[2].button("Plan a manual alert", width="stretch"):
         st.session_state.review_workspace = "Alert plans"
         st.rerun()
 
@@ -4700,10 +4757,18 @@ def streamlit_dashboard(path: Path = DEFAULT_DATA) -> None:
     _require_streamlit_access(st)
     _inject_product_styles(st)
 
+    # The default product is the one-search cockpit. The legacy review engine
+    # remains in this module for rollback compatibility, but it is no longer
+    # part of the daily path or a source of sample-data friction.
+    from dashboard.cockpit import render_cockpit
+
+    render_cockpit(st, _market_data_config_from_streamlit(st))
+    return
+
     st.sidebar.markdown("### Trading Autopilot")
     st.sidebar.caption("Chart-first decision support")
     view_mode = st.sidebar.radio(
-        "Experience",
+        "View mode",
         options=["Beginner", "Advanced"],
         index=0,
         key="view_mode",
