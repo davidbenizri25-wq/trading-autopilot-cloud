@@ -203,3 +203,62 @@ def tradingview_widget_html(
     </div>
   </body>
 </html>"""
+
+
+def tradingview_market_context_html(*, theme: str = "dark") -> str:
+    """Build the fixed SPY/QQQ Daily-and-4H market-context preset."""
+
+    panels = (
+        ("SPY · Daily", "AMEX:SPY", "1D"),
+        ("SPY · 4H", "AMEX:SPY", "4H"),
+        ("QQQ · Daily", "NASDAQ:QQQ", "1D"),
+        ("QQQ · 4H", "NASDAQ:QQQ", "4H"),
+    )
+    widgets: list[str] = []
+    for label, symbol, timeframe in panels:
+        config = build_tradingview_widget_config(
+            symbol,
+            timeframe,
+            compact=True,
+            theme=theme,
+        )
+        config.update(
+            {
+                "allow_symbol_change": False,
+                "details": False,
+                "withdateranges": False,
+            }
+        )
+        config_json = json.dumps(config, ensure_ascii=True, separators=(",", ":")).replace("</", "<\\/")
+        widgets.append(
+            '<section class="market-panel">'
+            f'<div class="market-label">{label}</div>'
+            '<div class="tradingview-widget-container">'
+            '<div class="tradingview-widget-container__widget"></div>'
+            '<script type="text/javascript" '
+            'src="https://s3.tradingview.com/external-embedding/embed-widget-advanced-chart.js" '
+            f'async>{config_json}</script>'
+            "</div></section>"
+        )
+
+    return f"""<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+      * {{ box-sizing: border-box; }}
+      html, body {{ width: 100%; height: 100%; margin: 0; background: #07111f; color: #dbeafe; }}
+      .market-grid {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; height: 100%; }}
+      .market-panel {{ min-width: 0; min-height: 0; border: 1px solid rgba(148,163,184,.18); border-radius: 10px; overflow: hidden; background: #07111f; }}
+      .market-label {{ height: 30px; padding: 7px 10px; font: 600 12px/16px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; letter-spacing: .02em; }}
+      .tradingview-widget-container {{ width: 100%; height: calc(100% - 30px); margin: 0; overflow: hidden; }}
+      .tradingview-widget-container__widget {{ width: 100%; height: 100%; margin: 0; overflow: hidden; }}
+    </style>
+  </head>
+  <body>
+    <main class="market-grid" aria-label="SPY and QQQ Daily and 4-hour market context">
+      {''.join(widgets)}
+    </main>
+  </body>
+</html>"""
