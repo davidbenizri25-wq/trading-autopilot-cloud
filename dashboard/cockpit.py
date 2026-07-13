@@ -27,6 +27,7 @@ from autopilot_state import AutopilotStateStore, default_state
 from tradingview_integration import (
     normalize_tradingview_symbol,
     tradingview_chart_url,
+    tradingview_market_context_html,
     tradingview_widget_html,
 )
 
@@ -485,6 +486,21 @@ def build_decision_brief(decision: Mapping[str, Any] | None) -> dict[str, Any]:
         ),
         "safe_decision": safe,
     }
+
+
+def entry_action_allowed(brief: Mapping[str, Any] | None) -> bool:
+    """Allow entry recording only for a current, explicit ENTER decision."""
+
+    brief = brief or {}
+    return bool(
+        brief.get("verdict") == "ENTER"
+        and brief.get("state") == "ENTER"
+        and brief.get("entry_satisfied") == "Yes"
+        and brief.get("current_price") not in (None, "", "Unavailable")
+        and brief.get("timestamp") not in (None, "", "Unavailable")
+        and brief.get("currentness") in {"Real-time", "Delayed", "Last close"}
+        and brief.get("source") not in (None, "", "Unavailable")
+    )
 
 
 def options_table_rows(options: Mapping[str, Any] | None) -> list[dict[str, str]]:
@@ -1013,6 +1029,8 @@ def _apply_tracking_action(st: Any, payload: Mapping[str, Any], action: str) -> 
     session = st.session_state
     state = deepcopy(session.get("_autopilot_personal_state") or default_state())
     decision = _safe_decision(payload.get("decision") if isinstance(payload.get("decision"), Mapping) else {})
+    if action == "entered" and not entry_action_allowed(build_decision_brief(decision)):
+        return "blocked"
     ticker = str(decision.get("ticker") or "").upper()
     details = _tracking_snapshot(payload)
     store = session.get("_autopilot_state_store")
@@ -1273,11 +1291,16 @@ def _render_tracking_actions(st: Any, payload: Mapping[str, Any], brief: Mapping
     state = st.session_state.get("_autopilot_personal_state") or {}
     positions = state.get("positions") if isinstance(state.get("positions"), Mapping) else {}
     has_position = brief["ticker"] in positions
-    has_price = brief["current_price"] != "Unavailable"
+    entry_enabled = entry_action_allowed(brief)
     columns = st.columns(4, gap="small")
     clicked: Optional[str] = None
     with columns[0]:
-        if st.button("I entered", key=f"cockpit_entered_{brief['ticker']}", width="stretch", disabled=not has_price):
+        if st.button(
+            "I entered",
+            key=f"cockpit_entered_{brief['ticker']}",
+            width="stretch",
+            disabled=not entry_enabled,
+        ):
             clicked = "entered"
     with columns[1]:
         if st.button("I’m watching", key=f"cockpit_watching_{brief['ticker']}", width="stretch"):
@@ -1301,9 +1324,14 @@ def _render_tracking_actions(st: Any, payload: Mapping[str, Any], brief: Mapping
             "passed": "Pass decision saved for your journal and calibration.",
             "closed": "Tracked trade closed and moved to your journal.",
         }
-        st.success(messages[clicked])
-        if mode == "session-only":
-            st.caption("Saved for this session only.")
+        if mode == "blocked":
+            st.warning("Entry snapshot was not saved because the current decision is not ENTER.")
+        else:
+            st.success(messages[clicked])
+            if mode == "session-only":
+                st.caption("Saved for this session only.")
+    if not entry_enabled:
+        st.caption("Entry recording unlocks only when current evidence reaches ENTER. This never places an order.")
 
     refreshed_state = st.session_state.get("_autopilot_personal_state") or state
     enabled_alerts = (
@@ -1406,7 +1434,7 @@ def _render_advanced(st: Any, payload: Mapping[str, Any], state: Mapping[str, An
         )
         persistence = st.session_state.get("_autopilot_persistence_mode")
         st.write("Personal state: saved across sessions" if persistence == "persistent" else "Personal state: this session only")
-        st.markdown("**Interactive TradingView view**")
+        st.markdown("**Focused ticker-analysis preset**")
         symbol = normalize_tradingview_symbol(payload.get("tradingview_symbol") or brief["ticker"])
         watchlist = list(state.get("watchlist") or []) if isinstance(state, Mapping) else []
         try:
@@ -1419,6 +1447,18 @@ def _render_advanced(st: Any, payload: Mapping[str, Any], state: Mapping[str, An
             )
         except Exception:
             st.info("The embedded TradingView view is unavailable. Use the 15m handoff above.")
+        st.markdown("**Market-context 2 × 2 preset**")
+        st.caption("SPY Daily · SPY 4H · QQQ Daily · QQQ 4H")
+        try:
+            from streamlit.components.v1 import html as render_market_context_html
+
+            render_market_context_html(
+                tradingview_market_context_html(),
+                height=880,
+                scrolling=False,
+            )
+        except Exception:
+            st.info("The market-context preset is unavailable. The app-native SPY/QQQ regime remains visible above.")
         st.caption(
             "The official chart handoff opens the correct symbol and interval. Private TradingView layouts "
             "and drawings remain in your signed-in TradingView session and are not claimed as synchronized."
@@ -1600,6 +1640,7 @@ __all__ = [
     "format_ratio",
     "format_timestamp",
     "options_table_rows",
+    "entry_action_allowed",
     "public_text",
     "render_cockpit",
     "resolve_state_path",

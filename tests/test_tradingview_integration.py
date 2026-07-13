@@ -10,6 +10,7 @@ from tradingview_integration import (
     normalize_tradingview_symbol,
     tradingview_chart_url,
     tradingview_interval,
+    tradingview_market_context_html,
     tradingview_widget_html,
 )
 
@@ -68,6 +69,21 @@ class TradingViewIntegrationTests(unittest.TestCase):
         self.assertIsNotNone(match)
         config = json.loads(match.group(1))
         self.assertEqual(config["interval"], "15")
+
+    def test_market_context_preset_is_fixed_to_spy_and_qqq_daily_and_four_hour(self) -> None:
+        widget = tradingview_market_context_html()
+        self.assertEqual(widget.count("embed-widget-advanced-chart.js"), 4)
+        configs = [json.loads(value) for value in re.findall(r"async>(\{.*?\})</script>", widget)]
+        self.assertEqual(
+            [(config["symbol"], config["interval"]) for config in configs],
+            [
+                ("AMEX:SPY", "D"),
+                ("AMEX:SPY", "240"),
+                ("NASDAQ:QQQ", "D"),
+                ("NASDAQ:QQQ", "240"),
+            ],
+        )
+        self.assertTrue(all(config["allow_symbol_change"] is False for config in configs))
 
 
 if __name__ == "__main__":

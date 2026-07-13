@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
 from dashboard.cockpit import (
+    _apply_tracking_action,
     BREAKDOWN_SECTIONS,
     build_decision_brief,
     build_home_snapshot,
     currentness_label,
+    entry_action_allowed,
     format_price,
     format_timestamp,
     options_table_rows,
@@ -129,6 +132,32 @@ class CockpitContractTests(unittest.TestCase):
         self.assertEqual(format_timestamp("not a timestamp"), "Unavailable")
         self.assertEqual(format_price(None), "Unavailable")
 
+    def test_entry_recording_requires_a_current_explicit_enter_decision(self) -> None:
+        self.assertTrue(entry_action_allowed(build_decision_brief(complete_decision())))
+        self.assertFalse(entry_action_allowed(build_decision_brief(complete_decision(data_label="stale"))))
+        self.assertFalse(
+            entry_action_allowed(
+                build_decision_brief(
+                    complete_decision(
+                        verdict="WAIT FOR CONFIRMATION",
+                        state="ARMED",
+                        entry_conditions_satisfied=False,
+                    )
+                )
+            )
+        )
+        self.assertFalse(entry_action_allowed(build_decision_brief(complete_decision(current_price=None))))
+
+    def test_tracking_boundary_rejects_stale_non_enter_entry(self) -> None:
+        st = SimpleNamespace(session_state={})
+        mode = _apply_tracking_action(
+            st,
+            {"decision": complete_decision(data_label="stale")},
+            "entered",
+        )
+        self.assertEqual(mode, "blocked")
+        self.assertNotIn("_autopilot_personal_state", st.session_state)
+
     def test_public_text_never_echoes_paths_traces_or_credentials(self) -> None:
         unsafe = [
             "/Users/person/private/state.json",
@@ -238,6 +267,7 @@ class CockpitContractTests(unittest.TestCase):
             '"I passed"',
             '"Close trade"',
             'st.expander("Advanced"',
+            "Market-context 2 × 2 preset",
             "AutopilotStateStore",
             '"AUTOPILOT_STATE_PATH"',
         ]:
