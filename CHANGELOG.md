@@ -1,17 +1,31 @@
 # Changelog
 
-## v1.5.4-cloud-experience-upgrade
+## 2.0.0 — Sol Ultra decision cockpit
 
-- Replaced the 9/24-tab interface with five single-render workflow pages.
-- Added an embedded read-only TradingView chart synchronized to the selected ticker and timeframe.
-- Added full TradingView chart links that reuse the user's signed-in browser session without sharing credentials.
-- Added a guided full-width TradingView/scanner import workflow.
-- Replaced contradictory ready/not-ready states with Blocked, Reviewable with warnings, and Ready for review.
-- Added mobile candidate and calibration cards, cleaner status surfaces, and bookmarkable page URLs.
-- Hid internal server paths and disabled public custom-path entry by default.
-- Kept unknown imported indicators and levels at zero instead of inventing values from current price.
-- Preserved scoring formulas, filters, risk rules, session-only data handling, and read-only market data.
-- Preserved no broker/order execution and no automatic TradingView alert creation.
+- Replaced the default CSV/tab workflow with one universal ticker search and a single progressive decision surface.
+- Added exact Polygon symbol/exchange resolution, multi-timeframe candles through 5m, SPY/QQQ/sector context, news, source health, currentness labels, caching, and safe provider fallbacks.
+- Added the evidence-first BLOCKED/FORMING/ARMED/ENTER/EXTENDED/INVALIDATED state machine and full 21-section explanation.
+- Corrected the methodology baseline to 9 EMA, 21 WMA, 50/200 WMA, 200 SMA, MACD 12/26/9, and intraday VWAP.
+- Added an annotated Plotly chart, exact TradingView handoff, embedded official widget, and indicator-only Sol Ultra Pine helper.
+- Added real options-chain ranking with underlying, freshness, completeness, earnings, spread, liquidity, Greek, and theta gates.
+- Added durable private state support, recent searches, ranked watchlist, saved plans, position actions, meaningful state-change events, and journal snapshots.
+- Added fail-closed handling for incomplete indicators, partial candles, higher-timeframe conflict, stale/future timestamps, unknown earnings, wrong-underlying options, and nearby opposing structure.
+- Added a generated canonical-to-cloud mirror workflow, CI, rollback documentation, and expanded automated coverage.
+- Preserved the no-broker, no-order, no-spend boundary.
+
+## v1.5.4-mobile-calibration-warning-polish-dev
+
+- Added mobile-friendly Calibration Results cards.
+- Added plain-English warning summary for non-blocking validation warnings.
+- Added clearer "0 blocking issues" success messaging.
+- Added beginner guidance explaining warnings versus blockers.
+- Kept the full advanced Calibration Results grid in Advanced mode.
+- Improved Calibration Results mobile spacing and next-step guidance.
+- Preserved existing scoring logic.
+- Preserved read-only market-data behavior.
+- Preserved no broker/order/trade execution.
+- Preserved no automatic TradingView alert creation.
+- Preserved no secrets or real data commits.
 
 ## v1.5.3-mobile-sidebar-post-handoff-polish-dev
 
