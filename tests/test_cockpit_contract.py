@@ -7,10 +7,14 @@ import unittest
 from unittest.mock import patch
 
 from dashboard.cockpit import (
+    _active_timeframe,
     _apply_tracking_action,
+    _set_active_timeframe,
+    _ticker_from_search_choice,
     BREAKDOWN_SECTIONS,
     build_decision_brief,
     build_home_snapshot,
+    build_timeframe_alignment,
     currentness_label,
     entry_action_allowed,
     format_price,
@@ -162,6 +166,9 @@ class CockpitContractTests(unittest.TestCase):
         unsafe = [
             "/Users/person/private/state.json",
             "/var/app/data.json",
+            "file:///Users/person/private/state.json",
+            "path=/Users/person/private/state.json",
+            "debug:/private/tmp/state.json",
             "RuntimeError: provider exploded",
             "api_key=do-not-show-this",
             "-----BEGIN " + "PRIVATE KEY-----",
@@ -170,6 +177,17 @@ class CockpitContractTests(unittest.TestCase):
             with self.subTest(value=value):
                 self.assertEqual(public_text(value), "Unavailable")
         self.assertEqual(public_text("15m confirmation is not yet satisfied."), "15m confirmation is not yet satisfied.")
+
+    def test_safe_business_warnings_remain_visible_and_do_not_claim_a_gate(self) -> None:
+        decision = complete_decision(
+            warnings=["Earnings are 7 day(s) away."],
+            primary_risk="Earnings are 7 day(s) away.",
+        )
+        brief = build_decision_brief(decision)
+
+        self.assertEqual(brief["verdict"], "ENTER")
+        self.assertEqual(brief["primary_risk"], "Earnings are 7 day(s) away.")
+        self.assertNotIn("gated conservatively", brief["primary_risk"].lower())
 
     def test_options_rows_preserve_unavailable_fields_instead_of_inventing_values(self) -> None:
         rows = options_table_rows(
@@ -254,14 +272,81 @@ class CockpitContractTests(unittest.TestCase):
                 "/tmp/from-config.json",
             )
 
-    def test_streamlit_contract_is_form_first_mobile_safe_and_not_legacy(self) -> None:
+    def test_one_minute_and_one_month_stay_distinct_in_alignment_and_query_state(self) -> None:
+        decision = complete_decision(
+            timeframes={
+                "1M": {
+                    "direction": "bullish",
+                    "trend_score": 3,
+                    "macd_histogram": 0.4,
+                    "close": 210.25,
+                    "support": [200.0],
+                    "resistance": [220.0],
+                }
+            }
+        )
+        monthly = build_timeframe_alignment(decision, selected_timeframe="1M")
+        minute = build_timeframe_alignment(
+            decision,
+            selected_timeframe="1m",
+            selected_analysis={
+                "direction": "bearish",
+                "trend_score": -3,
+                "macd_histogram": -0.4,
+                "close": 209.0,
+                "support": [205.0],
+                "resistance": [210.0],
+            },
+        )
+        self.assertEqual(next(row for row in monthly if row["timeframe"] == "1M")["active"], "yes")
+        self.assertEqual(next(row for row in minute if row["timeframe"] == "1M")["active"], "no")
+        self.assertEqual(next(row for row in minute if row["timeframe"] == "1m")["active"], "yes")
+        self.assertEqual(next(row for row in minute if row["timeframe"] == "1m")["direction"], "Bearish")
+        self.assertEqual(next(row for row in minute if row["timeframe"] == "3m")["direction"], "Unavailable")
+
+        for raw, expected in (("1m", "1m"), ("1M", "1M"), (["15m", "1M"], "1M")):
+            with self.subTest(raw=raw):
+                st = SimpleNamespace(session_state={}, query_params={"tf": raw})
+                self.assertEqual(_active_timeframe(st), expected)
+                self.assertEqual(st.session_state["_autopilot_timeframe"], expected)
+
+        st = SimpleNamespace(session_state={}, query_params={})
+        self.assertEqual(_set_active_timeframe(st, "1m"), "1m")
+        self.assertEqual(st.query_params["tf"], "1m")
+        self.assertEqual(_set_active_timeframe(st, "1M"), "1M")
+        self.assertEqual(st.query_params["tf"], "1M")
+
+        missing_query_api = SimpleNamespace(session_state={})
+        self.assertEqual(_active_timeframe(missing_query_api), "15m")
+
+    def test_autocomplete_choice_extracts_ticker_without_restricting_new_symbols(self) -> None:
+        self.assertEqual(
+            _ticker_from_search_choice("AAPL · Apple Inc. · NASDAQ"),
+            "AAPL",
+        )
+        self.assertEqual(_ticker_from_search_choice("RIVN"), "RIVN")
+
+    def test_streamlit_contract_is_form_first_mobile_safe_and_redesigned(self) -> None:
         source = COCKPIT.read_text(encoding="utf-8")
         for required in [
             "def render_cockpit(",
             'st.form("autopilot_ticker_search"',
             "form_submit_button",
             'width="stretch"',
-            "Open {brief['ticker']} in my TradingView · 15m",
+            "st.segmented_control(",
+            "options=list(TIMEFRAME_LABELS)",
+            'selection_mode="single"',
+            "st.selectbox(",
+            "accept_new_options=True",
+            "_ticker_from_search_choice(query)",
+            '"Presentation Mode"',
+            "build_presentation_payload(",
+            "presentation_pdf_bytes(",
+            "st.download_button(",
+            '"Download decision brief · PDF"',
+            '"toImageButtonOptions"',
+            "tradingview_chart_url(symbol, label)",
+            "Open {brief['ticker']} in TradingView · {label}",
             '"I entered"',
             '"I’m watching"',
             '"I passed"',
@@ -277,8 +362,8 @@ class CockpitContractTests(unittest.TestCase):
             "use_container_width",
             "st.tabs(",
             "st.file_uploader(",
-            "st.selectbox(",
             "st.exception(",
+            "streamlit.components.v1",
             "/Users/",
         ]:
             with self.subTest(forbidden=forbidden):

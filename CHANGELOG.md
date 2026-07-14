@@ -1,5 +1,14 @@
 # Changelog
 
+## 2.1.0-premium-terminal — 2026-07-13
+
+- Promoted the universal ticker experience into a premium, chart-first decision cockpit with a calmer ENTER / WAIT / PASS workflow.
+- Added ten distinct chart timeframes (`1m`, `3m`, `5m`, `15m`, `30m`, `1H`, `4H`, `1D`, `1W`, `1M`), selected-interval TradingView handoff, and a four-chart multi-timeframe wall.
+- Added presentation/showcase mode and a strict public-only, one-page PDF export while keeping personal state, credentials, and bankroll settings out of public output.
+- Added provider-backed earnings tri-state handling: scheduled, verified no event through the checked window, or unresolved; uncertainty continues to fail closed.
+- Hardened canonical-to-cloud release provenance around the exact clean source commit, repository, version, and explicit public allowlist.
+- Preserved the no-broker, no-order, no-spend boundary.
+
 ## 2.0.0 — Sol Ultra decision cockpit
 
 - Replaced the default CSV/tab workflow with one universal ticker search and a single progressive decision surface.
@@ -13,7 +22,7 @@
 - Added a generated canonical-to-cloud mirror workflow, CI, rollback documentation, and expanded automated coverage.
 - Preserved the no-broker, no-order, no-spend boundary.
 
-## v1.5.4-mobile-calibration-warning-polish-dev
+## v1.5.4 — mobile calibration warning polish (historical)
 
 - Added mobile-friendly Calibration Results cards.
 - Added plain-English warning summary for non-blocking validation warnings.

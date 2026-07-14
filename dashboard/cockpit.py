@@ -7,7 +7,9 @@ the existing dashboard entry point remains responsible for page setup.
 
 from __future__ import annotations
 
+import base64
 from copy import deepcopy
+from dataclasses import asdict
 from datetime import datetime, timezone
 import hashlib
 import html
@@ -16,14 +18,18 @@ import re
 from typing import Any, Callable, Mapping, MutableMapping, Optional
 
 from autopilot_chart import build_autopilot_chart
+from autopilot_engine import analyze_timeframe
 from autopilot_journal import aggregate_calibration, evaluate_journal_outcome
 from autopilot_service import (
     AutopilotServiceError,
     TTLCache,
     analyze_symbol,
+    load_chart_bars,
     unavailable_result,
 )
 from autopilot_state import AutopilotStateStore, default_state
+from presentation_export import build_presentation_payload, presentation_pdf_bytes
+from timeframes import TIMEFRAME_LABELS, get_timeframe_spec, normalize_timeframe
 from tradingview_integration import (
     normalize_tradingview_symbol,
     tradingview_chart_url,
@@ -76,8 +82,8 @@ STATE_PRIORITY = {
 }
 
 _UNSAFE_PUBLIC_TEXT = (
-    re.compile(r"(?:^|\s)/(?:Users|home|private|tmp|var|etc|mount|mnt)/", re.IGNORECASE),
-    re.compile(r"\b[A-Za-z]:\\"),
+    re.compile(r"/(?:Users|home|private|tmp|var|etc|mount|mnt)(?:/|\b)", re.IGNORECASE),
+    re.compile(r"[A-Za-z]:\\"),
     re.compile(r"\bTraceback\b|\b(?:[A-Za-z]+Error|Exception):", re.IGNORECASE),
     re.compile(
         r"\b(?:api[_ -]?key|access[_ -]?token|client[_ -]?secret|password)\s*[:=]",
@@ -87,6 +93,10 @@ _UNSAFE_PUBLIC_TEXT = (
 )
 
 _RESULT_CACHE = TTLCache(ttl_seconds=120, max_items=32)
+_CHART_CACHE = TTLCache(ttl_seconds=300, max_items=96)
+
+DEFAULT_TIMEFRAME = "15m"
+MULTI_TIMEFRAME_LABELS: tuple[str, ...] = ("1D", "4H", "1H", "15m")
 
 
 COCKPIT_CSS = """
@@ -111,11 +121,64 @@ COCKPIT_CSS = """
     color: var(--ap-text);
   }
   [data-testid="stAppViewContainer"] .main .block-container {
-    max-width: 1240px;
-    padding-top: 1.4rem;
+    max-width: 1500px;
+    padding-top: 0.85rem;
     padding-bottom: 5rem;
   }
   [data-testid="stSidebar"] { display: none; }
+  html, body, .stApp { overflow-x: hidden; }
+  header[data-testid="stHeader"] { background: transparent; }
+  .ap-topbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    border-bottom: 1px solid var(--ap-line);
+    padding: 0.2rem 0 0.75rem;
+    margin-bottom: 0.8rem;
+  }
+  .ap-brand {
+    display: flex;
+    align-items: center;
+    gap: 0.68rem;
+    color: var(--ap-text);
+    font-weight: 820;
+    letter-spacing: -0.015em;
+  }
+  .ap-brand-mark {
+    display: grid;
+    place-items: center;
+    width: 2rem;
+    height: 2rem;
+    border: 1px solid rgba(56, 189, 248, 0.42);
+    border-radius: 0.62rem;
+    color: var(--ap-cyan);
+    background: rgba(56, 189, 248, 0.09);
+    box-shadow: 0 0 28px rgba(56, 189, 248, 0.12);
+  }
+  .ap-top-meta { color: var(--ap-muted); font-size: 0.76rem; text-align: right; }
+  .ap-ribbon {
+    display: flex;
+    gap: 0.45rem;
+    align-items: center;
+    overflow-x: auto;
+    scrollbar-width: none;
+    padding: 0.15rem 0 0.6rem;
+    margin-bottom: 0.2rem;
+  }
+  .ap-ribbon::-webkit-scrollbar { display: none; }
+  .ap-ribbon-chip {
+    flex: 0 0 auto;
+    border: 1px solid var(--ap-line);
+    border-radius: 999px;
+    color: var(--ap-muted);
+    background: rgba(10, 23, 39, 0.8);
+    font-size: 0.72rem;
+    font-weight: 720;
+    padding: 0.38rem 0.66rem;
+    white-space: nowrap;
+  }
+  .ap-ribbon-chip strong { color: var(--ap-text); margin-left: 0.25rem; }
   .ap-kicker {
     color: var(--ap-cyan);
     font-size: 0.74rem;
@@ -171,6 +234,11 @@ COCKPIT_CSS = """
     background: linear-gradient(145deg, rgba(14, 30, 49, 0.97), rgba(8, 19, 33, 0.98));
     box-shadow: 0 24px 70px rgba(0, 0, 0, 0.28);
     margin: 1.15rem 0 0.8rem;
+    animation: apVerdictIn 240ms ease-out both;
+  }
+  @keyframes apVerdictIn {
+    from { transform: translateY(5px); opacity: 0.72; }
+    to { transform: translateY(0); opacity: 1; }
   }
   .ap-decision.enter { border-color: rgba(52, 211, 153, 0.48); }
   .ap-decision.wait { border-color: rgba(251, 191, 36, 0.46); }
@@ -252,6 +320,88 @@ COCKPIT_CSS = """
   }
   .ap-callout.risk { border-left-color: var(--ap-red); background: rgba(244, 63, 94, 0.07); }
   .ap-callout.upgrade { border-left-color: var(--ap-green); background: rgba(16, 185, 129, 0.07); }
+  [data-testid="stSegmentedControl"] {
+    overflow-x: auto;
+    scrollbar-width: none;
+    padding-bottom: 0.15rem;
+  }
+  [data-testid="stSegmentedControl"]::-webkit-scrollbar { display: none; }
+  [data-testid="stSegmentedControl"] > div { min-width: max-content; flex-wrap: nowrap !important; }
+  [data-testid="stSegmentedControl"] button {
+    min-width: 3.35rem;
+    min-height: 2.45rem;
+    border-radius: 0.7rem !important;
+    font-weight: 790;
+    letter-spacing: 0.01em;
+  }
+  .ap-chart-head {
+    display: flex;
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: 0.75rem;
+    margin: 0.45rem 0 0.3rem;
+  }
+  .ap-chart-title { color: var(--ap-text); font-size: 1.05rem; font-weight: 780; }
+  .ap-chart-note { color: var(--ap-muted); font-size: 0.75rem; }
+  .ap-rail {
+    border: 1px solid var(--ap-line);
+    border-radius: 1rem;
+    padding: 0.15rem 0.85rem 0.85rem;
+    background: rgba(7, 17, 31, 0.62);
+  }
+  .ap-rr {
+    position: relative;
+    border-left: 2px solid rgba(148, 163, 184, 0.26);
+    margin: 0.85rem 0.35rem 0.9rem;
+    padding-left: 0.9rem;
+  }
+  .ap-rr-row { display: flex; justify-content: space-between; gap: 0.8rem; padding: 0.28rem 0; font-size: 0.78rem; }
+  .ap-rr-row strong { color: var(--ap-text); }
+  .ap-rr-row.target { color: var(--ap-green); }
+  .ap-rr-row.entry { color: var(--ap-cyan); }
+  .ap-rr-row.stop { color: var(--ap-red); }
+  .ap-heatmap {
+    display: grid;
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+    gap: 0.5rem;
+    margin: 0.55rem 0 1rem;
+  }
+  .ap-tf-cell {
+    border: 1px solid var(--ap-line);
+    border-radius: 0.8rem;
+    background: var(--ap-panel-soft);
+    padding: 0.72rem;
+    min-width: 0;
+  }
+  .ap-tf-cell.active { border-color: rgba(56, 189, 248, 0.72); box-shadow: inset 0 0 0 1px rgba(56, 189, 248, 0.18); }
+  .ap-tf-cell.bullish { background: linear-gradient(145deg, rgba(16, 185, 129, 0.12), rgba(12, 25, 42, 0.9)); }
+  .ap-tf-cell.bearish { background: linear-gradient(145deg, rgba(244, 63, 94, 0.11), rgba(12, 25, 42, 0.9)); }
+  .ap-tf-label { color: var(--ap-muted); font-size: 0.69rem; font-weight: 820; }
+  .ap-tf-read { color: var(--ap-text); font-size: 0.84rem; font-weight: 760; margin-top: 0.26rem; }
+  .ap-tf-detail { color: var(--ap-muted); font-size: 0.66rem; line-height: 1.35; margin-top: 0.25rem; }
+  .ap-confluence {
+    display: grid;
+    grid-template-columns: minmax(150px, 0.7fr) minmax(0, 2fr);
+    gap: 0.8rem;
+    align-items: center;
+    border: 1px solid var(--ap-line);
+    border-radius: 0.95rem;
+    background: var(--ap-panel-soft);
+    padding: 0.9rem;
+  }
+  .ap-meter { height: 0.55rem; border-radius: 999px; background: rgba(148, 163, 184, 0.15); overflow: hidden; }
+  .ap-meter > span { display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg, var(--ap-cyan), var(--ap-green)); }
+  .ap-confluence-list { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0.4rem; }
+  .ap-confluence-item { color: var(--ap-muted); font-size: 0.72rem; }
+  .ap-confluence-item strong { color: var(--ap-text); display: block; margin-top: 0.12rem; }
+  .ap-scenarios { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0.7rem; }
+  .ap-scenario { border: 1px solid var(--ap-line); border-radius: 0.9rem; background: var(--ap-panel-soft); padding: 0.9rem; }
+  .ap-scenario.bull { border-top-color: var(--ap-green); }
+  .ap-scenario.base { border-top-color: var(--ap-cyan); }
+  .ap-scenario.bear { border-top-color: var(--ap-red); }
+  .ap-scenario h4 { margin: 0 0 0.35rem; color: var(--ap-text); font-size: 0.82rem; }
+  .ap-scenario p { margin: 0; color: var(--ap-muted); font-size: 0.76rem; line-height: 1.45; }
+  .ap-private-note { color: var(--ap-muted); font-size: 0.72rem; margin-top: 0.4rem; }
   .ap-table-wrap { overflow-x: auto; border: 1px solid var(--ap-line); border-radius: 0.9rem; }
   .ap-table { width: 100%; border-collapse: collapse; min-width: 1120px; font-size: 0.78rem; }
   .ap-table th { color: var(--ap-muted); background: #0a1727; text-align: left; padding: 0.7rem; white-space: nowrap; }
@@ -263,13 +413,22 @@ COCKPIT_CSS = """
     [data-testid="stAppViewContainer"] .main .block-container { padding: 0.8rem 0.72rem 4rem; }
     .ap-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .ap-decision { border-radius: 1rem; }
+    .ap-heatmap { display: flex; overflow-x: auto; padding-bottom: 0.3rem; scroll-snap-type: x proximity; }
+    .ap-tf-cell { min-width: 9rem; scroll-snap-align: start; }
+    .ap-scenarios { grid-template-columns: 1fr; }
+    .ap-confluence { grid-template-columns: 1fr; }
+    .ap-confluence-list { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   }
   @media (max-width: 520px) {
     .ap-grid { grid-template-columns: 1fr; gap: 0.5rem; }
     .ap-title { font-size: 1.75rem; }
     .ap-subtitle { font-size: 0.9rem; }
-    div[data-testid="stTextInput"] input { min-height: 3.3rem; font-size: 1.05rem; }
+    div[data-testid="stTextInput"] input, div[data-testid="stSelectbox"] input { min-height: 3.3rem; font-size: 1.05rem; }
     .stButton > button, .stLinkButton > a, div[data-testid="stFormSubmitButton"] button { min-height: 3.2rem; }
+    .ap-topbar { align-items: flex-start; }
+    .ap-top-meta { display: none; }
+    .ap-ribbon { margin-left: -0.72rem; margin-right: -0.72rem; padding-left: 0.72rem; padding-right: 0.72rem; }
+    .ap-confluence-list { grid-template-columns: 1fr; }
   }
 </style>
 """
@@ -298,6 +457,13 @@ def public_text(value: Any, fallback: str = "Unavailable", *, max_length: int = 
     if any(pattern.search(text) for pattern in _UNSAFE_PUBLIC_TEXT):
         return fallback
     return text
+
+
+def _html_data_url(markup: str) -> str:
+    """Wrap trusted local widget markup in an isolated iframe data URL."""
+
+    encoded = base64.b64encode(str(markup).encode("utf-8")).decode("ascii")
+    return f"data:text/html;base64,{encoded}"
 
 
 def format_price(value: Any) -> str:
@@ -348,6 +514,18 @@ def currentness_label(value: Any) -> str:
     return CURRENTNESS_LABELS.get(normalized, "Unavailable")
 
 
+def earnings_context_label(decision: Mapping[str, Any] | None) -> str:
+    source = decision if isinstance(decision, Mapping) else {}
+    status = str(source.get("earnings_status") or "unresolved").strip().lower()
+    if status == "scheduled" and source.get("earnings_date"):
+        date_status = public_text(source.get("earnings_date_status"), "scheduled", max_length=16).title()
+        return f"{date_status} · {public_text(source.get('earnings_date'), max_length=16)}"
+    if status == "verified_none":
+        through = public_text(source.get("earnings_checked_through"), "the checked window", max_length=20)
+        return f"No event in vendor calendar through {through}"
+    return "Unresolved · entry gated"
+
+
 def verdict_label(value: Any) -> str:
     normalized = str(value or "PASS").strip().upper().replace("_", " ")
     if normalized == "ENTER":
@@ -392,21 +570,23 @@ def _safe_decision(decision: Mapping[str, Any] | None) -> dict[str, Any]:
         source["primary_risk"] = "The current market evidence is not complete enough for an entry decision."
 
     warnings = source.get("warnings")
-    if isinstance(warnings, list) and warnings:
-        source["warnings"] = ["Some supporting provider inputs were unavailable; the decision was gated conservatively."]
+    if isinstance(warnings, list):
+        safe_warnings = [
+            public_text(item, "A supporting input was unavailable.", max_length=320)
+            for item in warnings
+            if str(item or "").strip()
+        ]
         if source.get("primary_risk") in warnings:
-            source["primary_risk"] = source["warnings"][0]
+            warning_index = warnings.index(source.get("primary_risk"))
+            if warning_index < len(safe_warnings):
+                source["primary_risk"] = safe_warnings[warning_index]
+        source["warnings"] = safe_warnings
 
     breakdown = deepcopy(source.get("full_breakdown"))
     if not isinstance(breakdown, Mapping):
         breakdown = {}
     else:
         breakdown = dict(breakdown)
-    if warnings:
-        breakdown["liquidity_and_market_structure"] = (
-            "Some supporting provider inputs were unavailable. No missing observation was inferred, "
-            "and the verdict was gated conservatively."
-        )
     if fail_closed:
         breakdown["final_verdict"] = source["do_this_now"]
     source["full_breakdown"] = breakdown
@@ -463,6 +643,7 @@ def build_decision_brief(decision: Mapping[str, Any] | None) -> dict[str, Any]:
         "stretch_target": format_price(plan.get("stretch_target")),
         "reward_to_risk": format_ratio(plan.get("reward_to_risk")),
         "horizon": public_text(plan.get("horizon"), "Unavailable", max_length=80),
+        "earnings": earnings_context_label(safe),
         "reasons": reasons,
         "primary_risk": public_text(
             safe.get("primary_risk"),
@@ -638,11 +819,19 @@ def build_home_snapshot(state: Mapping[str, Any] | None) -> dict[str, Any]:
     catalysts = []
     for item in analyses:
         earnings = item.get("earnings_date")
-        if earnings:
+        earnings_status = str(item.get("earnings_status") or "unresolved").lower()
+        if earnings_status == "scheduled" and earnings:
             catalysts.append(
                 {
                     "ticker": public_text(item.get("ticker"), "Ticker", max_length=24),
                     "message": f"Earnings date: {public_text(earnings, 'Unavailable', max_length=20)}",
+                }
+            )
+        elif earnings_status == "verified_none":
+            catalysts.append(
+                {
+                    "ticker": public_text(item.get("ticker"), "Ticker", max_length=24),
+                    "message": earnings_context_label(item),
                 }
             )
         elif str(item.get("state") or "").upper() in {"ENTER", "ARMED"}:
@@ -727,8 +916,9 @@ def build_position_snapshot(state: Mapping[str, Any] | None) -> list[dict[str, s
     return sorted(rows, key=lambda row: (row["thesis"] != "Broken", row["ticker"]))
 
 
-def _unavailable_payload(query: str) -> dict[str, Any]:
+def _unavailable_payload(query: str, timeframe: str = DEFAULT_TIMEFRAME) -> dict[str, Any]:
     clean = re.sub(r"[^A-Za-z0-9.\-]", "", str(query or "").upper())[:14] or "UNRESOLVED"
+    label = normalize_timeframe(timeframe, default=DEFAULT_TIMEFRAME)
     decision = unavailable_result(
         clean,
         "Current provider evidence is unavailable; no entry decision was made.",
@@ -737,10 +927,12 @@ def _unavailable_payload(query: str) -> dict[str, Any]:
     return {
         "decision": decision,
         "chart_bars": [],
+        "chart_frames": {},
+        "selected_timeframe": label,
         "journal_bars": [],
         "resolved": {"ticker": clean},
         "tradingview_symbol": symbol,
-        "tradingview_url": tradingview_chart_url(symbol, "15m"),
+        "tradingview_url": tradingview_chart_url(symbol, label),
         "provider_health": {
             "provider": "Unavailable",
             "status": "unavailable",
@@ -762,9 +954,15 @@ def _cached_analysis(query: str, provider_key: str, *, include_options: bool = T
     return _RESULT_CACHE.get_or_create(cache_key, create)
 
 
-def _initialize_state(st: Any, config: Mapping[str, Any] | Any | None) -> tuple[dict[str, Any], Optional[AutopilotStateStore]]:
+def _initialize_state(
+    st: Any,
+    config: Mapping[str, Any] | Any | None,
+    *,
+    presentation: bool = False,
+) -> tuple[dict[str, Any], Optional[AutopilotStateStore]]:
     session = st.session_state
-    path = resolve_state_path(config)
+    private_state_enabled = _truthy(_config_value(config, "AUTOPILOT_PRIVATE_STATE_ENABLED"))
+    path = None if presentation or not private_state_enabled else resolve_state_path(config)
     session_key = hashlib.sha256(path.encode("utf-8")).hexdigest() if path else "session-only"
     if session.get("_autopilot_state_identity") == session_key and "_autopilot_personal_state" in session:
         return session["_autopilot_personal_state"], session.get("_autopilot_state_store")
@@ -986,8 +1184,11 @@ def _tracking_snapshot(payload: Mapping[str, Any]) -> dict[str, Any]:
     options = decision.get("options") if isinstance(decision.get("options"), Mapping) else {}
     timeframes = decision.get("timeframes") if isinstance(decision.get("timeframes"), Mapping) else {}
     recommendation = options.get("recommendation") if isinstance(options.get("recommendation"), Mapping) else None
+    selected_timeframe = normalize_timeframe(
+        payload.get("selected_timeframe"), default=DEFAULT_TIMEFRAME
+    )
     chart_rows = []
-    for row in list(payload.get("chart_bars") or [])[-180:]:
+    for row in _frame_rows(payload, selected_timeframe)[-180:]:
         if isinstance(row, Mapping):
             chart_rows.append(
                 {
@@ -1018,7 +1219,7 @@ def _tracking_snapshot(payload: Mapping[str, Any]) -> dict[str, Any]:
         },
         "suggested_contract": deepcopy(dict(recommendation)) if recommendation else None,
         "original_chart": {
-            "timeframe": "15m",
+            "timeframe": selected_timeframe,
             "tradingview_symbol": payload.get("tradingview_symbol"),
             "bars": chart_rows,
         },
@@ -1123,31 +1324,451 @@ def _session_tracking_action(
     state["updated_at"] = now
 
 
-def _render_header(st: Any) -> None:
+_SEARCH_OPTIONS: tuple[str, ...] = (
+    "SPY · SPDR S&P 500 ETF Trust · NYSE Arca",
+    "QQQ · Invesco QQQ Trust · NASDAQ",
+    "AAPL · Apple Inc. · NASDAQ",
+    "MSFT · Microsoft Corporation · NASDAQ",
+    "NVDA · NVIDIA Corporation · NASDAQ",
+    "AMZN · Amazon.com Inc. · NASDAQ",
+    "META · Meta Platforms Inc. · NASDAQ",
+    "GOOGL · Alphabet Inc. · NASDAQ",
+    "TSLA · Tesla Inc. · NASDAQ",
+    "AMD · Advanced Micro Devices Inc. · NASDAQ",
+    "AVGO · Broadcom Inc. · NASDAQ",
+    "NFLX · Netflix Inc. · NASDAQ",
+    "PLTR · Palantir Technologies Inc. · NASDAQ",
+    "COIN · Coinbase Global Inc. · NASDAQ",
+    "IWM · iShares Russell 2000 ETF · NYSE Arca",
+    "DIA · SPDR Dow Jones Industrial Average ETF · NYSE Arca",
+)
+
+
+def _query_value(st: Any, key: str) -> Optional[str]:
+    params = getattr(st, "query_params", None)
+    if params is None:
+        return None
+    try:
+        value = params.get(key)
+    except Exception:
+        return None
+    if isinstance(value, (list, tuple)):
+        value = value[-1] if value else None
+    text = str(value or "").strip()
+    return text or None
+
+
+def _set_query_values(st: Any, **updates: Any) -> None:
+    params = getattr(st, "query_params", None)
+    if params is None:
+        return
+    for key, raw_value in updates.items():
+        try:
+            if raw_value in (None, ""):
+                if key in params:
+                    del params[key]
+            else:
+                params[key] = str(raw_value)
+        except Exception:
+            continue
+
+
+def _truthy(value: Any) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on", "presentation"}
+
+
+def _presentation_mode(st: Any) -> bool:
+    requested = _query_value(st, "view") == "presentation" or _truthy(
+        _query_value(st, "presentation")
+    )
+    if requested:
+        st.session_state["_autopilot_presentation"] = True
+    return bool(st.session_state.get("_autopilot_presentation", requested))
+
+
+def _active_timeframe(st: Any) -> str:
+    query_timeframe = _query_value(st, "tf")
+    session_timeframe = st.session_state.get("_autopilot_timeframe")
+    selected = normalize_timeframe(query_timeframe or session_timeframe, default=DEFAULT_TIMEFRAME)
+    st.session_state["_autopilot_timeframe"] = selected
+    return selected
+
+
+def _set_active_timeframe(st: Any, value: Any) -> str:
+    selected = normalize_timeframe(value, default=DEFAULT_TIMEFRAME)
+    st.session_state["_autopilot_timeframe"] = selected
+    _set_query_values(st, tf=selected)
+    return selected
+
+
+def _ticker_from_search_choice(value: Any) -> str:
+    text = str(value or "").strip()
+    if " · " in text:
+        text = text.split(" · ", 1)[0]
+    return text.strip()
+
+
+def _engine_timeframe_label(timeframe: str) -> Optional[str]:
+    return {
+        "5m": "5M",
+        "15m": "15M",
+        "1H": "1H",
+        "4H": "4H",
+        "1D": "1D",
+        "1W": "1W",
+        "1M": "1M",
+    }.get(normalize_timeframe(timeframe, default=DEFAULT_TIMEFRAME))
+
+
+def _frame_rows(payload: Mapping[str, Any], timeframe: str) -> list[dict[str, Any]]:
+    label = normalize_timeframe(timeframe, default=DEFAULT_TIMEFRAME)
+    frames = payload.get("chart_frames") if isinstance(payload.get("chart_frames"), Mapping) else {}
+    values = frames.get(label)
+    if isinstance(values, list):
+        return [dict(row) for row in values if isinstance(row, Mapping)]
+    if label == DEFAULT_TIMEFRAME and isinstance(payload.get("chart_bars"), list):
+        return [dict(row) for row in payload.get("chart_bars", []) if isinstance(row, Mapping)]
+    return []
+
+
+def _chart_rows_for(
+    payload: MutableMapping[str, Any],
+    timeframe: str,
+    provider_key: str,
+) -> list[dict[str, Any]]:
+    label = normalize_timeframe(timeframe, default=DEFAULT_TIMEFRAME)
+    rows = _frame_rows(payload, label)
+    ticker = str(payload.get("resolved", {}).get("ticker") or "").strip().upper() if isinstance(payload.get("resolved"), Mapping) else ""
+    requires_registry_depth = label in {"1H", "4H", "1W", "1M"}
+    if (not rows or requires_registry_depth) and ticker and provider_key:
+        fingerprint = hashlib.sha256(provider_key.encode("utf-8")).hexdigest()[:16]
+        cache_key = f"{fingerprint}:{ticker}:{label}"
+
+        def create() -> list[dict[str, Any]]:
+            return load_chart_bars(ticker, label, provider_key)
+
+        try:
+            rows = _CHART_CACHE.get_or_create(cache_key, create)
+        except Exception:
+            rows = []
+        if rows:
+            frames = dict(payload.get("chart_frames") or {})
+            frames[label] = deepcopy(rows)
+            payload["chart_frames"] = frames
+    return rows
+
+
+def _selected_chart_rows(
+    st: Any,
+    payload: MutableMapping[str, Any],
+    timeframe: str,
+    provider_key: str,
+) -> list[dict[str, Any]]:
+    label = normalize_timeframe(timeframe, default=DEFAULT_TIMEFRAME)
+    rows = _chart_rows_for(payload, label, provider_key)
+    payload["chart_bars"] = deepcopy(rows)
+    payload["selected_timeframe"] = label
+    st.session_state["_autopilot_active_result"] = payload
+    return rows
+
+
+def build_timeframe_alignment(
+    decision: Optional[Mapping[str, Any]],
+    *,
+    selected_timeframe: str = DEFAULT_TIMEFRAME,
+    selected_analysis: Optional[Mapping[str, Any]] = None,
+) -> list[dict[str, str]]:
+    safe = _safe_decision(decision)
+    frames = safe.get("timeframes") if isinstance(safe.get("timeframes"), Mapping) else {}
+    selected = normalize_timeframe(selected_timeframe, default=DEFAULT_TIMEFRAME)
+    rows: list[dict[str, str]] = []
+    for label in ("1M", "1W", "1D", "4H", "1H", "30m", "15m", "5m", "3m", "1m"):
+        engine_label = _engine_timeframe_label(label)
+        item = frames.get(engine_label) if engine_label and isinstance(frames.get(engine_label), Mapping) else {}
+        if label == selected and isinstance(selected_analysis, Mapping):
+            item = selected_analysis
+        direction = public_text(item.get("direction"), "unavailable", max_length=24).lower()
+        trend_score = _number(item.get("trend_score"))
+        macd_hist = _number(item.get("macd_histogram"))
+        close = _number(item.get("close"))
+        supports = [value for value in list(item.get("support") or []) if _number(value) is not None]
+        resistances = [value for value in list(item.get("resistance") or []) if _number(value) is not None]
+        ma_read = (
+            "Aligned up"
+            if trend_score is not None and trend_score >= 2
+            else "Aligned down"
+            if trend_score is not None and trend_score <= -2
+            else "Mixed"
+        )
+        momentum = (
+            "Positive"
+            if macd_hist is not None and macd_hist > 0
+            else "Negative"
+            if macd_hist is not None and macd_hist < 0
+            else "Flat / unavailable"
+        )
+        level_status = "No level data"
+        if close is not None and supports:
+            level_status = f"Above {format_price(max(float(value) for value in supports))} support"
+        if close is not None and resistances and min(float(value) for value in resistances) <= close:
+            level_status = "At / through resistance"
+        rows.append(
+            {
+                "timeframe": label,
+                "direction": direction.title(),
+                "ma_alignment": ma_read,
+                "momentum": momentum,
+                "level_status": level_status,
+                "active": "yes" if label == selected else "no",
+            }
+        )
+    return rows
+
+
+def _alignment_html(
+    decision: Mapping[str, Any],
+    selected_timeframe: str,
+    selected_analysis: Optional[Mapping[str, Any]] = None,
+) -> str:
+    cells: list[str] = []
+    for row in build_timeframe_alignment(
+        decision,
+        selected_timeframe=selected_timeframe,
+        selected_analysis=selected_analysis,
+    ):
+        direction = row["direction"].lower()
+        class_name = "bullish" if direction == "bullish" else "bearish" if direction == "bearish" else "mixed"
+        active = " active" if row["active"] == "yes" else ""
+        cells.append(
+            f'<div class="ap-tf-cell {class_name}{active}">'
+            f'<div class="ap-tf-label">{html.escape(row["timeframe"])}</div>'
+            f'<div class="ap-tf-read">{html.escape(row["direction"])}</div>'
+            f'<div class="ap-tf-detail">{html.escape(row["ma_alignment"])} · {html.escape(row["momentum"])}<br>{html.escape(row["level_status"])}</div>'
+            "</div>"
+        )
+    return '<div class="ap-heatmap">' + "".join(cells) + "</div>"
+
+
+def _confluence_html(decision: Mapping[str, Any]) -> str:
+    safe = _safe_decision(decision)
+    confidence = int(max(0, min(100, round(_number(safe.get("confidence")) or 0))))
+    market = safe.get("market_context") if isinstance(safe.get("market_context"), Mapping) else {}
+    plan = safe.get("plan") if isinstance(safe.get("plan"), Mapping) else {}
+    items = [
+        ("Timeframes", "Weighted hierarchy"),
+        ("Trigger", "Confirmed" if safe.get("entry_conditions_satisfied") else "Waiting"),
+        ("Market", public_text(market.get("regime"), "Unavailable", max_length=24).title()),
+        ("R:R", format_ratio(plan.get("reward_to_risk"))),
+        ("Data", currentness_label(safe.get("data_label"))),
+        ("Earnings", earnings_context_label(safe)),
+    ]
+    detail = "".join(
+        f'<div class="ap-confluence-item">{html.escape(label)}<strong>{html.escape(value)}</strong></div>'
+        for label, value in items
+    )
+    return (
+        '<div class="ap-confluence">'
+        f'<div><div class="ap-label">Explainable confluence</div><div class="ap-value">{confidence}%</div><div class="ap-meter"><span style="width:{confidence}%"></span></div></div>'
+        f'<div class="ap-confluence-list">{detail}</div>'
+        "</div>"
+    )
+
+
+def _scenario_html(decision: Mapping[str, Any]) -> str:
+    safe = _safe_decision(decision)
+    breakdown = safe.get("full_breakdown") if isinstance(safe.get("full_breakdown"), Mapping) else {}
+    cards = (
+        ("bull", "Bull case", public_text(breakdown.get("bull_case"), "Unavailable", max_length=520)),
+        ("base", "Base / no-trade case", public_text(breakdown.get("no_trade_case"), "Unavailable", max_length=520)),
+        ("bear", "Bear case", public_text(breakdown.get("bear_case"), "Unavailable", max_length=520)),
+    )
+    return '<div class="ap-scenarios">' + "".join(
+        f'<div class="ap-scenario {kind}"><h4>{html.escape(title)}</h4><p>{html.escape(text)}</p></div>'
+        for kind, title, text in cards
+    ) + "</div>"
+
+
+def _reward_ladder_html(brief: Mapping[str, Any]) -> str:
+    rows = (
+        ("target", "Stretch target", brief.get("stretch_target")),
+        ("target", "Target 2", brief.get("target_2")),
+        ("target", "Target 1", brief.get("target_1")),
+        ("entry", "Trigger", brief.get("trigger")),
+        ("entry", "Entry zone", brief.get("entry_zone")),
+        ("stop", "Invalidation", brief.get("invalidation")),
+    )
+    return '<div class="ap-rr">' + "".join(
+        f'<div class="ap-rr-row {kind}"><span>{html.escape(label)}</span><strong>{html.escape(public_text(value))}</strong></div>'
+        for kind, label, value in rows
+    ) + "</div>"
+
+
+def _market_ribbon_html(decision: Mapping[str, Any]) -> str:
+    safe = _safe_decision(decision)
+    market = safe.get("market_context") if isinstance(safe.get("market_context"), Mapping) else {}
+    sector_symbol = public_text(market.get("sector_symbol"), "Sector", max_length=16)
+    chips = (
+        ("Regime", public_text(str(market.get("regime") or "unavailable").replace("-", " ").title())),
+        ("SPY", public_text(str(market.get("spy_direction") or "unavailable").title())),
+        ("QQQ", public_text(str(market.get("qqq_direction") or "unavailable").title())),
+        (sector_symbol, public_text(str(market.get("sector_direction") or "unavailable").title())),
+        ("Volatility", public_text(str(market.get("volatility") or "unavailable").title())),
+        ("Breadth", public_text(str(market.get("breadth") or "unavailable").title())),
+        ("Data", currentness_label(safe.get("data_label"))),
+    )
+    return '<div class="ap-ribbon">' + "".join(
+        f'<div class="ap-ribbon-chip">{html.escape(label)}<strong>{html.escape(value)}</strong></div>'
+        for label, value in chips
+    ) + "</div>"
+
+
+def _render_timeframe_control(st: Any, current: str) -> str:
+    selected = normalize_timeframe(current, default=DEFAULT_TIMEFRAME)
+    key = "_autopilot_timeframe_segment"
+    if st.session_state.get(key) not in TIMEFRAME_LABELS:
+        st.session_state[key] = selected
+    st.markdown('<div class="ap-section-title">Chart timeframe</div>', unsafe_allow_html=True)
+    chosen = st.segmented_control(
+        "Chart timeframe",
+        options=list(TIMEFRAME_LABELS),
+        key=key,
+        selection_mode="single",
+        label_visibility="collapsed",
+        width="stretch",
+    )
+    chosen = normalize_timeframe(chosen, default=selected)
+    return _set_active_timeframe(st, chosen)
+
+
+def _decision_rail_html(brief: Mapping[str, Any]) -> str:
+    reasons = "".join(
+        f"<li>{html.escape(public_text(reason, 'Evidence unavailable', max_length=360))}</li>"
+        for reason in list(brief.get("reasons") or [])[:3]
+    )
+    metrics = _html_grid(
+        [
+            ("State", brief.get("state")),
+            ("Direction", brief.get("direction")),
+            ("Confidence", brief.get("confidence")),
+            ("Grade", brief.get("grade")),
+            ("Price", brief.get("current_price")),
+            ("R:R", brief.get("reward_to_risk")),
+        ]
+    )
+    return (
+        '<div class="ap-rail">'
+        '<div class="ap-section-title">Decision rail</div>'
+        + metrics
+        + _reward_ladder_html(brief)
+        + f'<div class="ap-label">Why this decision</div><ol>{reasons}</ol>'
+        + _callout("Primary risk", brief.get("primary_risk"), "risk")
+        + _callout("What upgrades it", brief.get("upgrade"), "upgrade")
+        + _callout("What invalidates it", brief.get("invalidate"), "risk")
+        + "</div>"
+    )
+
+
+def _render_header(st: Any, *, presentation: bool) -> bool:
+    mode_label = "Showcase view" if presentation else "David's decision terminal"
     st.markdown(
-        """
-        <div class="ap-kicker">Trading Autopilot</div>
-        <h1 class="ap-title">Your decision cockpit</h1>
-        <p class="ap-subtitle">Search once. Get the market context, chart, trade plan and a clear next action.</p>
+        f"""
+        <div class="ap-topbar">
+          <div class="ap-brand"><span class="ap-brand-mark">TA</span><span>Trading Autopilot</span></div>
+          <div class="ap-top-meta">{html.escape(mode_label)}<br>Decision support only</div>
+        </div>
+        <div class="ap-kicker">Chart-first market intelligence</div>
+        <h1 class="ap-title">Search. Read the setup. Decide.</h1>
+        <p class="ap-subtitle">One ticker turns into a synchronized chart, multi-timeframe evidence, and an ENTER / WAIT / PASS action.</p>
         """,
         unsafe_allow_html=True,
     )
 
+    toggle_key = "_autopilot_presentation_toggle"
+    if toggle_key not in st.session_state:
+        st.session_state[toggle_key] = bool(presentation)
+    enabled = bool(
+        st.toggle(
+            "Presentation Mode",
+            key=toggle_key,
+            help="Hides personal watchlist, journal, positions and tracking controls for a clean shareable view.",
+        )
+    )
+    if enabled != presentation:
+        st.session_state["_autopilot_presentation"] = enabled
+        _set_query_values(st, view="presentation" if enabled else None, presentation=None)
+    if enabled:
+        st.markdown(
+            "<style>header[data-testid='stHeader'] { background: transparent; } .ap-private-only { display:none !important; }</style>",
+            unsafe_allow_html=True,
+        )
+    return enabled
+
 
 def _render_search(st: Any) -> tuple[bool, str]:
+    current = str(st.session_state.get("_autopilot_search_query") or _query_value(st, "symbol") or "").strip()
+    options = list(_SEARCH_OPTIONS)
+    current_index = None
+    if current:
+        match = next((index for index, value in enumerate(options) if value.upper().startswith(current.upper() + " ·")), None)
+        if match is None:
+            options.insert(0, current.upper())
+            current_index = 0
+        else:
+            current_index = match
     with st.form("autopilot_ticker_search", clear_on_submit=False):
-        query = st.text_input(
-            "Ticker",
-            value=str(st.session_state.get("_autopilot_search_query") or ""),
-            placeholder="Ticker or exchange:ticker — press Enter",
-            max_chars=32,
-            label_visibility="collapsed",
+        search_column, action_column = st.columns([5.6, 1.25], gap="small")
+        with search_column:
+            query = st.selectbox(
+                "Ticker search",
+                options=options,
+                index=current_index,
+                placeholder="Search ticker, company or exchange — press Enter",
+                accept_new_options=True,
+                label_visibility="collapsed",
+            )
+        with action_column:
+            submitted = st.form_submit_button("Analyze", type="primary", width="stretch")
+    try:
+        st.html(
+            """
+            <script>
+            (() => {
+              const root = window.parent.document;
+              if (window.parent.__tradingAutopilotSlashShortcut) return;
+              window.parent.__tradingAutopilotSlashShortcut = true;
+              root.addEventListener('keydown', (event) => {
+                const tag = (event.target && event.target.tagName || '').toLowerCase();
+                if (event.key === '/' && !['input','textarea','select'].includes(tag)) {
+                  const input = root.querySelector('[data-testid="stSelectbox"] input');
+                  if (input) { event.preventDefault(); input.focus(); }
+                }
+              });
+            })();
+            </script>
+            """,
+            unsafe_allow_javascript=True,
         )
-        submitted = st.form_submit_button("Analyze", type="primary", width="stretch")
-    return submitted, str(query or "").strip()
+    except Exception:
+        pass
+    return submitted, _ticker_from_search_choice(query)
 
 
-def _render_home(st: Any, state: Mapping[str, Any]) -> None:
+def _render_home(st: Any, state: Mapping[str, Any], *, presentation: bool = False) -> None:
+    if presentation:
+        st.markdown('<div class="ap-section-title">Start with one symbol</div>', unsafe_allow_html=True)
+        st.markdown(
+            _html_grid(
+                [
+                    ("1 · Search", "Type any listed US ticker or choose a company suggestion."),
+                    ("2 · Read", "Compare the chart, timeframe alignment, trigger and invalidation."),
+                    ("3 · Decide", "Use ENTER, WAIT or PASS as decision support—not an order."),
+                ]
+            ),
+            unsafe_allow_html=True,
+        )
+        st.info("Try SPY, QQQ, AAPL, NVDA or TSLA. Presentation Mode keeps personal watchlists, positions, journals and tracking controls out of view.")
+        st.caption("Decision support only. No orders are placed.")
+        return
     model = build_home_snapshot(state)
     st.markdown('<div class="ap-section-title">Today at a glance</div>', unsafe_allow_html=True)
     cells = [
@@ -1246,14 +1867,10 @@ def _render_decision_card(st: Any, brief: Mapping[str, Any]) -> None:
     st.markdown(
         _html_grid(
             [
-                ("Current setup state", brief["state"]),
-                ("Direction", brief["direction"]),
-                ("Confidence", brief["confidence"]),
-                ("Setup grade", brief["grade"]),
                 ("Current price", brief["current_price"]),
-                ("Market status", brief["market_status"]),
-                ("Setup type", brief["setup_type"]),
-                ("Entry conditions satisfied", brief["entry_satisfied"]),
+                ("Market", brief["market_status"]),
+                ("Setup", brief["setup_type"]),
+                ("Entry confirmed", brief["entry_satisfied"]),
             ]
         ),
         unsafe_allow_html=True,
@@ -1353,20 +1970,48 @@ def _render_tracking_actions(st: Any, payload: Mapping[str, Any], brief: Mapping
     st.caption("Alerts are limited to setup-state, target, invalidation, earnings/news thesis changes; ordinary price movement is ignored.")
 
 
-def _render_chart(st: Any, payload: Mapping[str, Any], brief: Mapping[str, Any]) -> None:
-    st.markdown('<div class="ap-section-title">Annotated setup chart</div>', unsafe_allow_html=True)
-    rows = payload.get("chart_bars") if isinstance(payload.get("chart_bars"), list) else []
+def _render_chart(
+    st: Any,
+    payload: Mapping[str, Any],
+    brief: Mapping[str, Any],
+    timeframe: str,
+    rows: list[dict[str, Any]],
+) -> None:
+    label = normalize_timeframe(timeframe, default=DEFAULT_TIMEFRAME)
+    spec = get_timeframe_spec(label)
+    st.markdown(
+        f'<div class="ap-chart-head"><div><div class="ap-chart-title">{html.escape(str(brief["ticker"]))} · {html.escape(label)} setup chart</div>'
+        f'<div class="ap-chart-note">{html.escape("Intraday" if spec.intraday else "Higher timeframe")} · completed provider bars · decision levels remain unchanged</div></div></div>',
+        unsafe_allow_html=True,
+    )
     if rows:
         try:
+            decision = brief["safe_decision"]
+            frames = decision.get("timeframes") if isinstance(decision.get("timeframes"), Mapping) else {}
+            engine_label = _engine_timeframe_label(label)
+            selected_analysis = frames.get(engine_label) if engine_label and isinstance(frames.get(engine_label), Mapping) else None
             figure = build_autopilot_chart(
                 rows,
-                brief["safe_decision"],
-                title=f"{brief['ticker']} · 15m decision chart",
+                decision,
+                title=f"{brief['ticker']} · {label}",
+                timeframe=label,
+                selected_analysis=selected_analysis,
+                earnings_date=decision.get("earnings_date"),
             )
             st.plotly_chart(
                 figure,
                 width="stretch",
-                config={"displaylogo": False, "scrollZoom": True, "responsive": True},
+                key=f"autopilot_chart_{brief['ticker']}_{label}",
+                config={
+                    "displaylogo": False,
+                    "scrollZoom": True,
+                    "responsive": True,
+                    "toImageButtonOptions": {
+                        "format": "png",
+                        "filename": f"trading-autopilot-{str(brief['ticker']).lower()}-{label}",
+                        "scale": 2,
+                    },
+                },
             )
         except Exception:
             st.info("The annotated chart is unavailable for this response. No visual level was inferred.")
@@ -1374,13 +2019,101 @@ def _render_chart(st: Any, payload: Mapping[str, Any], brief: Mapping[str, Any])
         st.info("Chart unavailable because current price bars were not returned. No visual level was inferred.")
 
     symbol = normalize_tradingview_symbol(payload.get("tradingview_symbol") or brief["ticker"])
-    url = tradingview_chart_url(symbol, "15m")
+    url = tradingview_chart_url(symbol, label)
     st.link_button(
-        f"Open {brief['ticker']} in my TradingView · 15m",
+        f"Open {brief['ticker']} in TradingView · {label}",
         url,
         width="stretch",
     )
-    st.caption(f"Opens {public_text(symbol, brief['ticker'], max_length=72)} at the 15m interval.")
+    st.caption(
+        f"Opens {public_text(symbol, brief['ticker'], max_length=72)} at {label}. "
+        "Your signed-in TradingView drawings and private layouts stay in TradingView; the app does not claim two-way sync."
+    )
+
+
+def _render_multi_timeframe_view(
+    st: Any,
+    payload: MutableMapping[str, Any],
+    brief: Mapping[str, Any],
+    provider_key: str,
+) -> None:
+    enabled = st.toggle(
+        "4-chart multi-timeframe view",
+        key="_autopilot_multi_timeframe",
+        help="Compare Daily, 4H, 1H and 15m without changing the decision engine or the selected single chart.",
+    )
+    if not enabled:
+        return
+    st.markdown('<div class="ap-section-title">Multi-timeframe chart wall</div>', unsafe_allow_html=True)
+    columns = st.columns(2, gap="small")
+    for index, label in enumerate(MULTI_TIMEFRAME_LABELS):
+        with columns[index % 2]:
+            rows = _chart_rows_for(payload, label, provider_key)
+            if not rows:
+                st.info(f"{label} bars unavailable.")
+                continue
+            try:
+                decision = brief["safe_decision"]
+                frames = decision.get("timeframes") if isinstance(decision.get("timeframes"), Mapping) else {}
+                engine_label = _engine_timeframe_label(label)
+                selected_analysis = frames.get(engine_label) if engine_label and isinstance(frames.get(engine_label), Mapping) else None
+                figure = build_autopilot_chart(
+                    rows,
+                    decision,
+                    title=f"{brief['ticker']} · {label}",
+                    max_bars=120,
+                    timeframe=label,
+                    selected_analysis=selected_analysis,
+                    earnings_date=decision.get("earnings_date"),
+                    compact=True,
+                )
+                st.plotly_chart(
+                    figure,
+                    width="stretch",
+                    key=f"autopilot_multi_{brief['ticker']}_{label}",
+                    config={"displaylogo": False, "responsive": True, "scrollZoom": True},
+                )
+            except Exception:
+                st.info(f"{label} chart unavailable.")
+
+
+def _render_export(
+    st: Any,
+    payload: Mapping[str, Any],
+    brief: Mapping[str, Any],
+    timeframe: str,
+    selected_analysis: Optional[Mapping[str, Any]] = None,
+) -> None:
+    symbol = normalize_tradingview_symbol(payload.get("tradingview_symbol") or brief["ticker"])
+    tradingview_url = tradingview_chart_url(symbol, timeframe)
+    public_payload = build_presentation_payload(
+        brief["safe_decision"],
+        timeframe=timeframe,
+        tradingview_symbol=symbol,
+        tradingview_url=tradingview_url,
+        selected_analysis=selected_analysis,
+    )
+    st.markdown('<div class="ap-section-title">Present or export</div>', unsafe_allow_html=True)
+    left, right = st.columns([1, 1], gap="small")
+    with left:
+        try:
+            pdf_bytes = presentation_pdf_bytes(public_payload)
+        except Exception:
+            st.info("PDF export is temporarily unavailable. The chart PNG control remains available.")
+        else:
+            st.download_button(
+                "Download decision brief · PDF",
+                data=pdf_bytes,
+                file_name=f"trading-autopilot-{str(brief['ticker']).lower()}-{timeframe}.pdf",
+                mime="application/pdf",
+                width="stretch",
+            )
+    with right:
+        st.link_button("Open synchronized TradingView chart", tradingview_url, width="stretch")
+    st.caption(
+        "Use the camera button in the chart toolbar for a high-resolution PNG. "
+        "Presentation Mode and the PDF exclude watchlists, positions, journals, provider errors, paths and credentials."
+    )
 
 
 def _render_options(st: Any, decision: Mapping[str, Any]) -> None:
@@ -1402,6 +2135,23 @@ def _render_options(st: Any, decision: Mapping[str, Any]) -> None:
         st.warning("Contract rankings are provisional only. Wait for the underlying setup to reach ENTER.")
     else:
         st.info("No contract is recommended. The table is shown only to explain why the chain did not qualify.")
+    top = rows[0]
+    st.markdown("**Top contract at a glance**")
+    st.markdown(
+        _html_grid(
+            [
+                ("Contract", top.get("Contract")),
+                ("Expiration / DTE", f"{top.get('Expiration')} · {top.get('DTE')} DTE"),
+                ("Strike / type", f"{top.get('Strike')} · {top.get('Type')}"),
+                ("Bid / ask", f"{top.get('Bid')} / {top.get('Ask')}"),
+                ("Spread", f"{top.get('Spread $')} · {top.get('Spread %')}"),
+                ("Liquidity", top.get("Liquidity")),
+                ("Greeks", f"Δ {top.get('Delta')} · Γ {top.get('Gamma')} · Θ {top.get('Theta')}"),
+                ("Breakeven", top.get("Breakeven")),
+            ]
+        ),
+        unsafe_allow_html=True,
+    )
     st.markdown(_options_html(rows), unsafe_allow_html=True)
     st.caption("Missing Greeks, liquidity, IV rank or earnings data remain Unavailable; they are never estimated as observed values.")
 
@@ -1420,7 +2170,15 @@ def _render_breakdown(st: Any, decision: Mapping[str, Any]) -> None:
             st.write(text)
 
 
-def _render_advanced(st: Any, payload: Mapping[str, Any], state: Mapping[str, Any], brief: Mapping[str, Any]) -> None:
+def _render_advanced(
+    st: Any,
+    payload: Mapping[str, Any],
+    state: Mapping[str, Any],
+    brief: Mapping[str, Any],
+    timeframe: str,
+    *,
+    presentation: bool = False,
+) -> None:
     with st.expander("Advanced", expanded=False):
         st.markdown("**Methodology shown on the app-native chart**")
         st.write("9 EMA · 21 WMA · 50 WMA · 200 WMA · 200 SMA · MACD 12/26/9")
@@ -1432,42 +2190,57 @@ def _render_advanced(st: Any, payload: Mapping[str, Any], state: Mapping[str, An
             f"{currentness_label(health.get('data_label'))} · "
             f"{format_timestamp(health.get('timestamp'))}"
         )
-        persistence = st.session_state.get("_autopilot_persistence_mode")
-        st.write("Personal state: saved across sessions" if persistence == "persistent" else "Personal state: this session only")
+        if not presentation:
+            persistence = st.session_state.get("_autopilot_persistence_mode")
+            st.write("Personal state: saved across sessions" if persistence == "persistent" else "Personal state: this session only")
         st.markdown("**Focused ticker-analysis preset**")
         symbol = normalize_tradingview_symbol(payload.get("tradingview_symbol") or brief["ticker"])
         watchlist = list(state.get("watchlist") or []) if isinstance(state, Mapping) else []
-        try:
-            from streamlit.components.v1 import html as render_component_html
-
-            render_component_html(
-                tradingview_widget_html(symbol, "15m", watchlist=watchlist, compact=True),
-                height=560,
-                scrolling=False,
-            )
-        except Exception:
-            st.info("The embedded TradingView view is unavailable. Use the 15m handoff above.")
-        st.markdown("**Market-context 2 × 2 preset**")
-        st.caption("SPY Daily · SPY 4H · QQQ Daily · QQQ 4H")
-        try:
-            from streamlit.components.v1 import html as render_market_context_html
-
-            render_market_context_html(
-                tradingview_market_context_html(),
-                height=880,
-                scrolling=False,
-            )
-        except Exception:
-            st.info("The market-context preset is unavailable. The app-native SPY/QQQ regime remains visible above.")
+        load_tradingview = st.toggle(
+            "Load official TradingView widgets",
+            value=False,
+            key=f"_autopilot_load_tradingview_{brief['ticker']}_{int(presentation)}",
+            help="Loads TradingView's external chart scripts only when you want the embedded views.",
+        )
+        if load_tradingview:
+            try:
+                st.iframe(
+                    _html_data_url(
+                        tradingview_widget_html(
+                            symbol,
+                            timeframe,
+                            watchlist=watchlist,
+                            compact=True,
+                        )
+                    ),
+                    height=560,
+                    width="stretch",
+                )
+            except Exception:
+                st.info(f"The embedded TradingView view is unavailable. Use the {timeframe} handoff above.")
+            st.markdown("**Market-context 2 × 2 preset**")
+            st.caption("SPY Daily · SPY 4H · QQQ Daily · QQQ 4H")
+            try:
+                st.iframe(
+                    _html_data_url(tradingview_market_context_html()),
+                    height=880,
+                    width="stretch",
+                )
+            except Exception:
+                st.info("The market-context preset is unavailable. The app-native SPY/QQQ regime remains visible above.")
+        else:
+            st.caption("Embedded TradingView charts are on demand so ticker and timeframe changes stay fast.")
         st.caption(
             "The official chart handoff opens the correct symbol and interval. Private TradingView layouts "
             "and drawings remain in your signed-in TradingView session and are not claimed as synchronized."
         )
         outcomes = (
             list(state.get("calibration", {}).get("results", []))
-            if isinstance(state.get("calibration"), Mapping)
+            if not presentation and isinstance(state.get("calibration"), Mapping)
             else []
         )
+        if presentation:
+            return
         st.markdown("**Automatic journal and calibration**")
         if outcomes:
             try:
@@ -1548,16 +2321,22 @@ def _valid_query(query: str) -> bool:
     return bool(re.fullmatch(r"\$?[A-Za-z0-9][A-Za-z0-9.\-]*(?::[A-Za-z0-9][A-Za-z0-9.\-]*)?", query))
 
 
-def _run_search(st: Any, query: str, config: Mapping[str, Any] | Any | None) -> dict[str, Any]:
+def _run_search(
+    st: Any,
+    query: str,
+    config: Mapping[str, Any] | Any | None,
+    *,
+    timeframe: str = DEFAULT_TIMEFRAME,
+) -> dict[str, Any]:
     st.session_state["_autopilot_search_query"] = query
     if not _valid_query(query):
         st.warning("Enter one valid ticker, optionally qualified by exchange, such as NASDAQ:AAPL.")
-        return _unavailable_payload(query)
+        return _unavailable_payload(query, timeframe)
     provider_key = _provider_key(config)
     with st.status("Analyzing the setup…", expanded=True) as progress:
         st.write("Resolving the symbol and exchange")
         if not provider_key:
-            payload = _unavailable_payload(query)
+            payload = _unavailable_payload(query, timeframe)
             st.write("Current market evidence is unavailable; the result is safely gated to PASS")
             progress.update(label="Analysis unavailable — PASS", state="complete", expanded=False)
             return payload
@@ -1565,9 +2344,17 @@ def _run_search(st: Any, query: str, config: Mapping[str, Any] | Any | None) -> 
         try:
             payload = _cached_analysis(query, provider_key, include_options=True)
         except AutopilotServiceError:
-            payload = _unavailable_payload(query)
+            payload = _unavailable_payload(query, timeframe)
         except Exception:
-            payload = _unavailable_payload(query)
+            payload = _unavailable_payload(query, timeframe)
+        payload = deepcopy(dict(payload))
+        selected = normalize_timeframe(timeframe, default=DEFAULT_TIMEFRAME)
+        frames = payload.get("chart_frames") if isinstance(payload.get("chart_frames"), Mapping) else {}
+        if selected in frames:
+            payload["chart_bars"] = deepcopy(list(frames.get(selected) or []))
+        payload["selected_timeframe"] = selected
+        symbol = normalize_tradingview_symbol(payload.get("tradingview_symbol") or query)
+        payload["tradingview_url"] = tradingview_chart_url(symbol, selected)
         st.write("Building the decision, chart and options review")
         decision = _safe_decision(payload.get("decision") if isinstance(payload.get("decision"), Mapping) else {})
         label = verdict_label(decision.get("verdict"))
@@ -1601,32 +2388,75 @@ def render_cockpit(st: Any, config: Mapping[str, Any] | Any | None = None) -> No
     """Render the complete one-search cockpit using Streamlit 1.50-compatible APIs."""
 
     st.markdown(COCKPIT_CSS, unsafe_allow_html=True)
-    state, _ = _initialize_state(st, config)
-    _render_header(st)
+    presentation = _presentation_mode(st)
+    state, _ = _initialize_state(st, config, presentation=presentation)
+    presentation = _render_header(st, presentation=presentation)
+    if presentation:
+        state, _ = _initialize_state(st, config, presentation=True)
+    timeframe = _active_timeframe(st)
     submitted, query = _render_search(st)
 
+    query_symbol = _query_value(st, "symbol")
+    if (
+        not submitted
+        and query_symbol
+        and not isinstance(st.session_state.get("_autopilot_active_result"), Mapping)
+        and not st.session_state.get("_autopilot_query_bootstrapped")
+    ):
+        submitted = True
+        query = query_symbol
+        st.session_state["_autopilot_query_bootstrapped"] = True
+
     if submitted:
-        payload = _run_search(st, query, config)
+        _set_query_values(st, symbol=query.upper(), tf=timeframe, view="presentation" if presentation else None)
+        payload = _run_search(st, query, config, timeframe=timeframe)
         st.session_state["_autopilot_active_result"] = payload
-        _persist_analysis(st, payload)
+        if not presentation:
+            _persist_analysis(st, payload)
 
     payload = st.session_state.get("_autopilot_active_result")
     if not isinstance(payload, Mapping):
-        _prepare_home_context(st, config)
+        if not presentation:
+            _prepare_home_context(st, config)
         state = st.session_state.get("_autopilot_personal_state") or state
-        _render_home(st, state)
+        _render_home(st, state, presentation=presentation)
         return
 
+    payload = deepcopy(dict(payload))
     decision = payload.get("decision") if isinstance(payload.get("decision"), Mapping) else {}
     brief = build_decision_brief(decision)
+    st.markdown(_market_ribbon_html(brief["safe_decision"]), unsafe_allow_html=True)
     _render_decision_card(st, brief)
-    _render_trade_plan(st, brief)
-    _render_tracking_actions(st, payload, brief)
-    _render_chart(st, payload, brief)
+
+    timeframe = _render_timeframe_control(st, timeframe)
+    provider_key = _provider_key(config)
+    rows = _selected_chart_rows(st, payload, timeframe, provider_key)
+    try:
+        selected_analysis = asdict(analyze_timeframe(timeframe, rows)) if rows else {}
+    except Exception:
+        selected_analysis = {}
+    chart_column, rail_column = st.columns([2.05, 1], gap="medium")
+    with chart_column:
+        _render_chart(st, payload, brief, timeframe, rows)
+    with rail_column:
+        st.markdown(_decision_rail_html(brief), unsafe_allow_html=True)
+
+    _render_multi_timeframe_view(st, payload, brief, provider_key)
+    st.markdown('<div class="ap-section-title">Timeframe alignment</div>', unsafe_allow_html=True)
+    st.markdown(
+        _alignment_html(brief["safe_decision"], timeframe, selected_analysis),
+        unsafe_allow_html=True,
+    )
+    st.markdown(_confluence_html(brief["safe_decision"]), unsafe_allow_html=True)
+    st.markdown('<div class="ap-section-title">Scenario map</div>', unsafe_allow_html=True)
+    st.markdown(_scenario_html(brief["safe_decision"]), unsafe_allow_html=True)
     _render_options(st, brief["safe_decision"])
+    if not presentation:
+        _render_tracking_actions(st, payload, brief)
     _render_breakdown(st, brief["safe_decision"])
     state = st.session_state.get("_autopilot_personal_state") or state
-    _render_advanced(st, payload, state, brief)
+    _render_advanced(st, payload, state, brief, timeframe, presentation=presentation)
+    _render_export(st, payload, brief, timeframe, selected_analysis)
     st.caption("Trading Autopilot provides decision support only. It does not connect to a broker or place orders.")
 
 
@@ -1634,6 +2464,7 @@ __all__ = [
     "BREAKDOWN_SECTIONS",
     "build_decision_brief",
     "build_home_snapshot",
+    "build_timeframe_alignment",
     "currentness_label",
     "format_percent",
     "format_price",

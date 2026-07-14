@@ -4,19 +4,22 @@ Trading Autopilot is David's read-only trading decision cockpit. One ticker sear
 
 It never connects to a broker, places an order, or spends money.
 
+Current release: **v2.1.0-premium-terminal** (displayed in the app as **v2.1.0**).
+
 ## Daily workflow
 
 1. Open the app.
 2. Enter a ticker or an exchange-qualified ticker such as `NASDAQ:AAPL`.
 3. Review the decision card and one-sentence instruction.
-4. Inspect the synchronized chart, trigger, entry zone, invalidation, targets, and evidence.
+4. Inspect the selected chart, four-chart multi-timeframe wall, trigger, entry zone, invalidation, targets, and evidence.
 5. Mark the setup as entered, watching, passed, or closed when useful.
 
 No CSV, manual indicator entry, manual level entry, source selector, or sample workflow is required on the main screen.
 
 ## What the cockpit evaluates
 
-- Monthly, Weekly, Daily, 4H, 1H, 15m, and 5m evidence, with Weekly/Daily/4H/15m weighted most heavily.
+- Ten distinct chart intervals: 1m, 3m, 5m, 15m, 30m, 1H, 4H, 1D, 1W, and 1M. One-minute and one-month labels remain deliberately case-sensitive.
+- Multi-timeframe evidence with Weekly/Daily/4H/15m weighted most heavily, plus a four-chart wall for fast alignment review.
 - The saved chart baseline: 9 EMA, **21 WMA**, 50 WMA, 200 WMA, 200 SMA, MACD 12/26/9, and intraday VWAP.
 - SPY, QQQ, the relevant sector ETF, relative strength, liquidity, data freshness, earnings availability, news, structure, momentum, volume, extension, and reward-to-risk.
 - A six-state explainable setup model: BLOCKED, FORMING, ARMED, ENTER, EXTENDED, and INVALIDATED.
@@ -29,19 +32,24 @@ Every visible conclusion is derived from provider observations or explicitly lab
 The app provides:
 
 - An app-native annotated candlestick and MACD chart using the saved methodology baseline.
-- Exact symbol, exchange, and 15-minute handoff to the signed-in TradingView browser session.
+- Exact symbol, exchange, and selected-timeframe handoff to the signed-in TradingView browser session.
+- A four-chart multi-timeframe wall for comparing the active setup across intervals.
 - An official embedded TradingView view in Advanced.
 - The indicator-only `tradingview/trading_autopilot_sol_ultra.pine` helper for consistent indicators and transferred plan levels.
 
 Private TradingView layouts and drawings are not exposed through the public widget API and are never claimed as synchronized. The original TradingView layout must not be modified; any account-side rollout belongs in a duplicate layout named `Trading Autopilot | David`.
 
+## Presentation and privacy
+
+Showcase mode removes personal controls and durable-state behavior from the presentation surface. Its optional one-page PDF is built from an explicit public allowlist: decision, chart context, levels, evidence, and provider health may be included; credentials, private state, personal bankroll limits, and internal paths may not.
+
 ## Personal state and monitoring
 
 The cockpit records recent searches, watchlist choices, saved analyses and plans, tracked positions, in-app state changes, alerts, journal actions, calibration data, and UI preferences.
 
-- With `APP_ACCESS_CODE` configured, the app uses a private server-side state file by default.
-- `AUTOPILOT_STATE_PATH` and `AUTOPILOT_STATE_ALLOWED_ROOT` can override that location.
-- Without private access configuration, state stays session-only so a public visitor cannot inherit or overwrite personal data.
+- State is session-only by default, including when only `APP_ACCESS_CODE` or state-path variables are configured.
+- Durable shared state requires both `APP_ACCESS_CODE` and the explicit private-deployment opt-in `AUTOPILOT_PRIVATE_STATE_ENABLED = "true"`.
+- After that opt-in, `AUTOPILOT_STATE_PATH` and `AUTOPILOT_STATE_ALLOWED_ROOT` can override the private server-side location.
 - Provider keys and other credentials are rejected from saved state.
 
 Monitoring runs when the app refreshes a tracked symbol. Only meaningful transitions such as FORMING → ARMED, ARMED → ENTER, target reached, or invalidation reached create events; ordinary price noise does not.
@@ -54,7 +62,10 @@ Production secrets belong in Streamlit's secret manager, never in Git:
 MARKET_DATA_PROVIDER = "polygon"
 POLYGON_API_KEY = "..."
 APP_ACCESS_CODE = "..." # recommended for durable personal state
+AUTOPILOT_PRIVATE_STATE_ENABLED = "true" # explicit opt-in; omit for public/session-only use
 ```
+
+Personal bankroll and loss limits stay in the canonical-only `config/risk_config.json`. The generated public mirror deliberately omits that file and uses fail-closed zero defaults instead of publishing personal financial settings.
 
 The app distinguishes Real-time, Delayed, Last close, Stale, and Unavailable data with exact timestamps. Provider errors are sanitized before display. Stale, future-dated, incomplete, or currently forming bars cannot create an ENTER result.
 
@@ -69,7 +80,7 @@ python3 -m venv .venv
 Run the complete verification suite:
 
 ```bash
-.venv/bin/python -m pytest -q
+.venv/bin/python -m unittest discover -s tests -p 'test_*.py'
 ```
 
 ## Repository ownership and cloud release
@@ -79,11 +90,13 @@ Run the complete verification suite:
 Check or update the public mirror from the canonical repository:
 
 ```bash
-python3 tools/sync_cloud_mirror.py --target /absolute/path/to/trading-autopilot-cloud --mode check
-python3 tools/sync_cloud_mirror.py --target /absolute/path/to/trading-autopilot-cloud --mode apply
+# Run after committing the canonical release branch; apply/check refuse dirty sources.
+SOURCE_COMMIT=$(git rev-parse HEAD)
+python3 tools/sync_cloud_mirror.py --target /absolute/path/to/trading-autopilot-cloud --source-commit "$SOURCE_COMMIT" --mode check
+python3 tools/sync_cloud_mirror.py --target /absolute/path/to/trading-autopilot-cloud --source-commit "$SOURCE_COMMIT" --mode apply
 ```
 
-The sync tool refuses unsafe targets, never copies Git metadata or secrets, and only removes files previously recorded as managed. See `docs/SOURCE_OF_TRUTH.md` for the branch, review, deployment, and rollback procedure.
+The sync tool refuses unsafe targets and dirty or mismatched canonical sources, never copies Git metadata, secrets, or private risk limits, records canonical commit/version provenance, and only removes files previously recorded as managed. See `docs/SOURCE_OF_TRUTH.md` for the branch, review, deployment, and rollback procedure.
 
 ## Safety boundary
 
@@ -96,9 +109,9 @@ The sync tool refuses unsafe targets, never copies Git metadata or secrets, and 
 <details>
 <summary>Historical v1.x compatibility documentation</summary>
 
-The material below is retained only as an auditable record for the frozen v1.x regression suite. It does not describe the default 2.0 cockpit workflow.
+The material below is retained only as an auditable record for the frozen v1.x regression suite. It does not describe the default 2.1 premium-terminal workflow.
 
-# Trading Autopilot v1.5.4-mobile-calibration-warning-polish-dev
+# Historical Trading Autopilot v1.x interface
 
 Trading Autopilot is a decision-support dashboard for scanner ranking, watchlist review, helper levels, review planning, and journaling.
 

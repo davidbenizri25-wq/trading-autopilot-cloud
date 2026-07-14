@@ -14,22 +14,10 @@ import re
 from typing import Any, Iterable, Mapping
 from urllib.parse import urlencode
 
+from timeframes import TRADINGVIEW_INTERVALS, tradingview_interval_for
+
 
 DEFAULT_TRADINGVIEW_SYMBOL = "SPY"
-TRADINGVIEW_INTERVALS = {
-    "1m": "1",
-    "3m": "3",
-    "5m": "5",
-    "15m": "15",
-    "30m": "30",
-    "45m": "45",
-    "1h": "60",
-    "2h": "120",
-    "4h": "240",
-    "1d": "D",
-    "1w": "W",
-    "1mo": "M",
-}
 TRADINGVIEW_EXCHANGES = {
     "XNAS": "NASDAQ",
     "XNGS": "NASDAQ",
@@ -96,18 +84,7 @@ def candidate_tradingview_symbol(row: Mapping[str, Any] | None) -> str:
 def tradingview_interval(timeframe: Any) -> str:
     """Map app timeframe labels to TradingView widget intervals."""
 
-    value = str(timeframe or "1D").strip().lower().replace(" ", "")
-    aliases = {
-        "60m": "1h",
-        "240m": "4h",
-        "day": "1d",
-        "daily": "1d",
-        "week": "1w",
-        "weekly": "1w",
-        "month": "1mo",
-        "monthly": "1mo",
-    }
-    return TRADINGVIEW_INTERVALS.get(aliases.get(value, value), "D")
+    return tradingview_interval_for(timeframe, default="1D")
 
 
 def tradingview_chart_url(symbol: Any, timeframe: Any = None) -> str:

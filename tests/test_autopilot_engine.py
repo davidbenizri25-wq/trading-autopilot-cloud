@@ -34,6 +34,25 @@ def trend_bars(*, bullish: bool = True, count: int = 260, start: float = 100.0) 
     return bars
 
 
+def evaluate_confirmed_fixture(**earnings: object):
+    """Evaluate one otherwise-confirmed setup with only earnings inputs varied."""
+
+    bars = trend_bars()
+    return evaluate_setup(
+        "AAPL",
+        {"1M": bars, "1W": bars, "1D": bars, "4H": bars, "1H": bars, "15M": bars, "5M": bars},
+        market_context=MarketContext(
+            regime="risk-on",
+            spy_direction="bullish",
+            qqq_direction="bullish",
+        ),
+        market_status="open",
+        data_label="delayed",
+        average_daily_dollar_volume=500_000_000,
+        **earnings,
+    )
+
+
 class AutopilotEngineTests(unittest.TestCase):
     def test_normalize_bars_rejects_impossible_candle(self) -> None:
         rows = trend_bars(count=2)
@@ -105,20 +124,122 @@ class AutopilotEngineTests(unittest.TestCase):
         self.assertTrue(any("1D structure is bearish" in blocker for blocker in result.blockers))
 
     def test_unknown_earnings_holds_technically_confirmed_setup_at_armed(self) -> None:
-        bars = trend_bars()
-        result = evaluate_setup(
-            "AAPL",
-            {"1W": bars, "1D": bars, "4H": bars, "15M": bars},
-            market_context=MarketContext(
-                regime="risk-on", spy_direction="bullish", qqq_direction="bullish"
-            ),
-            data_label="delayed",
-            average_daily_dollar_volume=500_000_000,
-        )
+        result = evaluate_confirmed_fixture()
         self.assertEqual(result.state, "ARMED")
         self.assertEqual(result.verdict, "WAIT FOR CONFIRMATION")
         self.assertFalse(result.entry_conditions_satisfied)
+        self.assertEqual(result.earnings_status, "unresolved")
         self.assertIn("earnings date must be verified", result.do_this_now)
+
+    def test_provider_diagnostics_are_genericized_before_reaching_the_decision(self) -> None:
+        result = evaluate_confirmed_fixture(
+            provider_warnings=["debug:/private/tmp/provider.log?api_key=secret"],
+        )
+
+        serialized = str(result.to_dict())
+        self.assertNotIn("/private/tmp", serialized)
+        self.assertNotIn("api_key", serialized)
+        self.assertIn("supporting provider inputs", serialized)
+
+    def test_verified_none_allows_same_confirmed_fixture_to_enter(self) -> None:
+        unresolved = evaluate_confirmed_fixture()
+        verified_none = evaluate_confirmed_fixture(
+            earnings_status="verified_none",
+            earnings_date=None,
+            earnings_date_status=None,
+            earnings_checked_through="2030-01-12",
+        )
+
+        self.assertEqual(unresolved.state, "ARMED")
+        self.assertEqual(verified_none.state, "ENTER")
+        self.assertEqual(verified_none.verdict, "ENTER")
+        self.assertTrue(verified_none.entry_conditions_satisfied)
+        self.assertEqual(verified_none.earnings_status, "verified_none")
+        self.assertFalse(
+            any("must be verified" in warning.lower() for warning in verified_none.warnings)
+        )
+        self.assertIn(
+            "No earnings event was returned inside the verified vendor-calendar window.",
+            verified_none.full_breakdown["earnings_news_and_catalysts"],
+        )
+
+    def test_scheduled_earnings_windows_block_or_warn_at_boundaries(self) -> None:
+        hard_window = evaluate_confirmed_fixture(
+            earnings_status="scheduled",
+            earnings_date="2030-01-04",
+            earnings_date_status="confirmed",
+            days_to_earnings=3,
+        )
+        warning_window = evaluate_confirmed_fixture(
+            earnings_status="scheduled",
+            earnings_date="2030-01-11",
+            earnings_date_status="projected",
+            days_to_earnings=10,
+        )
+
+        self.assertEqual(hard_window.state, "BLOCKED")
+        self.assertEqual(hard_window.verdict, "PASS")
+        self.assertTrue(
+            any("inside the hard catalyst-risk window" in blocker for blocker in hard_window.blockers)
+        )
+        self.assertEqual(warning_window.state, "ENTER")
+        self.assertTrue(any("Earnings are 10 day(s) away." == item for item in warning_window.warnings))
+        self.assertFalse(any("hard catalyst" in blocker for blocker in warning_window.blockers))
+
+    def test_inconsistent_earnings_status_and_date_fail_closed(self) -> None:
+        cases = (
+            ("scheduled without date", {"earnings_status": "scheduled"}),
+            (
+                "verified none with date",
+                {"earnings_status": "verified_none", "earnings_date": "2030-01-11"},
+            ),
+            ("unsupported status", {"earnings_status": "provider_guess"}),
+            (
+                "verified none without complete checked window",
+                {"earnings_status": "verified_none"},
+            ),
+            (
+                "scheduled without days",
+                {
+                    "earnings_status": "scheduled",
+                    "earnings_date": "2030-01-11",
+                    "earnings_date_status": "confirmed",
+                },
+            ),
+            (
+                "scheduled with negative days",
+                {
+                    "earnings_status": "scheduled",
+                    "earnings_date": "2030-01-01",
+                    "earnings_date_status": "confirmed",
+                    "days_to_earnings": -1,
+                },
+            ),
+        )
+        for label, earnings in cases:
+            with self.subTest(label=label):
+                result = evaluate_confirmed_fixture(**earnings)
+                self.assertEqual(result.earnings_status, "unresolved")
+                self.assertEqual(result.state, "ARMED")
+                self.assertEqual(result.verdict, "WAIT FOR CONFIRMATION")
+                self.assertFalse(result.entry_conditions_satisfied)
+                self.assertTrue(
+                    any("must be verified" in warning.lower() for warning in result.warnings)
+                )
+
+    def test_decision_serializes_earnings_verification_fields(self) -> None:
+        result = evaluate_confirmed_fixture(
+            earnings_status="verified_none",
+            earnings_date=None,
+            earnings_date_status=None,
+            earnings_checked_through="2030-01-12",
+        )
+        payload = result.to_dict()
+
+        self.assertIsNone(payload["earnings_date"])
+        self.assertEqual(payload["earnings_status"], "verified_none")
+        self.assertIsNone(payload["earnings_date_status"])
+        self.assertEqual(payload["earnings_checked_through"], "2030-01-12")
 
     def test_two_completed_fifteen_minute_closes_are_required(self) -> None:
         bars = trend_bars()

@@ -14,7 +14,6 @@ autopilot_journal.py
 autopilot_service.py
 autopilot_state.py
 chart_review.py
-config/risk_config.json
 covered_call_filter.py
 dashboard/app.py
 dashboard/cockpit.py
@@ -27,6 +26,7 @@ market_data.py
 options_filter.py
 options_ranker.py
 polygon_provider.py
+presentation_export.py
 requirements.txt
 risk_config.py
 scoring.py
@@ -39,11 +39,15 @@ tests/test_autopilot_state.py
 tests/test_cockpit_contract.py
 tests/test_options_ranker.py
 tests/test_polygon_provider.py
+tests/test_presentation_export.py
+tests/test_release_privacy.py
 tests/test_scoring_freeze.py
 tests/test_sol_ultra_pine.py
 tests/test_sync_cloud_mirror.py
+tests/test_timeframes.py
 tests/test_tradingview_integration.py
 tests/test_ui_contract.py
+timeframes.py
 tools/sync_cloud_mirror.py
 tools/validate_candidates.py
 tradingview/trading_autopilot_chart_helper_v140.pine

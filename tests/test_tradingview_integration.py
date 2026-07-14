@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import unittest
+from urllib.parse import parse_qs, urlsplit
 
 from tradingview_integration import (
     build_tradingview_widget_config,
@@ -13,6 +14,20 @@ from tradingview_integration import (
     tradingview_market_context_html,
     tradingview_widget_html,
 )
+
+
+REQUIRED_INTERVALS = {
+    "1m": "1",
+    "3m": "3",
+    "5m": "5",
+    "15m": "15",
+    "30m": "30",
+    "1H": "60",
+    "4H": "240",
+    "1D": "D",
+    "1W": "W",
+    "1M": "M",
+}
 
 
 class TradingViewIntegrationTests(unittest.TestCase):
@@ -39,8 +54,7 @@ class TradingViewIntegrationTests(unittest.TestCase):
         )
 
     def test_timeframe_mapping(self) -> None:
-        expected = {"15m": "15", "30m": "30", "1h": "60", "4h": "240", "1D": "D", "1W": "W"}
-        for timeframe, interval in expected.items():
+        for timeframe, interval in REQUIRED_INTERVALS.items():
             with self.subTest(timeframe=timeframe):
                 self.assertEqual(tradingview_interval(timeframe), interval)
 
@@ -53,6 +67,19 @@ class TradingViewIntegrationTests(unittest.TestCase):
             tradingview_chart_url("NASDAQ:AAPL", "15m"),
             "https://www.tradingview.com/chart/?symbol=NASDAQ%3AAAPL&interval=15",
         )
+
+    def test_chart_urls_use_every_selected_timeframe(self) -> None:
+        for timeframe, interval in REQUIRED_INTERVALS.items():
+            with self.subTest(timeframe=timeframe):
+                query = parse_qs(urlsplit(tradingview_chart_url("NASDAQ:AAPL", timeframe)).query)
+                self.assertEqual(query, {"symbol": ["NASDAQ:AAPL"], "interval": [interval]})
+
+    def test_widget_configs_use_every_selected_timeframe(self) -> None:
+        for timeframe, interval in REQUIRED_INTERVALS.items():
+            with self.subTest(timeframe=timeframe):
+                config = build_tradingview_widget_config("NASDAQ:AAPL", timeframe)
+                self.assertEqual(config["symbol"], "NASDAQ:AAPL")
+                self.assertEqual(config["interval"], interval)
 
     def test_widget_config_deduplicates_and_limits_watchlist(self) -> None:
         config = build_tradingview_widget_config("AAPL", "4h", watchlist=["AAPL", "MSFT", "MSFT"])

@@ -16,16 +16,19 @@ from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence, Union
 from urllib.error import HTTPError
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
+
+from timeframes import get_timeframe_spec, normalize_timeframe
 
 
 POLYGON_BASE_URL = "https://api.polygon.io"
 POLYGON_HOST = "api.polygon.io"
+MASSIVE_HOST = "api.massive.com"
 MAX_ERROR_MESSAGE_CHARS = 240
 
 JsonDict = dict[str, Any]
-UrlOpener = Callable[[str], Any]
+UrlOpener = Callable[[Any], Any]
 DateLike = Union[str, date, datetime]
 
 _TICKER_RE = re.compile(r"^[A-Z0-9][A-Z0-9.\-]{0,31}$")
@@ -59,36 +62,7 @@ _EXCHANGE_ALIASES = {
     "CBOE": "BATS",
 }
 
-_SOURCE_TIMEFRAMES = {
-    "1d": (1, "day", "1d"),
-    "d": (1, "day", "1d"),
-    "day": (1, "day", "1d"),
-    "daily": (1, "day", "1d"),
-    "5m": (5, "minute", "5m"),
-    "5min": (5, "minute", "5m"),
-    "5minute": (5, "minute", "5m"),
-    "15m": (15, "minute", "15m"),
-    "15min": (15, "minute", "15m"),
-    "15minute": (15, "minute", "15m"),
-}
-
-_TARGET_TIMEFRAMES = {
-    "1h": "1h",
-    "60m": "1h",
-    "hour": "1h",
-    "hourly": "1h",
-    "4h": "4h",
-    "240m": "4h",
-    "4hour": "4h",
-    "1w": "1w",
-    "w": "1w",
-    "week": "1w",
-    "weekly": "1w",
-    "1mo": "1mo",
-    "1mth": "1mo",
-    "month": "1mo",
-    "monthly": "1mo",
-}
+_RESAMPLE_TARGETS = {"1H": "1h", "4H": "4h", "1W": "1w", "1M": "1mo"}
 
 _HTTP_LABELS = {
     400: "bad request",
@@ -260,6 +234,26 @@ class NewsArticle:
         data["published_at"] = _datetime_text(self.published_at)
         data["tickers"] = list(self.tickers)
         data["keywords"] = list(self.keywords)
+        return data
+
+
+@dataclass(frozen=True)
+class EarningsContext:
+    """Tri-state result from a successful or failed vendor-calendar check."""
+
+    status: str
+    date: Optional[date]
+    date_status: Optional[str]
+    checked_at: datetime
+    checked_through: date
+    source: str = "Massive / Benzinga Earnings"
+    message: Optional[str] = None
+
+    def to_dict(self) -> JsonDict:
+        data = asdict(self)
+        data["date"] = self.date.isoformat() if self.date is not None else None
+        data["checked_at"] = _datetime_text(self.checked_at)
+        data["checked_through"] = self.checked_through.isoformat()
         return data
 
 
@@ -714,6 +708,32 @@ def build_ticker_news_url(
     )
 
 
+def build_earnings_calendar_url(
+    ticker: Any,
+    start: DateLike,
+    end: DateLike,
+    *,
+    limit: int = 50_000,
+) -> str:
+    """Build the official Massive/Benzinga earnings URL without credentials."""
+
+    clean_ticker = parse_ticker(ticker).ticker
+    start_text = _date_text(start)
+    end_text = _date_text(end)
+    if start_text > end_text:
+        raise ValueError("Earnings start date must not be after end date.")
+    query = urlencode(
+        {
+            "ticker": clean_ticker,
+            "date.gte": start_text,
+            "date.lte": end_text,
+            "sort": "date.asc",
+            "limit": _bounded_limit(limit, maximum=50_000),
+        }
+    )
+    return urlunsplit(("https", MASSIVE_HOST, "/benzinga/v1/earnings", query, ""))
+
+
 def build_options_snapshot_url(
     underlying_ticker: Any,
     api_key: str,
@@ -736,18 +756,28 @@ def _date_text(value: DateLike) -> str:
 
 
 def _source_timeframe(value: Any) -> tuple[int, str, str]:
-    normalized = str(value or "").strip().lower().replace(" ", "")
     try:
-        return _SOURCE_TIMEFRAMES[normalized]
-    except KeyError:
-        raise ValueError("Polygon source timeframe must be daily, 5m, or 15m.") from None
+        spec = get_timeframe_spec(value)
+    except ValueError:
+        raise ValueError(
+            "Polygon source timeframe must be 1m, 3m, 5m, 15m, 30m, or Daily."
+        ) from None
+    if (
+        spec.source_kind != "source"
+        or spec.polygon_multiplier is None
+        or spec.polygon_timespan is None
+    ):
+        raise ValueError(
+            "Polygon source timeframe must be 1m, 3m, 5m, 15m, 30m, or Daily."
+        )
+    normalized = "1d" if spec.label == "1D" else spec.label
+    return spec.polygon_multiplier, spec.polygon_timespan, normalized
 
 
 def _target_timeframe(value: Any) -> str:
-    normalized = str(value or "").strip().lower().replace(" ", "")
     try:
-        return _TARGET_TIMEFRAMES[normalized]
-    except KeyError:
+        return _RESAMPLE_TARGETS[normalize_timeframe(value)]
+    except (KeyError, ValueError):
         raise ValueError("Resample timeframe must be weekly, monthly, 1h, or 4h.") from None
 
 
@@ -770,7 +800,7 @@ def _response_bytes(response: Any) -> bytes:
     raise TypeError("Provider response body is not text or bytes.")
 
 
-def _open_and_read(url: str, opener: Optional[UrlOpener]) -> bytes:
+def _open_and_read(url: Any, opener: Optional[UrlOpener]) -> bytes:
     response = opener(url) if opener is not None else urlopen(url, timeout=20)
     if hasattr(response, "__enter__"):
         with response as managed:
@@ -789,21 +819,24 @@ def _request_json(
     api_key: str,
     opener: Optional[UrlOpener],
     operation: str,
+    headers: Optional[Mapping[str, str]] = None,
+    provider_label: str = "Polygon",
 ) -> JsonDict:
     try:
-        raw = _open_and_read(url, opener)
+        target: Any = Request(url, headers=dict(headers or {})) if headers else url
+        raw = _open_and_read(target, opener)
     except HTTPError as exc:
         code = int(getattr(exc, "code", 0) or 0)
         label = _HTTP_LABELS.get(code, "provider error")
         raise PolygonProviderError(
-            f"Polygon {operation} failed with HTTP {code} ({label}).",
+            f"{provider_label} {operation} failed with HTTP {code} ({label}).",
             operation=operation,
             status_code=code or None,
         ) from None
     except Exception as exc:
         error_name = exc.__class__.__name__
         raise PolygonProviderError(
-            f"Polygon {operation} request failed ({error_name}).",
+            f"{provider_label} {operation} request failed ({error_name}).",
             operation=operation,
         ) from None
 
@@ -811,12 +844,12 @@ def _request_json(
         payload = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
         raise PolygonProviderError(
-            f"Polygon {operation} returned an invalid JSON response.",
+            f"{provider_label} {operation} returned an invalid JSON response.",
             operation=operation,
         ) from None
     if not isinstance(payload, dict):
         raise PolygonProviderError(
-            f"Polygon {operation} returned an unexpected response shape.",
+            f"{provider_label} {operation} returned an unexpected response shape.",
             operation=operation,
         )
 
@@ -826,7 +859,7 @@ def _request_json(
         detail = redact_sensitive_text(raw_detail, api_key=api_key)
         suffix = f": {detail}" if detail else "."
         raise PolygonProviderError(
-            f"Polygon {operation} returned an error{suffix}",
+            f"{provider_label} {operation} returned an error{suffix}",
             operation=operation,
         )
     return payload
@@ -1093,7 +1126,7 @@ def fetch_daily_bars(
     return fetch_aggregate_bars(ticker, "1d", start, end, api_key, opener=opener)
 
 
-def fetch_15m_bars(
+def fetch_1m_bars(
     ticker: Any,
     start: DateLike,
     end: DateLike,
@@ -1101,7 +1134,18 @@ def fetch_15m_bars(
     *,
     opener: Optional[UrlOpener] = None,
 ) -> list[OHLCVBar]:
-    return fetch_aggregate_bars(ticker, "15m", start, end, api_key, opener=opener)
+    return fetch_aggregate_bars(ticker, "1m", start, end, api_key, opener=opener)
+
+
+def fetch_3m_bars(
+    ticker: Any,
+    start: DateLike,
+    end: DateLike,
+    api_key: str,
+    *,
+    opener: Optional[UrlOpener] = None,
+) -> list[OHLCVBar]:
+    return fetch_aggregate_bars(ticker, "3m", start, end, api_key, opener=opener)
 
 
 def fetch_5m_bars(
@@ -1113,6 +1157,28 @@ def fetch_5m_bars(
     opener: Optional[UrlOpener] = None,
 ) -> list[OHLCVBar]:
     return fetch_aggregate_bars(ticker, "5m", start, end, api_key, opener=opener)
+
+
+def fetch_15m_bars(
+    ticker: Any,
+    start: DateLike,
+    end: DateLike,
+    api_key: str,
+    *,
+    opener: Optional[UrlOpener] = None,
+) -> list[OHLCVBar]:
+    return fetch_aggregate_bars(ticker, "15m", start, end, api_key, opener=opener)
+
+
+def fetch_30m_bars(
+    ticker: Any,
+    start: DateLike,
+    end: DateLike,
+    api_key: str,
+    *,
+    opener: Optional[UrlOpener] = None,
+) -> list[OHLCVBar]:
+    return fetch_aggregate_bars(ticker, "30m", start, end, api_key, opener=opener)
 
 
 def _coerce_bar(value: Union[OHLCVBar, Mapping[str, Any]], timeframe: str = "") -> Optional[OHLCVBar]:
@@ -1482,6 +1548,149 @@ def fetch_ticker_news(
 get_ticker_news = fetch_ticker_news
 
 
+def _massive_earnings_next_url(value: Any) -> Optional[str]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    parsed = urlsplit(text)
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname != MASSIVE_HOST
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path != "/benzinga/v1/earnings"
+        or any(_is_sensitive_name(key) for key, _ in parse_qsl(parsed.query, keep_blank_values=True))
+    ):
+        raise PolygonProviderError(
+            "Massive earnings calendar returned an unsafe pagination URL.",
+            operation="earnings calendar",
+        )
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, parsed.query, ""))
+
+
+def fetch_earnings_context(
+    ticker: Any,
+    start: DateLike,
+    end: DateLike,
+    api_key: str,
+    *,
+    opener: Optional[UrlOpener] = None,
+    checked_at: Optional[datetime] = None,
+    max_pages: int = 10,
+) -> EarningsContext:
+    """Verify an earnings window without converting provider failures into absence."""
+
+    clean_ticker = parse_ticker(ticker).ticker
+    start_date = _parse_date(start)
+    end_date = _parse_date(end)
+    if start_date is None or end_date is None:
+        raise ValueError("Earnings dates must use YYYY-MM-DD format.")
+    if start_date > end_date:
+        raise ValueError("Earnings start date must not be after end date.")
+    clean_key = str(api_key or "").strip()
+    if not clean_key:
+        raise PolygonProviderError("Polygon API key is required.")
+    current = checked_at or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    current = current.astimezone(timezone.utc)
+    pages = _bounded_limit(max_pages, maximum=100)
+    url: Optional[str] = build_earnings_calendar_url(clean_ticker, start_date, end_date)
+    events: list[tuple[date, str]] = []
+    seen_urls: set[str] = set()
+
+    try:
+        for _ in range(pages):
+            if not url or url in seen_urls:
+                if url in seen_urls:
+                    raise PolygonProviderError(
+                        "Massive earnings pagination repeated a page URL.",
+                        operation="earnings calendar",
+                    )
+                break
+            seen_urls.add(url)
+            payload = _request_json(
+                url,
+                api_key=clean_key,
+                opener=opener,
+                operation="earnings calendar",
+                headers={"Authorization": f"Bearer {clean_key}", "Accept": "application/json"},
+                provider_label="Massive",
+            )
+            if str(payload.get("status") or "").strip().upper() != "OK":
+                raise PolygonProviderError(
+                    "Massive earnings calendar returned an unresolved status.",
+                    operation="earnings calendar",
+                )
+            results = payload.get("results")
+            if not isinstance(results, list):
+                raise PolygonProviderError(
+                    "Massive earnings calendar returned an unexpected response shape.",
+                    operation="earnings calendar",
+                )
+            count = payload.get("count")
+            if count is not None and (isinstance(count, bool) or not isinstance(count, int) or count != len(results)):
+                raise PolygonProviderError(
+                    "Massive earnings calendar returned an inconsistent result count.",
+                    operation="earnings calendar",
+                )
+            for raw_value in results:
+                raw = _mapping(raw_value)
+                try:
+                    row_ticker = sanitize_ticker(raw.get("ticker"))
+                except InvalidTickerError:
+                    raise PolygonProviderError(
+                        "Massive earnings calendar returned a malformed ticker.",
+                        operation="earnings calendar",
+                    ) from None
+                event_date = _parse_date(raw.get("date"))
+                event_status = str(raw.get("date_status") or "").strip().lower()
+                if (
+                    row_ticker != clean_ticker
+                    or event_date is None
+                    or not start_date <= event_date <= end_date
+                    or event_status not in {"projected", "confirmed"}
+                ):
+                    raise PolygonProviderError(
+                        "Massive earnings calendar returned data outside the requested verified window.",
+                        operation="earnings calendar",
+                    )
+                events.append((event_date, event_status))
+            url = _massive_earnings_next_url(payload.get("next_url"))
+        if url:
+            raise PolygonProviderError(
+                "Massive earnings pagination exceeded the safe page limit.",
+                operation="earnings calendar",
+            )
+    except PolygonProviderError as exc:
+        return EarningsContext(
+            status="unresolved",
+            date=None,
+            date_status=None,
+            checked_at=current,
+            checked_through=end_date,
+            message=redact_sensitive_text(str(exc), api_key=clean_key),
+        )
+
+    if not events:
+        return EarningsContext(
+            status="verified_none",
+            date=None,
+            date_status=None,
+            checked_at=current,
+            checked_through=end_date,
+            message="No event was returned inside the successful Benzinga calendar query window.",
+        )
+    event_date, event_status = min(events, key=lambda item: item[0])
+    return EarningsContext(
+        status="scheduled",
+        date=event_date,
+        date_status=event_status,
+        checked_at=current,
+        checked_through=end_date,
+    )
+
+
 def _quote_metrics(
     bid: Optional[float], ask: Optional[float], provider_midpoint: Optional[float]
 ) -> tuple[Optional[float], Optional[float], Optional[float]]:
@@ -1669,6 +1878,28 @@ class PolygonProvider:
 
     fetch_daily_bars = daily_bars
 
+    def bars_1m(self, ticker: Any, start: DateLike, end: DateLike) -> list[OHLCVBar]:
+        return fetch_1m_bars(
+            ticker,
+            start,
+            end,
+            self.__api_key,
+            opener=self._opener,
+        )
+
+    fetch_1m_bars = bars_1m
+
+    def bars_3m(self, ticker: Any, start: DateLike, end: DateLike) -> list[OHLCVBar]:
+        return fetch_3m_bars(
+            ticker,
+            start,
+            end,
+            self.__api_key,
+            opener=self._opener,
+        )
+
+    fetch_3m_bars = bars_3m
+
     def bars_5m(self, ticker: Any, start: DateLike, end: DateLike) -> list[OHLCVBar]:
         return fetch_5m_bars(
             ticker,
@@ -1690,6 +1921,17 @@ class PolygonProvider:
         )
 
     fetch_15m_bars = bars_15m
+
+    def bars_30m(self, ticker: Any, start: DateLike, end: DateLike) -> list[OHLCVBar]:
+        return fetch_30m_bars(
+            ticker,
+            start,
+            end,
+            self.__api_key,
+            opener=self._opener,
+        )
+
+    fetch_30m_bars = bars_30m
 
     def stock_snapshots(
         self,
@@ -1724,6 +1966,25 @@ class PolygonProvider:
         )
 
     fetch_ticker_news = news
+
+    def earnings_context(
+        self,
+        ticker: Any,
+        start: DateLike,
+        end: DateLike,
+        *,
+        checked_at: Optional[datetime] = None,
+    ) -> EarningsContext:
+        return fetch_earnings_context(
+            ticker,
+            start,
+            end,
+            self.__api_key,
+            opener=self._opener,
+            checked_at=checked_at,
+        )
+
+    fetch_earnings_context = earnings_context
 
     def options_chain(
         self,
@@ -1763,6 +2024,7 @@ resolve_ticker = resolve_symbol
 __all__ = [
     "AmbiguousSymbolError",
     "Bar",
+    "EarningsContext",
     "MarketStatus",
     "NewsArticle",
     "OHLCVBar",
@@ -1778,6 +2040,7 @@ __all__ = [
     "TickerResolution",
     "InvalidTickerError",
     "build_aggregates_url",
+    "build_earnings_calendar_url",
     "build_market_status_url",
     "build_options_snapshot_url",
     "build_polygon_aggs_url",
@@ -1786,13 +2049,17 @@ __all__ = [
     "build_ticker_news_url",
     "build_ticker_details_url",
     "build_ticker_reference_url",
+    "fetch_1m_bars",
+    "fetch_3m_bars",
     "fetch_15m_bars",
+    "fetch_30m_bars",
     "fetch_5m_bars",
     "fetch_aggregate_bars",
     "fetch_aggregates",
     "fetch_bars",
     "fetch_batched_stock_snapshots",
     "fetch_daily_bars",
+    "fetch_earnings_context",
     "fetch_market_status",
     "fetch_news",
     "fetch_options_chain",

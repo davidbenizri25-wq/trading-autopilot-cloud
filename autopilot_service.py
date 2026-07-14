@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import asdict, dataclass
-from datetime import datetime, time as datetime_time, timedelta, timezone
+from datetime import date as datetime_date, datetime, time as datetime_time, timedelta, timezone
 import hashlib
 import threading
 import time
@@ -27,6 +27,7 @@ from polygon_provider import (
     ResolvedTicker,
     resample_bars,
 )
+from timeframes import get_timeframe_spec, normalize_timeframe
 from tradingview_integration import normalize_tradingview_symbol, tradingview_chart_url
 
 
@@ -74,6 +75,8 @@ class ProviderHealth:
 class ServiceResult:
     decision: DecisionResult
     chart_bars: list[dict[str, Any]]
+    chart_frames: dict[str, list[dict[str, Any]]]
+    selected_timeframe: str
     journal_bars: list[dict[str, Any]]
     resolved: dict[str, Any]
     tradingview_symbol: str
@@ -85,6 +88,8 @@ class ServiceResult:
         return {
             "decision": self.decision.to_dict(),
             "chart_bars": deepcopy(self.chart_bars),
+            "chart_frames": deepcopy(self.chart_frames),
+            "selected_timeframe": self.selected_timeframe,
             "journal_bars": deepcopy(self.journal_bars),
             "resolved": deepcopy(self.resolved),
             "tradingview_symbol": self.tradingview_symbol,
@@ -121,13 +126,47 @@ class TTLCache:
 
 
 _DATA_CACHE = TTLCache(ttl_seconds=300, max_items=96)
+_CHART_DATA_CACHE = TTLCache(ttl_seconds=300, max_items=128)
+
+_ENGINE_TO_UI_TIMEFRAME = {
+    "5M": "5m",
+    "15M": "15m",
+    "1H": "1H",
+    "4H": "4H",
+    "1D": "1D",
+    "1W": "1W",
+    "1M": "1M",
+}
+_UI_TO_ENGINE_TIMEFRAME = {value: key for key, value in _ENGINE_TO_UI_TIMEFRAME.items()}
+_NATIVE_CHART_METHODS = {
+    "1m": "bars_1m",
+    "3m": "bars_3m",
+    "30m": "bars_30m",
+}
+_RESAMPLED_CHART_SOURCES = {
+    "1H": ("bars_15m", "15m", "1h"),
+    "4H": ("bars_15m", "15m", "4h"),
+    "1W": ("daily_bars", "1D", "1w"),
+    "1M": ("daily_bars", "1D", "1mo"),
+}
 
 
 def _api_fingerprint(api_key: str) -> str:
     return hashlib.sha256(str(api_key).encode("utf-8")).hexdigest()[:12]
 
 
+def _cache_namespace(api_key: str, opener: Any = None) -> str:
+    """Return a non-secret cache namespace, isolating injected test transports."""
+
+    namespace = _api_fingerprint(api_key)
+    return namespace if opener is None else f"{namespace}:transport:{id(opener)}"
+
+
 def _bar_dict(bar: OHLCVBar) -> dict[str, Any]:
+    try:
+        timeframe = normalize_timeframe(bar.timeframe)
+    except ValueError:
+        timeframe = str(bar.timeframe or "")
     return {
         "timestamp": bar.timestamp.isoformat(),
         "open": bar.open,
@@ -136,6 +175,7 @@ def _bar_dict(bar: OHLCVBar) -> dict[str, Any]:
         "close": bar.close,
         "volume": bar.volume,
         "vwap": bar.vwap,
+        "timeframe": timeframe,
         "complete": True,
     }
 
@@ -146,9 +186,10 @@ _MARKET_TIMEZONE = ZoneInfo("America/New_York")
 def _bar_completion_time(timestamp: datetime, timeframe: str) -> datetime:
     value = timestamp if timestamp.tzinfo is not None else timestamp.replace(tzinfo=timezone.utc)
     value = value.astimezone(timezone.utc)
-    label = str(timeframe or "").strip().upper()
-    if label in {"5M", "15M", "1H", "4H"}:
-        duration = {"5M": 5, "15M": 15, "1H": 60, "4H": 240}[label]
+    label = normalize_timeframe(timeframe)
+    durations = {"1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30, "1H": 60, "4H": 240}
+    if label in durations:
+        duration = durations[label]
         completion = value + timedelta(minutes=duration)
         local_start = value.astimezone(_MARKET_TIMEZONE)
         regular_close = datetime.combine(
@@ -229,6 +270,111 @@ def _frames_for_symbol(
         return frames, warnings
 
     return _DATA_CACHE.get_or_create(cache_key, fetch)
+
+
+def _chart_frames_from_engine_frames(
+    frames: Mapping[str, list[dict[str, Any]]],
+) -> dict[str, list[dict[str, Any]]]:
+    """Expose decision-source frames under exact, case-sensitive UI labels."""
+
+    output: dict[str, list[dict[str, Any]]] = {}
+    for engine_label, ui_label in _ENGINE_TO_UI_TIMEFRAME.items():
+        rows = frames.get(engine_label)
+        if rows:
+            output[ui_label] = deepcopy(list(rows))
+    return output
+
+
+def load_chart_bars(
+    ticker: str,
+    timeframe: str,
+    api_key: str,
+    *,
+    now: Optional[datetime] = None,
+    opener: Any = None,
+) -> list[dict[str, Any]]:
+    """Load completed bars for one selected chart interval.
+
+    The decision engine's base Daily/5m/15m bundle remains independently
+    cached. Native execution intervals and longer resampled views use the
+    registry's interval-specific lookback, then cache by provider identity,
+    symbol, interval and market date. This keeps 4H/weekly/monthly charts deep
+    enough for long moving averages without changing the MTF decision input.
+    """
+
+    clean_key = str(api_key or "").strip()
+    if not clean_key:
+        raise AutopilotServiceError(
+            "Live chart data is not connected. Add POLYGON_API_KEY in the deployment secret manager."
+        )
+    symbol = str(ticker or "").strip().upper()
+    if not symbol:
+        raise AutopilotServiceError("Ticker is required for chart data.")
+    try:
+        selected = normalize_timeframe(timeframe)
+    except ValueError as exc:
+        raise AutopilotServiceError(str(exc)) from None
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    current = current.astimezone(timezone.utc)
+    namespace = _cache_namespace(clean_key, opener)
+    provider = PolygonProvider(clean_key, opener=opener)
+
+    spec = get_timeframe_spec(selected)
+    if selected in _NATIVE_CHART_METHODS:
+        cache_key = f"{namespace}:{symbol}:{selected}:{current.date().isoformat()}"
+
+        def fetch_source() -> list[dict[str, Any]]:
+            method = getattr(provider, _NATIVE_CHART_METHODS[selected])
+            bars = method(
+                symbol,
+                (current - timedelta(days=spec.lookback_days)).date(),
+                current.date(),
+            )
+            completed = _completed_bars(bars, selected, current)
+            return [_bar_dict(bar) for bar in completed]
+
+        try:
+            return _CHART_DATA_CACHE.get_or_create(cache_key, fetch_source)
+        except (InvalidTickerError, PolygonProviderError) as exc:
+            raise AutopilotServiceError(str(exc)) from None
+
+    if selected in _RESAMPLED_CHART_SOURCES:
+        cache_key = f"{namespace}:{symbol}:{selected}:{current.date().isoformat()}"
+
+        def fetch_resampled() -> list[dict[str, Any]]:
+            method_name, source_timeframe, target_timeframe = _RESAMPLED_CHART_SOURCES[selected]
+            method = getattr(provider, method_name)
+            source_bars = method(
+                symbol,
+                (current - timedelta(days=spec.lookback_days)).date(),
+                current.date(),
+            )
+            completed_source = _completed_bars(source_bars, source_timeframe, current)
+            completed_target = _completed_bars(
+                resample_bars(completed_source, target_timeframe),
+                selected,
+                current,
+            )
+            return [_bar_dict(bar) for bar in completed_target]
+
+        try:
+            return _CHART_DATA_CACHE.get_or_create(cache_key, fetch_resampled)
+        except (InvalidTickerError, PolygonProviderError) as exc:
+            raise AutopilotServiceError(str(exc)) from None
+
+    engine_label = _UI_TO_ENGINE_TIMEFRAME[selected]
+    try:
+        frames, _ = _frames_for_symbol(
+            provider,
+            symbol,
+            current,
+            cache_namespace=namespace,
+        )
+    except (InvalidTickerError, PolygonProviderError) as exc:
+        raise AutopilotServiceError(str(exc)) from None
+    return deepcopy(frames.get(engine_label) or [])
 
 
 def sector_etf_for_security(security: ResolvedTicker) -> Optional[str]:
@@ -385,6 +531,7 @@ def analyze_symbol(
     now: Optional[datetime] = None,
     opener: Any = None,
     include_options: bool = True,
+    selected_timeframe: str = "15m",
 ) -> ServiceResult:
     """Resolve, fetch, analyze, and package one security search."""
 
@@ -395,6 +542,11 @@ def analyze_symbol(
     if current.tzinfo is None:
         current = current.replace(tzinfo=timezone.utc)
     current = current.astimezone(timezone.utc)
+    requested_timeframe = selected_timeframe if str(selected_timeframe or "").strip() else "15m"
+    try:
+        selected = normalize_timeframe(requested_timeframe)
+    except ValueError as exc:
+        raise AutopilotServiceError(str(exc)) from None
     provider = PolygonProvider(clean_key, opener=opener)
     try:
         resolved = provider.resolve_symbol(query)
@@ -403,7 +555,7 @@ def analyze_symbol(
     except PolygonProviderError as exc:
         raise AutopilotServiceError(str(exc)) from None
 
-    namespace = _api_fingerprint(clean_key)
+    namespace = _cache_namespace(clean_key, opener)
     frames, provider_messages = _frames_for_symbol(provider, resolved.ticker, current, cache_namespace=namespace)
     sector_symbol = sector_etf_for_security(resolved)
     market_context, _, market_messages = _market_context(provider, frames, sector_symbol, current, namespace)
@@ -420,6 +572,50 @@ def analyze_symbol(
         news_rows = [article.to_dict() for article in provider.news(resolved.ticker, limit=8)]
     except PolygonProviderError as exc:
         provider_messages.append(str(exc))
+    earnings_window_end = current.date() + timedelta(days=10)
+    earnings = provider.earnings_context(
+        resolved.ticker,
+        current.date(),
+        earnings_window_end,
+        checked_at=current,
+    )
+    earnings_status = str(getattr(earnings, "status", "unresolved") or "unresolved").strip().lower()
+    earnings_date_value = getattr(earnings, "date", None)
+    earnings_checked_value = getattr(earnings, "checked_through", None)
+    if earnings_status not in {"scheduled", "verified_none", "unresolved"}:
+        earnings_status = "unresolved"
+    if earnings_status == "scheduled" and not isinstance(earnings_date_value, datetime_date):
+        earnings_status = "unresolved"
+    if earnings_status == "verified_none" and earnings_date_value is not None:
+        earnings_status = "unresolved"
+    complete_calendar_window = (
+        isinstance(earnings_checked_value, datetime_date)
+        and earnings_checked_value >= earnings_window_end
+    )
+    scheduled_date_in_window = (
+        isinstance(earnings_date_value, datetime_date)
+        and current.date() <= earnings_date_value <= earnings_window_end
+    )
+    if earnings_status == "verified_none" and not complete_calendar_window:
+        earnings_status = "unresolved"
+    if earnings_status == "scheduled" and (
+        not complete_calendar_window or not scheduled_date_in_window
+    ):
+        earnings_status = "unresolved"
+    earnings_message = getattr(earnings, "message", None)
+    if earnings_status == "unresolved" and isinstance(earnings_message, str) and earnings_message:
+        provider_messages.append(earnings_message)
+    earnings_date = earnings_date_value.isoformat() if isinstance(earnings_date_value, datetime_date) else None
+    days_to_earnings = (
+        (earnings_date_value - current.date()).days
+        if isinstance(earnings_date_value, datetime_date)
+        else None
+    )
+    earnings_checked_through = (
+        earnings_checked_value.isoformat()
+        if isinstance(earnings_checked_value, datetime_date)
+        else None
+    )
     latest = _latest_timestamp(frames)
     label = _data_label(market_label, latest, current)
     latest_text = latest.isoformat().replace("+00:00", "Z") if latest else None
@@ -434,7 +630,13 @@ def analyze_symbol(
         data_source="Polygon",
         data_timestamp=latest_text,
         average_daily_dollar_volume=_average_daily_dollar_volume(frames.get("1D", [])),
-        earnings_date=None,
+        earnings_date=earnings_date,
+        days_to_earnings=days_to_earnings,
+        earnings_status=earnings_status,
+        earnings_date_status=(
+            str(getattr(earnings, "date_status", "") or "").strip().lower() or None
+        ),
+        earnings_checked_through=earnings_checked_through,
         news=news_rows,
         provider_warnings=provider_messages,
     )
@@ -458,8 +660,10 @@ def analyze_symbol(
                 "earnings_policy": "avoid",
                 "chain_complete": True,
             }
-            if decision.earnings_date:
+            if decision.earnings_status == "scheduled" and decision.earnings_date:
                 options_context["earnings_date"] = decision.earnings_date
+            elif decision.earnings_status == "verified_none":
+                options_context["earnings_date"] = None
             decision.options = rank_option_contracts(raw_contracts, options_context, now=current)
         except (ImportError, PolygonProviderError, TypeError, ValueError) as exc:
             decision.options = {
@@ -478,9 +682,23 @@ def analyze_symbol(
 
     exchange = MIC_TO_TRADINGVIEW.get(str(resolved.primary_exchange or "").upper(), resolved.primary_exchange or "")
     tv_symbol = normalize_tradingview_symbol(resolved.ticker, exchange)
-    chart_bars = deepcopy(frames.get("15M") or frames.get("1D") or [])
+    chart_frames = _chart_frames_from_engine_frames(frames)
+    try:
+        selected_rows = load_chart_bars(
+            resolved.ticker,
+            selected,
+            clean_key,
+            now=current,
+            opener=opener,
+        )
+    except AutopilotServiceError as exc:
+        selected_rows = []
+        provider_messages.append(str(exc))
+    if selected_rows:
+        chart_frames[selected] = deepcopy(selected_rows)
+    chart_bars = deepcopy(chart_frames.get(selected) or [])
     provider_health = ProviderHealth(
-        provider="Polygon",
+        provider="Polygon + Benzinga" if earnings_status != "unresolved" else "Polygon",
         status="connected" if frames else "error",
         data_label=label,
         timestamp=latest_text,
@@ -489,10 +707,12 @@ def analyze_symbol(
     return ServiceResult(
         decision=decision,
         chart_bars=chart_bars,
+        chart_frames=chart_frames,
+        selected_timeframe=selected,
         journal_bars=deepcopy(frames.get("1D") or []),
         resolved=resolved.to_dict(),
         tradingview_symbol=tv_symbol,
-        tradingview_url=tradingview_chart_url(tv_symbol, "15m"),
+        tradingview_url=tradingview_chart_url(tv_symbol, selected),
         provider_health=provider_health,
         fetched_at=current.isoformat().replace("+00:00", "Z"),
     )
