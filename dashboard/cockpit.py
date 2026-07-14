@@ -13,7 +13,9 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 import hashlib
 import html
+import json
 import os
+from pathlib import Path
 import re
 from typing import Any, Callable, Mapping, MutableMapping, Optional
 
@@ -97,6 +99,8 @@ _CHART_CACHE = TTLCache(ttl_seconds=300, max_items=96)
 
 DEFAULT_TIMEFRAME = "15m"
 MULTI_TIMEFRAME_LABELS: tuple[str, ...] = ("1D", "4H", "1H", "15m")
+APP_DISPLAY_VERSION = "2.1.0"
+_RELEASE_STATE_PATH = Path(__file__).resolve().parents[1] / "deploy" / ".cloud-mirror-state.json"
 
 
 COCKPIT_CSS = """
@@ -523,6 +527,22 @@ def earnings_context_label(decision: Mapping[str, Any] | None) -> str:
     if status == "verified_none":
         through = public_text(source.get("earnings_checked_through"), "the checked window", max_length=20)
         return f"No event in vendor calendar through {through}"
+    diagnostic = str(source.get("earnings_error_kind") or "").strip().lower()
+    diagnostic_labels = {
+        "entitlement": "Vendor entitlement required",
+        "availability": "Provider temporarily unavailable",
+        "throttling": "Provider throttled",
+        "authentication": "Provider authentication issue",
+        "authorization": "Provider authorization issue",
+        "timeout": "Provider timed out",
+        "transport": "Provider connection issue",
+        "invalid_response": "Provider response contract mismatch",
+        "provider_response": "Provider rejected the request",
+        "implementation": "Application validation issue",
+        "client": "Application request issue",
+    }
+    if diagnostic in diagnostic_labels:
+        return f"Unresolved · {diagnostic_labels[diagnostic]}"
     return "Unresolved · entry gated"
 
 
@@ -568,6 +588,9 @@ def _safe_decision(decision: Mapping[str, Any] | None) -> dict[str, Any]:
             "Pass for now—current market evidence is unavailable or stale, so no entry decision was made."
         )
         source["primary_risk"] = "The current market evidence is not complete enough for an entry decision."
+        source["invalidation_condition"] = (
+            "No current invalidation level is available; wait for complete provider-backed evidence."
+        )
 
     warnings = source.get("warnings")
     if isinstance(warnings, list):
@@ -1012,6 +1035,10 @@ def _safe_analysis_record(payload: Mapping[str, Any]) -> dict[str, Any]:
         "plan": deepcopy(dict(plan)),
         "market_context": deepcopy(dict(market)),
         "earnings_date": decision.get("earnings_date"),
+        "earnings_status": decision.get("earnings_status"),
+        "earnings_date_status": decision.get("earnings_date_status"),
+        "earnings_checked_through": decision.get("earnings_checked_through"),
+        "earnings_error_kind": decision.get("earnings_error_kind"),
         "options": deepcopy(dict(options)),
         "timeframes": {
             str(label): {"direction": value.get("direction")}
@@ -1621,18 +1648,53 @@ def _market_ribbon_html(decision: Mapping[str, Any]) -> str:
     market = safe.get("market_context") if isinstance(safe.get("market_context"), Mapping) else {}
     sector_symbol = public_text(market.get("sector_symbol"), "Sector", max_length=16)
     chips = (
-        ("Regime", public_text(str(market.get("regime") or "unavailable").replace("-", " ").title())),
-        ("SPY", public_text(str(market.get("spy_direction") or "unavailable").title())),
-        ("QQQ", public_text(str(market.get("qqq_direction") or "unavailable").title())),
-        (sector_symbol, public_text(str(market.get("sector_direction") or "unavailable").title())),
-        ("Volatility", public_text(str(market.get("volatility") or "unavailable").title())),
-        ("Breadth", public_text(str(market.get("breadth") or "unavailable").title())),
+        ("Regime", _compact_market_value(str(market.get("regime") or "unavailable").replace("-", " "))),
+        ("SPY", _compact_market_value(market.get("spy_direction"))),
+        ("QQQ", _compact_market_value(market.get("qqq_direction"))),
+        (sector_symbol, _compact_market_value(market.get("sector_direction"))),
+        ("Volatility", _compact_market_value(market.get("volatility"))),
+        ("Breadth", _compact_market_value(market.get("breadth"))),
         ("Data", currentness_label(safe.get("data_label"))),
     )
     return '<div class="ap-ribbon">' + "".join(
         f'<div class="ap-ribbon-chip">{html.escape(label)}<strong>{html.escape(value)}</strong></div>'
         for label, value in chips
     ) + "</div>"
+
+
+def _compact_market_value(value: Any) -> str:
+    """Keep ribbon values scannable without weakening unavailable states."""
+
+    cleaned = public_text(str(value or "unavailable").replace("-", " ").title(), "Unavailable")
+    normalized = cleaned.lower()
+    if "unavailable" in normalized or "not returned" in normalized or "not configured" in normalized:
+        return "Unavailable"
+    return cleaned
+
+
+def release_build_label(state_path: Path | None = None) -> str:
+    """Return a public, secrets-safe source marker for production verification."""
+
+    path = state_path or _RELEASE_STATE_PATH
+    if path.is_symlink() or not path.is_file():
+        return f"v{APP_DISPLAY_VERSION}"
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return f"v{APP_DISPLAY_VERSION}"
+    if not isinstance(state, Mapping):
+        return f"v{APP_DISPLAY_VERSION}"
+    if (
+        state.get("schema_version") != 2
+        or state.get("canonical_repository") != "davidbenizri25-wq/trading-elite-system"
+        or state.get("version") != "2.1.0-premium-terminal"
+    ):
+        return f"v{APP_DISPLAY_VERSION}"
+    canonical = str(state.get("canonical_commit") or "").strip().lower()
+    manifest = str(state.get("manifest_sha256") or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{40}", canonical) or not re.fullmatch(r"[0-9a-f]{64}", manifest):
+        return f"v{APP_DISPLAY_VERSION}"
+    return f"v{APP_DISPLAY_VERSION} · source {canonical[:7]} · manifest {manifest[:7]}"
 
 
 def _render_timeframe_control(st: Any, current: str) -> str:
@@ -1683,11 +1745,12 @@ def _decision_rail_html(brief: Mapping[str, Any]) -> str:
 
 def _render_header(st: Any, *, presentation: bool) -> bool:
     mode_label = "Showcase view" if presentation else "David's decision terminal"
+    build_label = release_build_label()
     st.markdown(
         f"""
         <div class="ap-topbar">
           <div class="ap-brand"><span class="ap-brand-mark">TA</span><span>Trading Autopilot</span></div>
-          <div class="ap-top-meta">{html.escape(mode_label)}<br>Decision support only</div>
+          <div class="ap-top-meta">{html.escape(mode_label)}<br>{html.escape(build_label)}<br>Decision support only</div>
         </div>
         <div class="ap-kicker">Chart-first market intelligence</div>
         <h1 class="ap-title">Search. Read the setup. Decide.</h1>
@@ -1992,9 +2055,14 @@ def _render_chart(
 ) -> None:
     label = normalize_timeframe(timeframe, default=DEFAULT_TIMEFRAME)
     spec = get_timeframe_spec(label)
+    chart_note = (
+        f"{'Intraday' if spec.intraday else 'Higher timeframe'} · completed provider bars · decision levels remain unchanged"
+        if rows
+        else f"{'Intraday' if spec.intraday else 'Higher timeframe'} · provider bars unavailable · no chart levels inferred"
+    )
     st.markdown(
         f'<div class="ap-chart-head"><div><div class="ap-chart-title">{html.escape(str(brief["ticker"]))} · {html.escape(label)} setup chart</div>'
-        f'<div class="ap-chart-note">{html.escape("Intraday" if spec.intraday else "Higher timeframe")} · completed provider bars · decision levels remain unchanged</div></div></div>',
+        f'<div class="ap-chart-note">{html.escape(chart_note)}</div></div></div>',
         unsafe_allow_html=True,
     )
     if rows:
@@ -2203,6 +2271,7 @@ def _render_advanced(
             f"{currentness_label(health.get('data_label'))} · "
             f"{format_timestamp(health.get('timestamp'))}"
         )
+        st.write(f"Earnings calendar: {earnings_context_label(brief['safe_decision'])}")
         if not presentation:
             persistence = st.session_state.get("_autopilot_persistence_mode")
             st.write("Personal state: saved across sessions" if persistence == "persistent" else "Personal state: this session only")

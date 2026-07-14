@@ -11,10 +11,14 @@ from __future__ import annotations
 import json
 import math
 import re
+import threading
+import time as time_module
+from collections import deque
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, time, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence, Union
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
@@ -26,6 +30,12 @@ POLYGON_BASE_URL = "https://api.polygon.io"
 POLYGON_HOST = "api.polygon.io"
 MASSIVE_HOST = "api.massive.com"
 MAX_ERROR_MESSAGE_CHARS = 240
+DEFAULT_PROVIDER_MAX_RETRIES = 2
+DEFAULT_PROVIDER_TRANSPORT_TIMEOUT_SECONDS = 8.0
+DEFAULT_PROVIDER_REQUEST_BUDGET_SECONDS = 15.0
+MAX_INLINE_RETRY_AFTER_SECONDS = 2.0
+DEFAULT_PROVIDER_COOLDOWN_SECONDS = 60.0
+MAX_PROVIDER_OBSERVATIONS = 256
 
 JsonDict = dict[str, Any]
 UrlOpener = Callable[[Any], Any]
@@ -76,6 +86,40 @@ _HTTP_LABELS = {
     503: "provider unavailable",
     504: "provider timeout",
 }
+_RETRYABLE_HTTP_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504})
+
+
+def classify_provider_failure(
+    status_code: Optional[int],
+    *,
+    provider: str = "Polygon",
+    operation: str = "request",
+) -> str:
+    """Return a stable, operator-oriented category without inspecting secrets."""
+
+    try:
+        code = int(status_code or 0)
+    except (TypeError, ValueError):
+        code = 0
+    provider_name = str(provider or "").strip().lower()
+    operation_name = str(operation or "").strip().lower()
+    if code == 400:
+        return "request"
+    if code == 401:
+        return "authentication"
+    if code == 403:
+        if provider_name == "massive" and operation_name == "earnings calendar":
+            return "entitlement"
+        return "authorization"
+    if code == 404:
+        return "not_found"
+    if code == 408:
+        return "timeout"
+    if code == 429:
+        return "throttling"
+    if code >= 500:
+        return "availability"
+    return "provider"
 
 
 def _is_sensitive_name(value: Any) -> bool:
@@ -91,10 +135,137 @@ class PolygonProviderError(RuntimeError):
         *,
         operation: str = "request",
         status_code: Optional[int] = None,
+        provider: str = "Polygon",
+        classification: Optional[str] = None,
+        attempts: int = 1,
+        retryable: bool = False,
+        retry_after_seconds: Optional[float] = None,
+        latency_ms: Optional[float] = None,
     ) -> None:
         super().__init__(message)
         self.operation = operation
         self.status_code = status_code
+        self.provider = str(provider or "Polygon")
+        self.classification = classification or classify_provider_failure(
+            status_code,
+            provider=self.provider,
+            operation=operation,
+        )
+        self.attempts = max(int(attempts), 1)
+        self.retryable = bool(retryable)
+        self.retry_after_seconds = retry_after_seconds
+        self.latency_ms = latency_ms
+        self.throttled = self.classification == "throttling" or status_code == 429
+
+    def to_dict(self) -> JsonDict:
+        return {
+            "provider": self.provider,
+            "operation": self.operation,
+            "classification": self.classification,
+            "status_code": self.status_code,
+            "attempts": self.attempts,
+            "retries": max(self.attempts - 1, 0),
+            "retryable": self.retryable,
+            "retry_after_seconds": self.retry_after_seconds,
+            "latency_ms": self.latency_ms,
+            "throttled": self.throttled,
+            "message": str(self),
+        }
+
+
+@dataclass(frozen=True)
+class ProviderRequestObservation:
+    """Bounded, credential-free telemetry for one completed provider request."""
+
+    provider: str
+    operation: str
+    outcome: str
+    classification: str
+    status_code: Optional[int]
+    attempts: int
+    retries: int
+    latency_ms: float
+    throttled: bool
+    retry_after_seconds: Optional[float]
+    observed_at: str
+
+    def to_dict(self) -> JsonDict:
+        return asdict(self)
+
+
+_PROVIDER_OBSERVATIONS: deque[ProviderRequestObservation] = deque(
+    maxlen=MAX_PROVIDER_OBSERVATIONS
+)
+_PROVIDER_OBSERVATIONS_LOCK = threading.RLock()
+_PROVIDER_COOLDOWNS: dict[str, float] = {}
+
+
+def clear_provider_observations(*, preserve_cooldowns: bool = False) -> None:
+    with _PROVIDER_OBSERVATIONS_LOCK:
+        _PROVIDER_OBSERVATIONS.clear()
+        if not preserve_cooldowns:
+            _PROVIDER_COOLDOWNS.clear()
+
+
+def _provider_cooldown_remaining(provider: str, now: float) -> Optional[float]:
+    key = str(provider or "Polygon").strip().lower()
+    with _PROVIDER_OBSERVATIONS_LOCK:
+        deadline = _PROVIDER_COOLDOWNS.get(key)
+        if deadline is None:
+            return None
+        remaining = deadline - now
+        if remaining <= 0:
+            _PROVIDER_COOLDOWNS.pop(key, None)
+            return None
+        return remaining
+
+
+def _set_provider_cooldown(provider: str, deadline: float) -> None:
+    key = str(provider or "Polygon").strip().lower()
+    with _PROVIDER_OBSERVATIONS_LOCK:
+        _PROVIDER_COOLDOWNS[key] = max(_PROVIDER_COOLDOWNS.get(key, 0.0), deadline)
+
+
+def recent_provider_observations(limit: int = 50) -> list[JsonDict]:
+    """Return the newest bounded observations without URLs, keys, or symbols."""
+
+    try:
+        bounded = max(0, min(int(limit), MAX_PROVIDER_OBSERVATIONS))
+    except (TypeError, ValueError):
+        bounded = 50
+    if bounded == 0:
+        return []
+    with _PROVIDER_OBSERVATIONS_LOCK:
+        return [item.to_dict() for item in list(_PROVIDER_OBSERVATIONS)[-bounded:]]
+
+
+def _record_provider_observation(
+    *,
+    provider: str,
+    operation: str,
+    outcome: str,
+    classification: str,
+    status_code: Optional[int],
+    attempts: int,
+    latency_ms: float,
+    throttled: bool,
+    retry_after_seconds: Optional[float],
+) -> None:
+    observation = ProviderRequestObservation(
+        provider=str(provider or "Polygon"),
+        operation=str(operation or "request"),
+        outcome=str(outcome or "unknown"),
+        classification=str(classification or "provider"),
+        status_code=status_code,
+        attempts=max(int(attempts), 1),
+        retries=max(int(attempts) - 1, 0),
+        latency_ms=round(max(float(latency_ms), 0.0), 3),
+        throttled=bool(throttled),
+        retry_after_seconds=retry_after_seconds,
+        observed_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    )
+    with _PROVIDER_OBSERVATIONS_LOCK:
+        _PROVIDER_OBSERVATIONS.append(observation)
 
 
 class InvalidTickerError(PolygonProviderError, ValueError):
@@ -248,6 +419,11 @@ class EarningsContext:
     checked_through: date
     source: str = "Massive / Benzinga Earnings"
     message: Optional[str] = None
+    error_kind: Optional[str] = None
+    status_code: Optional[int] = None
+    attempts: Optional[int] = None
+    latency_ms: Optional[float] = None
+    throttled: bool = False
 
     def to_dict(self) -> JsonDict:
         data = asdict(self)
@@ -800,8 +976,17 @@ def _response_bytes(response: Any) -> bytes:
     raise TypeError("Provider response body is not text or bytes.")
 
 
-def _open_and_read(url: Any, opener: Optional[UrlOpener]) -> bytes:
-    response = opener(url) if opener is not None else urlopen(url, timeout=20)
+def _open_and_read(
+    url: Any,
+    opener: Optional[UrlOpener],
+    *,
+    timeout_seconds: float = DEFAULT_PROVIDER_TRANSPORT_TIMEOUT_SECONDS,
+) -> bytes:
+    response = (
+        opener(url)
+        if opener is not None
+        else urlopen(url, timeout=timeout_seconds)
+    )
     if hasattr(response, "__enter__"):
         with response as managed:
             return _response_bytes(managed)
@@ -813,6 +998,61 @@ def _open_and_read(url: Any, opener: Optional[UrlOpener]) -> bytes:
             close()
 
 
+def _http_retry_after_seconds(error: HTTPError) -> Optional[float]:
+    headers = getattr(error, "headers", None)
+    if headers is None:
+        return None
+    try:
+        raw_value = headers.get("Retry-After")
+    except Exception:
+        return None
+    text = str(raw_value or "").strip()
+    if not text:
+        return None
+    try:
+        seconds = float(text)
+    except (TypeError, ValueError):
+        try:
+            retry_at = parsedate_to_datetime(text)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=timezone.utc)
+        seconds = (retry_at.astimezone(timezone.utc) - datetime.now(timezone.utc)).total_seconds()
+    if not math.isfinite(seconds):
+        return None
+    return max(seconds, 0.0)
+
+
+def _retry_delay_seconds(
+    *,
+    attempt: int,
+    retry_after_seconds: Optional[float],
+    status_code: Optional[int] = None,
+) -> Optional[float]:
+    if retry_after_seconds is not None:
+        if retry_after_seconds <= MAX_INLINE_RETRY_AFTER_SECONDS:
+            return retry_after_seconds
+        # A synchronous dashboard request must not sleep for a long server
+        # cooldown. Surface the cooldown so a later request can honor it.
+        return None
+    if status_code == 429:
+        # Without an explicit cooldown, a sub-second retry would spend more of
+        # the caller's quota without a credible chance of recovery.
+        return None
+    return min(0.25 * (2 ** max(attempt - 1, 0)), 2.0)
+
+
+def _bounded_request_seconds(value: Any, *, default: float, maximum: float) -> float:
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(seconds) or seconds <= 0:
+        return default
+    return min(seconds, maximum)
+
+
 def _request_json(
     url: str,
     *,
@@ -821,36 +1061,227 @@ def _request_json(
     operation: str,
     headers: Optional[Mapping[str, str]] = None,
     provider_label: str = "Polygon",
+    max_retries: int = DEFAULT_PROVIDER_MAX_RETRIES,
+    transport_timeout_seconds: float = DEFAULT_PROVIDER_TRANSPORT_TIMEOUT_SECONDS,
+    request_budget_seconds: float = DEFAULT_PROVIDER_REQUEST_BUDGET_SECONDS,
+    sleep: Callable[[float], None] = time_module.sleep,
+    clock: Callable[[], float] = time_module.monotonic,
 ) -> JsonDict:
     try:
-        target: Any = Request(url, headers=dict(headers or {})) if headers else url
-        raw = _open_and_read(target, opener)
-    except HTTPError as exc:
-        code = int(getattr(exc, "code", 0) or 0)
-        label = _HTTP_LABELS.get(code, "provider error")
-        raise PolygonProviderError(
-            f"{provider_label} {operation} failed with HTTP {code} ({label}).",
+        retries = max(0, min(int(max_retries), 5))
+    except (TypeError, ValueError):
+        retries = DEFAULT_PROVIDER_MAX_RETRIES
+    transport_timeout = _bounded_request_seconds(
+        transport_timeout_seconds,
+        default=DEFAULT_PROVIDER_TRANSPORT_TIMEOUT_SECONDS,
+        maximum=DEFAULT_PROVIDER_TRANSPORT_TIMEOUT_SECONDS,
+    )
+    request_budget = _bounded_request_seconds(
+        request_budget_seconds,
+        default=DEFAULT_PROVIDER_REQUEST_BUDGET_SECONDS,
+        maximum=DEFAULT_PROVIDER_REQUEST_BUDGET_SECONDS,
+    )
+    started_at = clock()
+    request_deadline = started_at + request_budget
+    attempts = 0
+    throttled = False
+    last_retry_after: Optional[float] = None
+
+    def elapsed_ms() -> float:
+        return max((clock() - started_at) * 1000.0, 0.0)
+
+    def remaining_budget_seconds() -> float:
+        return max(request_deadline - clock(), 0.0)
+
+    def sleep_before_retry(delay: float) -> bool:
+        bounded_delay = max(float(delay), 0.0)
+        remaining = remaining_budget_seconds()
+        # If the delay would consume the budget, surface the current provider
+        # failure instead of sleeping without enough time for another attempt.
+        if bounded_delay >= remaining:
+            return False
+        if bounded_delay > 0:
+            sleep(bounded_delay)
+        return remaining_budget_seconds() > 0
+
+    cooldown_remaining = _provider_cooldown_remaining(provider_label, started_at)
+    if cooldown_remaining is not None:
+        remaining = round(cooldown_remaining, 3)
+        _record_provider_observation(
+            provider=provider_label,
             operation=operation,
-            status_code=code or None,
-        ) from None
-    except Exception as exc:
-        error_name = exc.__class__.__name__
+            outcome="circuit_open",
+            classification="throttling",
+            status_code=429,
+            attempts=1,
+            latency_ms=0.0,
+            throttled=True,
+            retry_after_seconds=remaining,
+        )
         raise PolygonProviderError(
-            f"{provider_label} {operation} request failed ({error_name}).",
+            f"{provider_label} {operation} paused while the provider cooldown is active.",
             operation=operation,
-        ) from None
+            status_code=429,
+            provider=provider_label,
+            classification="throttling",
+            attempts=1,
+            retryable=True,
+            retry_after_seconds=remaining,
+            latency_ms=0.0,
+        )
+
+    while True:
+        attempts += 1
+        try:
+            remaining = remaining_budget_seconds()
+            if remaining <= 0:
+                raise TimeoutError("provider request budget exhausted")
+            target: Any = Request(url, headers=dict(headers or {})) if headers else url
+            raw = _open_and_read(
+                target,
+                opener,
+                timeout_seconds=min(transport_timeout, remaining),
+            )
+            break
+        except HTTPError as exc:
+            code = int(getattr(exc, "code", 0) or 0)
+            retryable = code in _RETRYABLE_HTTP_STATUS_CODES
+            retry_after = _http_retry_after_seconds(exc)
+            if retry_after is not None:
+                last_retry_after = retry_after
+            if code == 429:
+                throttled = True
+            delay = _retry_delay_seconds(
+                attempt=attempts,
+                retry_after_seconds=retry_after,
+                status_code=code,
+            )
+            if (
+                retryable
+                and attempts <= retries
+                and delay is not None
+                and sleep_before_retry(delay)
+            ):
+                continue
+            if code == 429:
+                cooldown_seconds = (
+                    last_retry_after
+                    if last_retry_after is not None and last_retry_after > 0
+                    else DEFAULT_PROVIDER_COOLDOWN_SECONDS
+                )
+                last_retry_after = cooldown_seconds
+                _set_provider_cooldown(provider_label, clock() + cooldown_seconds)
+            latency = elapsed_ms()
+            classification = classify_provider_failure(
+                code or None,
+                provider=provider_label,
+                operation=operation,
+            )
+            _record_provider_observation(
+                provider=provider_label,
+                operation=operation,
+                outcome="error",
+                classification=classification,
+                status_code=code or None,
+                attempts=attempts,
+                latency_ms=latency,
+                throttled=throttled,
+                retry_after_seconds=last_retry_after,
+            )
+            label = _HTTP_LABELS.get(code, "provider error")
+            raise PolygonProviderError(
+                f"{provider_label} {operation} failed with HTTP {code} ({label}).",
+                operation=operation,
+                status_code=code or None,
+                provider=provider_label,
+                classification=classification,
+                attempts=attempts,
+                retryable=retryable,
+                retry_after_seconds=last_retry_after,
+                latency_ms=round(latency, 3),
+            ) from None
+        except Exception as exc:
+            retryable = isinstance(exc, (TimeoutError, ConnectionError, URLError, OSError))
+            if retryable and attempts <= retries:
+                delay = _retry_delay_seconds(
+                    attempt=attempts,
+                    retry_after_seconds=None,
+                )
+                assert delay is not None
+                if sleep_before_retry(delay):
+                    continue
+            latency = elapsed_ms()
+            classification = "timeout" if isinstance(exc, TimeoutError) else (
+                "transport" if retryable else "client"
+            )
+            _record_provider_observation(
+                provider=provider_label,
+                operation=operation,
+                outcome="error",
+                classification=classification,
+                status_code=None,
+                attempts=attempts,
+                latency_ms=latency,
+                throttled=throttled,
+                retry_after_seconds=last_retry_after,
+            )
+            error_name = exc.__class__.__name__
+            raise PolygonProviderError(
+                f"{provider_label} {operation} request failed ({error_name}).",
+                operation=operation,
+                provider=provider_label,
+                classification=classification,
+                attempts=attempts,
+                retryable=retryable,
+                retry_after_seconds=last_retry_after,
+                latency_ms=round(latency, 3),
+            ) from None
 
     try:
         payload = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
+        latency = elapsed_ms()
+        _record_provider_observation(
+            provider=provider_label,
+            operation=operation,
+            outcome="error",
+            classification="invalid_response",
+            status_code=None,
+            attempts=attempts,
+            latency_ms=latency,
+            throttled=throttled,
+            retry_after_seconds=last_retry_after,
+        )
         raise PolygonProviderError(
             f"{provider_label} {operation} returned an invalid JSON response.",
             operation=operation,
+            provider=provider_label,
+            classification="invalid_response",
+            attempts=attempts,
+            retry_after_seconds=last_retry_after,
+            latency_ms=round(latency, 3),
         ) from None
     if not isinstance(payload, dict):
+        latency = elapsed_ms()
+        _record_provider_observation(
+            provider=provider_label,
+            operation=operation,
+            outcome="error",
+            classification="invalid_response",
+            status_code=None,
+            attempts=attempts,
+            latency_ms=latency,
+            throttled=throttled,
+            retry_after_seconds=last_retry_after,
+        )
         raise PolygonProviderError(
             f"{provider_label} {operation} returned an unexpected response shape.",
             operation=operation,
+            provider=provider_label,
+            classification="invalid_response",
+            attempts=attempts,
+            retry_after_seconds=last_retry_after,
+            latency_ms=round(latency, 3),
         )
 
     status = str(payload.get("status", "") or "").strip().upper()
@@ -858,10 +1289,48 @@ def _request_json(
         raw_detail = payload.get("error") or payload.get("message") or status
         detail = redact_sensitive_text(raw_detail, api_key=api_key)
         suffix = f": {detail}" if detail else "."
+        classification = "provider_response"
+        if status == "AUTH_ERROR":
+            classification = "authentication"
+        elif status == "NOT_AUTHORIZED":
+            classification = (
+                "entitlement"
+                if str(provider_label).lower() == "massive" and operation == "earnings calendar"
+                else "authorization"
+            )
+        latency = elapsed_ms()
+        _record_provider_observation(
+            provider=provider_label,
+            operation=operation,
+            outcome="error",
+            classification=classification,
+            status_code=None,
+            attempts=attempts,
+            latency_ms=latency,
+            throttled=throttled,
+            retry_after_seconds=last_retry_after,
+        )
         raise PolygonProviderError(
             f"{provider_label} {operation} returned an error{suffix}",
             operation=operation,
+            provider=provider_label,
+            classification=classification,
+            attempts=attempts,
+            retry_after_seconds=last_retry_after,
+            latency_ms=round(latency, 3),
         )
+    latency = elapsed_ms()
+    _record_provider_observation(
+        provider=provider_label,
+        operation=operation,
+        outcome="success",
+        classification="success",
+        status_code=None,
+        attempts=attempts,
+        latency_ms=latency,
+        throttled=throttled,
+        retry_after_seconds=last_retry_after,
+    )
     return payload
 
 
@@ -1548,6 +2017,15 @@ def fetch_ticker_news(
 get_ticker_news = fetch_ticker_news
 
 
+def _earnings_response_error(message: str) -> PolygonProviderError:
+    return PolygonProviderError(
+        message,
+        operation="earnings calendar",
+        provider="Massive",
+        classification="invalid_response",
+    )
+
+
 def _massive_earnings_next_url(value: Any) -> Optional[str]:
     text = str(value or "").strip()
     if not text:
@@ -1561,9 +2039,8 @@ def _massive_earnings_next_url(value: Any) -> Optional[str]:
         or parsed.path != "/benzinga/v1/earnings"
         or any(_is_sensitive_name(key) for key, _ in parse_qsl(parsed.query, keep_blank_values=True))
     ):
-        raise PolygonProviderError(
-            "Massive earnings calendar returned an unsafe pagination URL.",
-            operation="earnings calendar",
+        raise _earnings_response_error(
+            "Massive earnings calendar returned an unsafe pagination URL."
         )
     return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, parsed.query, ""))
 
@@ -1603,9 +2080,8 @@ def fetch_earnings_context(
         for _ in range(pages):
             if not url or url in seen_urls:
                 if url in seen_urls:
-                    raise PolygonProviderError(
-                        "Massive earnings pagination repeated a page URL.",
-                        operation="earnings calendar",
+                    raise _earnings_response_error(
+                        "Massive earnings pagination repeated a page URL."
                     )
                 break
             seen_urls.add(url)
@@ -1618,30 +2094,26 @@ def fetch_earnings_context(
                 provider_label="Massive",
             )
             if str(payload.get("status") or "").strip().upper() != "OK":
-                raise PolygonProviderError(
-                    "Massive earnings calendar returned an unresolved status.",
-                    operation="earnings calendar",
+                raise _earnings_response_error(
+                    "Massive earnings calendar returned an unresolved status."
                 )
             results = payload.get("results")
             if not isinstance(results, list):
-                raise PolygonProviderError(
-                    "Massive earnings calendar returned an unexpected response shape.",
-                    operation="earnings calendar",
+                raise _earnings_response_error(
+                    "Massive earnings calendar returned an unexpected response shape."
                 )
             count = payload.get("count")
             if count is not None and (isinstance(count, bool) or not isinstance(count, int) or count != len(results)):
-                raise PolygonProviderError(
-                    "Massive earnings calendar returned an inconsistent result count.",
-                    operation="earnings calendar",
+                raise _earnings_response_error(
+                    "Massive earnings calendar returned an inconsistent result count."
                 )
             for raw_value in results:
                 raw = _mapping(raw_value)
                 try:
                     row_ticker = sanitize_ticker(raw.get("ticker"))
                 except InvalidTickerError:
-                    raise PolygonProviderError(
-                        "Massive earnings calendar returned a malformed ticker.",
-                        operation="earnings calendar",
+                    raise _earnings_response_error(
+                        "Massive earnings calendar returned a malformed ticker."
                     ) from None
                 event_date = _parse_date(raw.get("date"))
                 event_status = str(raw.get("date_status") or "").strip().lower()
@@ -1651,16 +2123,14 @@ def fetch_earnings_context(
                     or not start_date <= event_date <= end_date
                     or event_status not in {"projected", "confirmed"}
                 ):
-                    raise PolygonProviderError(
-                        "Massive earnings calendar returned data outside the requested verified window.",
-                        operation="earnings calendar",
+                    raise _earnings_response_error(
+                        "Massive earnings calendar returned data outside the requested verified window."
                     )
                 events.append((event_date, event_status))
             url = _massive_earnings_next_url(payload.get("next_url"))
         if url:
-            raise PolygonProviderError(
-                "Massive earnings pagination exceeded the safe page limit.",
-                operation="earnings calendar",
+            raise _earnings_response_error(
+                "Massive earnings pagination exceeded the safe page limit."
             )
     except PolygonProviderError as exc:
         return EarningsContext(
@@ -1670,6 +2140,11 @@ def fetch_earnings_context(
             checked_at=current,
             checked_through=end_date,
             message=redact_sensitive_text(str(exc), api_key=clean_key),
+            error_kind=exc.classification,
+            status_code=exc.status_code,
+            attempts=exc.attempts,
+            latency_ms=exc.latency_ms,
+            throttled=exc.throttled,
         )
 
     if not events:
@@ -2032,6 +2507,7 @@ __all__ = [
     "OptionSnapshot",
     "PolygonProvider",
     "PolygonProviderError",
+    "ProviderRequestObservation",
     "ResolvedTicker",
     "StockSnapshot",
     "StockTickerSnapshot",
@@ -2049,6 +2525,8 @@ __all__ = [
     "build_ticker_news_url",
     "build_ticker_details_url",
     "build_ticker_reference_url",
+    "classify_provider_failure",
+    "clear_provider_observations",
     "fetch_1m_bars",
     "fetch_3m_bars",
     "fetch_15m_bars",
@@ -2086,6 +2564,7 @@ __all__ = [
     "redact_api_key",
     "redact_sensitive_text",
     "redact_url",
+    "recent_provider_observations",
     "resample_1h",
     "resample_4h",
     "resample_bars",

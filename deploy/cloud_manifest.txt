@@ -40,6 +40,7 @@ tests/test_cockpit_contract.py
 tests/test_options_ranker.py
 tests/test_polygon_provider.py
 tests/test_presentation_export.py
+tests/test_provider_resilience_observability.py
 tests/test_release_privacy.py
 tests/test_scoring_freeze.py
 tests/test_sol_ultra_pine.py
