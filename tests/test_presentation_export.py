@@ -149,6 +149,21 @@ class PresentationExportTests(unittest.TestCase):
         self.assertEqual(minute["direction"], "Bearish")
         self.assertEqual(monthly["active"], "no")
 
+    def test_incomplete_selected_analysis_falls_back_to_validated_engine_direction(self) -> None:
+        decision = complete_decision()
+        decision["timeframes"] = {"4H": {"direction": "bullish"}}
+        payload = build_presentation_payload(
+            decision,
+            timeframe="4H",
+            tradingview_symbol="NASDAQ:AAPL",
+            tradingview_url="https://www.tradingview.com/chart/?symbol=NASDAQ%3AAAPL&interval=240",
+            selected_analysis={"direction": "unavailable"},
+        )
+
+        four_hour = next(row for row in payload["alignment"] if row["timeframe"] == "4H")
+        self.assertEqual(four_hour["active"], "yes")
+        self.assertEqual(four_hour["direction"], "Bullish")
+
     def test_payload_redacts_private_paths_credentials_diagnostics_and_state(self) -> None:
         decision = complete_decision()
         decision.update(

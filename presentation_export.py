@@ -95,7 +95,15 @@ def build_presentation_payload(
         engine_label = engine_labels.get(label)
         row = frames.get(engine_label) if engine_label and isinstance(frames.get(engine_label), Mapping) else {}
         if label == selected_timeframe and isinstance(selected_analysis, Mapping):
-            row = selected_analysis
+            merged_row = dict(row)
+            selected_direction = selected_analysis.get("direction")
+            if str(selected_direction or "").strip().lower() not in {
+                "",
+                "unavailable",
+                "unknown",
+            }:
+                merged_row["direction"] = selected_direction
+            row = merged_row
         alignment.append(
             {
                 "timeframe": label,
