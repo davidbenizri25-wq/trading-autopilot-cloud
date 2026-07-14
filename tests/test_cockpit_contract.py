@@ -304,6 +304,34 @@ class CockpitContractTests(unittest.TestCase):
         self.assertEqual(next(row for row in minute if row["timeframe"] == "1m")["direction"], "Bearish")
         self.assertEqual(next(row for row in minute if row["timeframe"] == "3m")["direction"], "Unavailable")
 
+        decision_with_four_hour = complete_decision(
+            timeframes={
+                "4H": {
+                    "direction": "bullish",
+                    "trend_score": 3,
+                    "macd_histogram": 0.3,
+                    "close": 210.0,
+                    "support": [205.0],
+                    "resistance": [220.0],
+                }
+            }
+        )
+        four_hour = build_timeframe_alignment(
+            decision_with_four_hour,
+            selected_timeframe="4H",
+            selected_analysis={
+                "direction": "unavailable",
+                "trend_score": None,
+                "macd_histogram": None,
+                "support": [],
+                "resistance": [],
+            },
+        )
+        self.assertEqual(
+            next(row for row in four_hour if row["timeframe"] == "4H")["direction"],
+            "Bullish",
+        )
+
         for raw, expected in (("1m", "1m"), ("1M", "1M"), (["15m", "1M"], "1M")):
             with self.subTest(raw=raw):
                 st = SimpleNamespace(session_state={}, query_params={"tf": raw})

@@ -1486,7 +1486,20 @@ def build_timeframe_alignment(
         engine_label = _engine_timeframe_label(label)
         item = frames.get(engine_label) if engine_label and isinstance(frames.get(engine_label), Mapping) else {}
         if label == selected and isinstance(selected_analysis, Mapping):
-            item = selected_analysis
+            merged_item = dict(item)
+            for key, value in selected_analysis.items():
+                if value is None:
+                    continue
+                if key == "direction" and str(value).strip().lower() in {
+                    "",
+                    "unavailable",
+                    "unknown",
+                }:
+                    continue
+                if key in {"support", "resistance"} and not value:
+                    continue
+                merged_item[key] = value
+            item = merged_item
         direction = public_text(item.get("direction"), "unavailable", max_length=24).lower()
         trend_score = _number(item.get("trend_score"))
         macd_hist = _number(item.get("macd_histogram"))
