@@ -6,6 +6,7 @@ from copy import deepcopy
 from dataclasses import asdict, dataclass
 from datetime import date as datetime_date, datetime, time as datetime_time, timedelta, timezone
 import hashlib
+import math
 import threading
 import time
 from typing import Any, Callable, Mapping, Optional
@@ -69,6 +70,15 @@ class ProviderHealth:
     data_label: str
     timestamp: Optional[str]
     messages: list[str]
+    data_age_seconds: Optional[float] = None
+    stale: bool = False
+    cache_stats: Optional[dict[str, dict[str, int]]] = None
+    earnings_status: str = "unresolved"
+    earnings_error_kind: Optional[str] = None
+    earnings_status_code: Optional[int] = None
+    earnings_attempts: Optional[int] = None
+    earnings_latency_ms: Optional[float] = None
+    earnings_throttled: bool = False
 
 
 @dataclass
@@ -105,24 +115,98 @@ class TTLCache:
         self.max_items = max(int(max_items), 1)
         self._items: dict[str, tuple[float, Any]] = {}
         self._lock = threading.RLock()
+        self._inflight: dict[str, dict[str, Any]] = {}
+        self._hits = 0
+        self._misses = 0
+        self._loads = 0
+        self._load_errors = 0
+        self._expirations = 0
+        self._evictions = 0
+        self._coalesced_waits = 0
 
     def get_or_create(self, key: str, factory: Callable[[], Any]) -> Any:
         now = time.monotonic()
         with self._lock:
             cached = self._items.get(key)
             if cached and now - cached[0] < self.ttl_seconds:
+                self._hits += 1
                 return deepcopy(cached[1])
-        value = factory()
+            if cached:
+                self._items.pop(key, None)
+                self._expirations += 1
+            flight = self._inflight.get(key)
+            if flight is None:
+                flight = {
+                    "event": threading.Event(),
+                    "value": None,
+                    "error": None,
+                }
+                self._inflight[key] = flight
+                self._misses += 1
+                leader = True
+            else:
+                self._coalesced_waits += 1
+                leader = False
+
+        if not leader:
+            flight["event"].wait()
+            error = flight.get("error")
+            if error is not None:
+                raise error
+            with self._lock:
+                self._hits += 1
+            return deepcopy(flight.get("value"))
+
+        try:
+            value = factory()
+            cached_value = deepcopy(value)
+        except Exception as exc:
+            with self._lock:
+                self._load_errors += 1
+                flight["error"] = exc
+                self._inflight.pop(key, None)
+                flight["event"].set()
+            raise
         with self._lock:
-            self._items[key] = (now, deepcopy(value))
+            self._loads += 1
+            self._items[key] = (time.monotonic(), cached_value)
             if len(self._items) > self.max_items:
                 oldest = min(self._items.items(), key=lambda item: item[1][0])[0]
                 self._items.pop(oldest, None)
+                self._evictions += 1
+            flight["value"] = cached_value
+            self._inflight.pop(key, None)
+            flight["event"].set()
         return value
 
-    def clear(self) -> None:
+    def snapshot(self) -> dict[str, int]:
+        """Return aggregate cache health without exposing keys or cached values."""
+
+        with self._lock:
+            return {
+                "ttl_seconds": self.ttl_seconds,
+                "max_items": self.max_items,
+                "items": len(self._items),
+                "hits": self._hits,
+                "misses": self._misses,
+                "loads": self._loads,
+                "load_errors": self._load_errors,
+                "expirations": self._expirations,
+                "evictions": self._evictions,
+                "coalesced_waits": self._coalesced_waits,
+            }
+
+    def clear(self, *, reset_stats: bool = True) -> None:
         with self._lock:
             self._items.clear()
+            if reset_stats:
+                self._hits = 0
+                self._misses = 0
+                self._loads = 0
+                self._load_errors = 0
+                self._expirations = 0
+                self._evictions = 0
+                self._coalesced_waits = 0
 
 
 _DATA_CACHE = TTLCache(ttl_seconds=300, max_items=96)
@@ -458,12 +542,20 @@ def _option_contract_input(contract: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _data_label(market: str, latest: Optional[datetime], now: datetime) -> str:
+def _data_age_seconds(latest: Optional[datetime], now: datetime) -> Optional[float]:
     if latest is None:
-        return "unavailable"
+        return None
     current = now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
     observed = latest if latest.tzinfo is not None else latest.replace(tzinfo=timezone.utc)
-    age_seconds = (current.astimezone(timezone.utc) - observed.astimezone(timezone.utc)).total_seconds()
+    return (
+        current.astimezone(timezone.utc) - observed.astimezone(timezone.utc)
+    ).total_seconds()
+
+
+def _data_label(market: str, latest: Optional[datetime], now: datetime) -> str:
+    age_seconds = _data_age_seconds(latest, now)
+    if age_seconds is None:
+        return "unavailable"
     if age_seconds < 0:
         return "stale"
     market_label = str(market or "").strip().lower()
@@ -579,7 +671,10 @@ def analyze_symbol(
         earnings_window_end,
         checked_at=current,
     )
-    earnings_status = str(getattr(earnings, "status", "unresolved") or "unresolved").strip().lower()
+    raw_earnings_status = str(
+        getattr(earnings, "status", "unresolved") or "unresolved"
+    ).strip().lower()
+    earnings_status = raw_earnings_status
     earnings_date_value = getattr(earnings, "date", None)
     earnings_checked_value = getattr(earnings, "checked_through", None)
     if earnings_status not in {"scheduled", "verified_none", "unresolved"}:
@@ -602,6 +697,35 @@ def analyze_symbol(
         not complete_calendar_window or not scheduled_date_in_window
     ):
         earnings_status = "unresolved"
+    raw_error_kind = getattr(earnings, "error_kind", None)
+    earnings_error_kind = (
+        raw_error_kind.strip().lower()
+        if isinstance(raw_error_kind, str) and raw_error_kind.strip()
+        else None
+    )
+    if earnings_error_kind not in {
+        "authentication",
+        "authorization",
+        "entitlement",
+        "throttling",
+        "availability",
+        "timeout",
+        "transport",
+        "client",
+        "invalid_response",
+        "provider_response",
+        "implementation",
+    }:
+        earnings_error_kind = None
+    if earnings_status == "unresolved" and earnings_error_kind is None and (
+        raw_earnings_status not in {"scheduled", "verified_none", "unresolved"}
+        or raw_earnings_status != earnings_status
+        or (
+            raw_earnings_status in {"scheduled", "verified_none"}
+            and not complete_calendar_window
+        )
+    ):
+        earnings_error_kind = "implementation"
     earnings_message = getattr(earnings, "message", None)
     if earnings_status == "unresolved" and isinstance(earnings_message, str) and earnings_message:
         provider_messages.append(earnings_message)
@@ -616,8 +740,34 @@ def analyze_symbol(
         if isinstance(earnings_checked_value, datetime_date)
         else None
     )
+    raw_earnings_status_code = getattr(earnings, "status_code", None)
+    earnings_status_code = (
+        raw_earnings_status_code
+        if isinstance(raw_earnings_status_code, int)
+        and not isinstance(raw_earnings_status_code, bool)
+        else None
+    )
+    raw_earnings_attempts = getattr(earnings, "attempts", None)
+    earnings_attempts = (
+        raw_earnings_attempts
+        if isinstance(raw_earnings_attempts, int)
+        and not isinstance(raw_earnings_attempts, bool)
+        and raw_earnings_attempts > 0
+        else None
+    )
+    raw_earnings_latency = getattr(earnings, "latency_ms", None)
+    earnings_latency_ms = (
+        float(raw_earnings_latency)
+        if isinstance(raw_earnings_latency, (int, float))
+        and not isinstance(raw_earnings_latency, bool)
+        and math.isfinite(float(raw_earnings_latency))
+        and raw_earnings_latency >= 0
+        else None
+    )
+    earnings_throttled = getattr(earnings, "throttled", False) is True
     latest = _latest_timestamp(frames)
     label = _data_label(market_label, latest, current)
+    data_age_seconds = _data_age_seconds(latest, current)
     latest_text = latest.isoformat().replace("+00:00", "Z") if latest else None
     decision = evaluate_setup(
         resolved.ticker,
@@ -637,6 +787,11 @@ def analyze_symbol(
             str(getattr(earnings, "date_status", "") or "").strip().lower() or None
         ),
         earnings_checked_through=earnings_checked_through,
+        earnings_error_kind=earnings_error_kind,
+        earnings_status_code=earnings_status_code,
+        earnings_attempts=earnings_attempts,
+        earnings_latency_ms=earnings_latency_ms,
+        earnings_throttled=earnings_throttled,
         news=news_rows,
         provider_warnings=provider_messages,
     )
@@ -698,11 +853,25 @@ def analyze_symbol(
         chart_frames[selected] = deepcopy(selected_rows)
     chart_bars = deepcopy(chart_frames.get(selected) or [])
     provider_health = ProviderHealth(
-        provider="Polygon + Benzinga" if earnings_status != "unresolved" else "Polygon",
+        provider="Polygon + Massive / Benzinga",
         status="connected" if frames else "error",
         data_label=label,
         timestamp=latest_text,
         messages=provider_messages,
+        data_age_seconds=(
+            round(data_age_seconds, 3) if data_age_seconds is not None else None
+        ),
+        stale=label == "stale",
+        cache_stats={
+            "analysis": _DATA_CACHE.snapshot(),
+            "chart": _CHART_DATA_CACHE.snapshot(),
+        },
+        earnings_status=earnings_status,
+        earnings_error_kind=earnings_error_kind,
+        earnings_status_code=earnings_status_code,
+        earnings_attempts=earnings_attempts,
+        earnings_latency_ms=earnings_latency_ms,
+        earnings_throttled=earnings_throttled,
     )
     return ServiceResult(
         decision=decision,

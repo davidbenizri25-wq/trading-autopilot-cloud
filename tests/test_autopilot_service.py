@@ -303,10 +303,17 @@ class AutopilotServiceTests(unittest.TestCase):
         self.assertEqual(captured["earnings_checked_through"], "2030-07-12")
         self.assertEqual(result.decision.earnings_status, "scheduled")
         self.assertEqual(result.decision.earnings_date, "2030-07-09")
-        self.assertEqual(result.provider_health.provider, "Polygon + Benzinga")
+        self.assertEqual(result.provider_health.provider, "Polygon + Massive / Benzinga")
         serialized = result.to_dict()["decision"]
+        self.assertEqual(serialized["days_to_earnings"], 7)
         self.assertEqual(serialized["earnings_date_status"], "projected")
         self.assertEqual(serialized["earnings_checked_through"], "2030-07-12")
+        health = result.to_dict()["provider_health"]
+        self.assertEqual(health["data_age_seconds"], 1320.0)
+        self.assertFalse(health["stale"])
+        self.assertEqual(set(health["cache_stats"]), {"analysis", "chart"})
+        self.assertEqual(health["earnings_status"], "scheduled")
+        self.assertIsNone(health["earnings_error_kind"])
 
     def test_service_never_invents_a_complete_earnings_window(self) -> None:
         now = datetime(2030, 7, 2, 15, 7, tzinfo=timezone.utc)
@@ -338,7 +345,8 @@ class AutopilotServiceTests(unittest.TestCase):
         self.assertEqual(captured["earnings_status"], "unresolved")
         self.assertIsNone(captured["earnings_checked_through"])
         self.assertEqual(result.decision.earnings_status, "unresolved")
-        self.assertEqual(result.provider_health.provider, "Polygon")
+        self.assertEqual(result.provider_health.provider, "Polygon + Massive / Benzinga")
+        self.assertEqual(result.provider_health.earnings_error_kind, "implementation")
 
     def test_verified_none_passes_explicit_none_to_options_context(self) -> None:
         now = datetime(2030, 7, 2, 15, 7, tzinfo=timezone.utc)
@@ -394,6 +402,39 @@ class AutopilotServiceTests(unittest.TestCase):
         self.assertIsNone(options_context["earnings_date"])
         self.assertEqual(captured["now"], now)
         self.assertEqual(result.decision.options, ranked)
+
+    def test_massive_entitlement_is_structured_in_decision_and_provider_health(self) -> None:
+        now = datetime(2030, 7, 2, 15, 7, tzinfo=timezone.utc)
+        earnings = EarningsContext(
+            status="unresolved",
+            date=None,
+            date_status=None,
+            checked_at=now,
+            checked_through=date(2030, 7, 12),
+            message="Massive earnings calendar failed with HTTP 403 (forbidden).",
+            error_kind="entitlement",
+            status_code=403,
+            attempts=1,
+            latency_ms=42.5,
+        )
+        provider = self._provider(earnings)
+
+        with (
+            patch("autopilot_service.PolygonProvider", return_value=provider),
+            patch("autopilot_service._frames_for_symbol", return_value=(self._frames(), [])),
+            patch(
+                "autopilot_service._market_context",
+                return_value=(MarketContext(regime="mixed"), {}, []),
+            ),
+            patch("autopilot_service.load_chart_bars", return_value=[]),
+        ):
+            result = analyze_symbol("AAPL", "test-key", now=now, include_options=False)
+
+        self.assertEqual(result.decision.earnings_status, "unresolved")
+        self.assertEqual(result.decision.earnings_error_kind, "entitlement")
+        self.assertEqual(result.decision.earnings_status_code, 403)
+        self.assertEqual(result.provider_health.earnings_error_kind, "entitlement")
+        self.assertEqual(result.provider_health.earnings_latency_ms, 42.5)
 
     def test_option_rank_input_requires_quote_timestamp_and_keeps_underlying(self) -> None:
         row = _option_contract_input(

@@ -54,6 +54,16 @@ def evaluate_confirmed_fixture(**earnings: object):
 
 
 class AutopilotEngineTests(unittest.TestCase):
+    def test_incomplete_setup_does_not_render_unavailable_as_a_price_level(self) -> None:
+        result = evaluate_setup("NVDA", {}, data_label="unavailable")
+
+        self.assertEqual(result.verdict, "PASS")
+        self.assertEqual(
+            result.invalidation_condition,
+            "No current invalidation level is defined; wait for complete provider-backed evidence.",
+        )
+        self.assertNotIn("above unavailable", result.invalidation_condition.lower())
+
     def test_normalize_bars_rejects_impossible_candle(self) -> None:
         rows = trend_bars(count=2)
         rows.append({"t": 1, "o": 10, "h": 8, "l": 9, "c": 11, "v": 1})
@@ -237,6 +247,7 @@ class AutopilotEngineTests(unittest.TestCase):
         payload = result.to_dict()
 
         self.assertIsNone(payload["earnings_date"])
+        self.assertIsNone(payload["days_to_earnings"])
         self.assertEqual(payload["earnings_status"], "verified_none")
         self.assertIsNone(payload["earnings_date_status"])
         self.assertEqual(payload["earnings_checked_through"], "2030-01-12")

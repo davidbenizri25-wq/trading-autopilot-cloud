@@ -461,9 +461,15 @@ class DecisionResult:
     full_breakdown: dict[str, str]
     news: list[dict[str, Any]] = field(default_factory=list)
     earnings_date: Optional[str] = None
+    days_to_earnings: Optional[int] = None
     earnings_status: str = "unresolved"
     earnings_date_status: Optional[str] = None
     earnings_checked_through: Optional[str] = None
+    earnings_error_kind: Optional[str] = None
+    earnings_status_code: Optional[int] = None
+    earnings_attempts: Optional[int] = None
+    earnings_latency_ms: Optional[float] = None
+    earnings_throttled: bool = False
     options: dict[str, Any] = field(default_factory=dict)
     engine_version: str = "2.1.0"
 
@@ -641,6 +647,11 @@ def evaluate_setup(
     earnings_status: Optional[str] = None,
     earnings_date_status: Optional[str] = None,
     earnings_checked_through: Optional[str] = None,
+    earnings_error_kind: Optional[str] = None,
+    earnings_status_code: Optional[int] = None,
+    earnings_attempts: Optional[int] = None,
+    earnings_latency_ms: Optional[float] = None,
+    earnings_throttled: bool = False,
     news: Optional[list[dict[str, Any]]] = None,
     provider_warnings: Optional[list[str]] = None,
 ) -> DecisionResult:
@@ -896,7 +907,11 @@ def evaluate_setup(
         if direction in {"bullish", "bearish"}
         else "Weekly, Daily, and 4H structure must align before a tactical trigger matters."
     )
-    invalidation_condition = f"A decisive close {'below' if direction == 'bullish' else 'above'} {_format_level(invalidation)}."
+    invalidation_condition = (
+        f"A decisive close {'below' if direction == 'bullish' else 'above'} {_format_level(invalidation)}."
+        if direction in {"bullish", "bearish"} and invalidation is not None
+        else "No current invalidation level is defined; wait for complete provider-backed evidence."
+    )
     news_rows = list(news or [])
     breakdown = _build_breakdown(
         analyses,
@@ -920,7 +935,10 @@ def evaluate_setup(
         state=state,
         direction=direction,
         confidence=confidence,
-        confidence_explanation=f"{round(alignment * 100)}% weighted timeframe alignment, adjusted for confirmation, market context, liquidity, catalyst risk, and data quality.",
+        confidence_explanation=(
+            f"{confidence}% decision confidence from weighted timeframe alignment, confirmation, "
+            "market context, liquidity, catalyst risk, and data quality."
+        ),
         grade=grade,
         current_price=_round(current_price, 2),
         market_status=market_status,
@@ -946,9 +964,15 @@ def evaluate_setup(
         full_breakdown=breakdown,
         news=news_rows,
         earnings_date=earnings_date,
+        days_to_earnings=days_to_earnings,
         earnings_status=normalized_earnings_status,
         earnings_date_status=earnings_date_status,
         earnings_checked_through=earnings_checked_through,
+        earnings_error_kind=earnings_error_kind,
+        earnings_status_code=earnings_status_code,
+        earnings_attempts=earnings_attempts,
+        earnings_latency_ms=earnings_latency_ms,
+        earnings_throttled=bool(earnings_throttled),
     )
 
 

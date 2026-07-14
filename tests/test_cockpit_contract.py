@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
+import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -9,6 +11,8 @@ from unittest.mock import patch
 from dashboard.cockpit import (
     _active_timeframe,
     _apply_tracking_action,
+    _compact_market_value,
+    _safe_analysis_record,
     _set_active_timeframe,
     _ticker_from_search_choice,
     BREAKDOWN_SECTIONS,
@@ -16,11 +20,13 @@ from dashboard.cockpit import (
     build_home_snapshot,
     build_timeframe_alignment,
     currentness_label,
+    earnings_context_label,
     entry_action_allowed,
     format_price,
     format_timestamp,
     options_table_rows,
     public_text,
+    release_build_label,
     resolve_state_path,
 )
 
@@ -73,6 +79,105 @@ def complete_decision(**overrides):
 
 
 class CockpitContractTests(unittest.TestCase):
+    def test_market_ribbon_compacts_provider_unavailable_messages(self) -> None:
+        self.assertEqual(
+            _compact_market_value("Unavailable from the configured stock feed"),
+            "Unavailable",
+        )
+        self.assertEqual(_compact_market_value("mixed"), "Mixed")
+
+    def test_fail_closed_brief_never_invents_an_unavailable_invalidation(self) -> None:
+        brief = build_decision_brief(
+            complete_decision(
+                data_label="unavailable",
+                data_source="Unavailable",
+                current_price=None,
+                invalidation_condition="A decisive close above unavailable.",
+            )
+        )
+
+        self.assertEqual(brief["verdict"], "PASS")
+        self.assertEqual(
+            brief["invalidate"],
+            "No current invalidation level is available; wait for complete provider-backed evidence.",
+        )
+
+    def test_earnings_status_names_entitlement_availability_and_implementation(self) -> None:
+        expected = {
+            "entitlement": "Unresolved · Vendor entitlement required",
+            "availability": "Unresolved · Provider temporarily unavailable",
+            "implementation": "Unresolved · Application validation issue",
+        }
+        for error_kind, label in expected.items():
+            with self.subTest(error_kind=error_kind):
+                self.assertEqual(
+                    earnings_context_label(
+                        {
+                            "earnings_status": "unresolved",
+                            "earnings_error_kind": error_kind,
+                        }
+                    ),
+                    label,
+                )
+
+    def test_safe_private_record_preserves_structured_earnings_status(self) -> None:
+        record = _safe_analysis_record(
+            {
+                "decision": complete_decision(
+                    earnings_status="unresolved",
+                    earnings_date=None,
+                    earnings_date_status=None,
+                    earnings_checked_through="2026-07-23",
+                    earnings_error_kind="entitlement",
+                ),
+                "provider_health": {},
+            }
+        )
+        self.assertEqual(record["earnings_status"], "unresolved")
+        self.assertEqual(record["earnings_checked_through"], "2026-07-23")
+        self.assertEqual(record["earnings_error_kind"], "entitlement")
+
+    def test_release_build_label_uses_only_valid_public_hashes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / ".cloud-mirror-state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "canonical_repository": "davidbenizri25-wq/trading-elite-system",
+                        "version": "2.1.0-premium-terminal",
+                        "canonical_commit": "a" * 40,
+                        "manifest_sha256": "b" * 64,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                release_build_label(state_path),
+                "v2.1.0 · source aaaaaaa · manifest bbbbbbb",
+            )
+            state_path.write_text('{"canonical_commit":"/private/tmp/leak"}', encoding="utf-8")
+            self.assertEqual(release_build_label(state_path), "v2.1.0")
+            state_path.write_text("[]", encoding="utf-8")
+            self.assertEqual(release_build_label(state_path), "v2.1.0")
+
+            real_state = Path(temp_dir) / "real-state.json"
+            real_state.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "canonical_repository": "davidbenizri25-wq/trading-elite-system",
+                        "version": "2.1.0-premium-terminal",
+                        "canonical_commit": "a" * 40,
+                        "manifest_sha256": "b" * 64,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            state_path.unlink()
+            state_path.symlink_to(real_state)
+            self.assertEqual(release_build_label(state_path), "v2.1.0")
+
     def test_breakdown_contract_contains_exactly_all_twenty_one_sections(self) -> None:
         self.assertEqual(len(BREAKDOWN_SECTIONS), 21)
         self.assertEqual(BREAKDOWN_SECTIONS[0], ("summary", "1. One-paragraph summary"))
