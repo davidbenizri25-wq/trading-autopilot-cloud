@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+from contextlib import nullcontext
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -13,9 +14,11 @@ from dashboard.cockpit import (
     _apply_tracking_action,
     _compact_market_value,
     _safe_analysis_record,
+    _render_advanced,
     _set_active_timeframe,
     _ticker_from_search_choice,
     BREAKDOWN_SECTIONS,
+    advanced_provider_diagnostics,
     build_decision_brief,
     build_home_snapshot,
     build_timeframe_alignment,
@@ -79,6 +82,94 @@ def complete_decision(**overrides):
 
 
 class CockpitContractTests(unittest.TestCase):
+    def test_advanced_provider_diagnostics_are_bounded_and_secrets_safe(self) -> None:
+        secret = "super-secret-provider-key"
+        diagnostics = advanced_provider_diagnostics(
+            {
+                "provider": "Polygon + Massive / Benzinga",
+                "status": "connected",
+                "data_label": "stale",
+                "timestamp": "2026-07-14T14:00:00Z",
+                "data_age_seconds": 320.5,
+                "stale": True,
+                "messages": [
+                    f"HTTP 429 api_key={secret} /Users/person/private/report.json",
+                    "Massive Benzinga earnings failed with HTTP 403",
+                ],
+                "cache_stats": {
+                    "analysis": {"hits": 3, "misses": 2, "loads": 2, "load_errors": 0},
+                    "chart": {"hits": 5, "misses": 4, "loads": 4, "coalesced_waits": 1},
+                },
+                "earnings_status": "unresolved",
+                "earnings_error_kind": "entitlement",
+                "earnings_status_code": 403,
+                "earnings_attempts": 1,
+                "earnings_latency_ms": 42.5,
+                "earnings_throttled": False,
+            },
+            [
+                {
+                    "provider": "Polygon",
+                    "operation": f"https://provider.example/{secret}/AAPL",
+                    "outcome": "error",
+                    "classification": "throttling",
+                    "status_code": 429,
+                    "attempts": 2,
+                    "retries": 1,
+                    "latency_ms": 125.5,
+                    "throttled": True,
+                    "observed_at": "2026-07-14T14:01:00Z",
+                    "symbol": "AAPL",
+                    "api_key": secret,
+                }
+            ],
+        )
+        serialized = json.dumps(diagnostics)
+        for forbidden in [secret, "/Users/person", "provider.example", "AAPL", "api_key"]:
+            self.assertNotIn(forbidden, serialized)
+        self.assertEqual(diagnostics["message_categories"], {"entitlement": 1, "throttling": 1})
+        self.assertEqual(diagnostics["requests"]["throttled_count"], 1)
+        self.assertEqual(diagnostics["requests"]["maximum_latency_ms"], 125.5)
+        self.assertLessEqual(len(diagnostics["requests"]["recent"]), 5)
+
+    def test_presentation_advanced_view_never_reads_provider_diagnostics(self) -> None:
+        class FakeStreamlit:
+            def __init__(self) -> None:
+                self.session_state = {}
+
+            def expander(self, *_args, **_kwargs):
+                return nullcontext()
+
+            def markdown(self, *_args, **_kwargs):
+                return None
+
+            def write(self, *_args, **_kwargs):
+                return None
+
+            def caption(self, *_args, **_kwargs):
+                return None
+
+            def toggle(self, *_args, **_kwargs):
+                return False
+
+        brief = {
+            "source": "Polygon",
+            "ticker": "AAPL",
+            "safe_decision": complete_decision(),
+        }
+        with patch(
+            "dashboard.cockpit.recent_provider_observations",
+            side_effect=AssertionError("presentation mode must not read diagnostics"),
+        ):
+            _render_advanced(
+                FakeStreamlit(),
+                {"provider_health": {}, "tradingview_symbol": "NASDAQ:AAPL"},
+                {},
+                brief,
+                "15m",
+                presentation=True,
+            )
+
     def test_market_ribbon_compacts_provider_unavailable_messages(self) -> None:
         self.assertEqual(
             _compact_market_value("Unavailable from the configured stock feed"),
