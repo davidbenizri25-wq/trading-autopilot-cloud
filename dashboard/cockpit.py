@@ -31,6 +31,7 @@ from autopilot_service import (
 )
 from autopilot_state import AutopilotStateStore, default_state
 from presentation_export import build_presentation_payload, presentation_pdf_bytes
+from polygon_provider import recent_provider_observations
 from timeframes import TIMEFRAME_LABELS, get_timeframe_spec, normalize_timeframe
 from tradingview_integration import (
     normalize_tradingview_symbol,
@@ -516,6 +517,167 @@ def format_timestamp(value: Any) -> str:
 def currentness_label(value: Any) -> str:
     normalized = str(value or "unavailable").strip().lower().replace(" ", "-")
     return CURRENTNESS_LABELS.get(normalized, "Unavailable")
+
+
+def advanced_provider_diagnostics(
+    health: Mapping[str, Any] | None,
+    observations: Optional[list[Mapping[str, Any]]] = None,
+) -> dict[str, Any]:
+    """Build one bounded diagnostics summary without URLs, symbols, payloads, or secrets."""
+
+    source = health if isinstance(health, Mapping) else {}
+    raw_messages = source.get("messages") if isinstance(source.get("messages"), list) else []
+    message_categories: dict[str, int] = {}
+    category_patterns = (
+        ("throttling", (r"\b429\b", r"rate.?limit", r"too many requests")),
+        ("authentication", (r"\b401\b", r"authentication", r"unauthori[sz]ed")),
+        ("entitlement", (r"entitlement", r"not entitled", r"benzinga.*403", r"massive.*403")),
+        ("authorization", (r"\b403\b", r"forbidden", r"authorization")),
+        ("availability", (r"\b5\d\d\b", r"service unavailable", r"bad gateway")),
+        ("timeout", (r"timeout", r"timed out")),
+        ("transport", (r"network", r"connection", r"dns", r"urlerror")),
+        ("invalid_response", (r"invalid response", r"contract mismatch", r"status.?error")),
+    )
+    for raw_message in raw_messages[:20]:
+        message = str(raw_message or "").lower()
+        matched = "other"
+        for category, patterns in category_patterns:
+            if any(re.search(pattern, message) for pattern in patterns):
+                matched = category
+                break
+        message_categories[matched] = message_categories.get(matched, 0) + 1
+
+    cache: dict[str, dict[str, int]] = {}
+    raw_cache = source.get("cache_stats") if isinstance(source.get("cache_stats"), Mapping) else {}
+    cache_fields = ("hits", "misses", "loads", "load_errors", "expirations", "coalesced_waits")
+    for cache_name in ("analysis", "chart"):
+        raw_stats = raw_cache.get(cache_name) if isinstance(raw_cache.get(cache_name), Mapping) else {}
+        cache[cache_name] = {
+            field: max(int(raw_stats[field]), 0)
+            for field in cache_fields
+            if isinstance(raw_stats.get(field), int) and not isinstance(raw_stats.get(field), bool)
+        }
+
+    allowed_classifications = {
+        "success",
+        "throttling",
+        "authentication",
+        "authorization",
+        "entitlement",
+        "request",
+        "not_found",
+        "availability",
+        "timeout",
+        "transport",
+        "client",
+        "invalid_response",
+        "provider_response",
+        "implementation",
+        "provider",
+    }
+    raw_observations = list(observations or [])[-20:]
+    classifications: dict[str, int] = {}
+    outcomes: dict[str, int] = {}
+    total_retries = 0
+    throttled = 0
+    maximum_latency_ms = 0.0
+    recent: list[dict[str, Any]] = []
+    recent_start = max(len(raw_observations) - 5, 0)
+    for observation_index, raw in enumerate(raw_observations):
+        if not isinstance(raw, Mapping):
+            continue
+        classification = str(raw.get("classification") or "provider").strip().lower()
+        if classification not in allowed_classifications:
+            classification = "provider"
+        outcome = str(raw.get("outcome") or "unknown").strip().lower()
+        if outcome not in {"success", "error", "circuit_open", "unknown"}:
+            outcome = "unknown"
+        classifications[classification] = classifications.get(classification, 0) + 1
+        outcomes[outcome] = outcomes.get(outcome, 0) + 1
+        retries = raw.get("retries")
+        if isinstance(retries, int) and not isinstance(retries, bool):
+            total_retries += max(retries, 0)
+        is_throttled = raw.get("throttled") is True
+        throttled += int(is_throttled)
+        latency = _number(raw.get("latency_ms"))
+        if latency is not None and latency >= 0:
+            maximum_latency_ms = max(maximum_latency_ms, latency)
+        if observation_index >= recent_start:
+            status_code = raw.get("status_code")
+            recent.append(
+                {
+                    "classification": classification,
+                    "outcome": outcome,
+                    "status_code": status_code
+                    if isinstance(status_code, int) and not isinstance(status_code, bool)
+                    else None,
+                    "attempts": max(int(raw.get("attempts") or 1), 1)
+                    if isinstance(raw.get("attempts"), int)
+                    and not isinstance(raw.get("attempts"), bool)
+                    else 1,
+                    "retries": max(retries, 0)
+                    if isinstance(retries, int) and not isinstance(retries, bool)
+                    else 0,
+                    "latency_ms": round(latency, 1) if latency is not None and latency >= 0 else None,
+                    "throttled": is_throttled,
+                    "observed_at": format_timestamp(raw.get("observed_at")),
+                }
+            )
+
+    age = _number(source.get("data_age_seconds"))
+    earnings_latency = _number(source.get("earnings_latency_ms"))
+    earnings_error = str(source.get("earnings_error_kind") or "none").strip().lower()
+    allowed_earnings_errors = {
+        "none",
+        "entitlement",
+        "availability",
+        "throttling",
+        "authentication",
+        "authorization",
+        "timeout",
+        "transport",
+        "invalid_response",
+        "provider_response",
+        "implementation",
+        "client",
+    }
+    if earnings_error not in allowed_earnings_errors:
+        earnings_error = "other"
+    return {
+        "provider": public_text(source.get("provider"), "Unavailable", max_length=48),
+        "status": public_text(source.get("status"), "unknown", max_length=24),
+        "currentness": currentness_label(source.get("data_label")),
+        "timestamp": format_timestamp(source.get("timestamp")),
+        "data_age_seconds": round(age, 1) if age is not None and age >= 0 else None,
+        "stale": source.get("stale") is True,
+        "message_categories": dict(sorted(message_categories.items())),
+        "cache": cache,
+        "earnings": {
+            "status": public_text(source.get("earnings_status"), "unresolved", max_length=24),
+            "error_kind": earnings_error,
+            "status_code": source.get("earnings_status_code")
+            if isinstance(source.get("earnings_status_code"), int)
+            and not isinstance(source.get("earnings_status_code"), bool)
+            else None,
+            "attempts": source.get("earnings_attempts")
+            if isinstance(source.get("earnings_attempts"), int)
+            and not isinstance(source.get("earnings_attempts"), bool)
+            else None,
+            "latency_ms": round(earnings_latency, 1)
+            if earnings_latency is not None and earnings_latency >= 0
+            else None,
+            "throttled": source.get("earnings_throttled") is True,
+        },
+        "requests": {
+            "count": len([item for item in raw_observations if isinstance(item, Mapping)]),
+            "classifications": dict(sorted(classifications.items())),
+            "outcomes": dict(sorted(outcomes.items())),
+            "total_retries": total_retries,
+            "throttled_count": throttled,
+            "maximum_latency_ms": round(maximum_latency_ms, 1),
+            "recent": recent,
+        },
+    }
 
 
 def earnings_context_label(decision: Mapping[str, Any] | None) -> str:
@@ -2273,6 +2435,72 @@ def _render_advanced(
         )
         st.write(f"Earnings calendar: {earnings_context_label(brief['safe_decision'])}")
         if not presentation:
+            diagnostics = advanced_provider_diagnostics(
+                health,
+                recent_provider_observations(20),
+            )
+            st.markdown("**Provider diagnostics**")
+            age = diagnostics.get("data_age_seconds")
+            message_categories = diagnostics.get("message_categories") or {}
+            category_text = ", ".join(
+                f"{public_text(name, 'other', max_length=24)} {int(count)}"
+                for name, count in message_categories.items()
+            ) or "none"
+            st.write(
+                f"Data age: {age:.1f}s" if isinstance(age, (int, float)) else "Data age: unavailable"
+            )
+            st.caption(
+                f"Stale flag: {'yes' if diagnostics.get('stale') else 'no'} · "
+                f"Safe provider-warning categories: {category_text}"
+            )
+            for cache_name in ("analysis", "chart"):
+                stats = diagnostics.get("cache", {}).get(cache_name, {})
+                st.caption(
+                    f"{cache_name.title()} cache · hits {int(stats.get('hits') or 0)} · "
+                    f"misses {int(stats.get('misses') or 0)} · loads {int(stats.get('loads') or 0)} · "
+                    f"errors {int(stats.get('load_errors') or 0)} · "
+                    f"coalesced {int(stats.get('coalesced_waits') or 0)}"
+                )
+            requests = diagnostics.get("requests") or {}
+            classifications = requests.get("classifications") or {}
+            classification_text = ", ".join(
+                f"{public_text(name, 'provider', max_length=24)} {int(count)}"
+                for name, count in classifications.items()
+            ) or "none observed"
+            st.caption(
+                f"Provider requests: {int(requests.get('count') or 0)} · "
+                f"retries {int(requests.get('total_retries') or 0)} · "
+                f"throttled {int(requests.get('throttled_count') or 0)} · "
+                f"max latency {float(requests.get('maximum_latency_ms') or 0):.1f}ms · "
+                f"{classification_text}"
+            )
+            for observation in list(requests.get("recent") or [])[-3:]:
+                if not isinstance(observation, Mapping):
+                    continue
+                st.caption(
+                    f"Latest request · {public_text(observation.get('classification'), 'provider', max_length=24)} · "
+                    f"{public_text(observation.get('outcome'), 'unknown', max_length=16)} · "
+                    f"HTTP {observation.get('status_code') if observation.get('status_code') is not None else '—'} · "
+                    f"attempts {int(observation.get('attempts') or 1)} · "
+                    f"{float(observation.get('latency_ms') or 0):.1f}ms"
+                )
+            earnings = diagnostics.get("earnings") or {}
+            earnings_latency = earnings.get("latency_ms")
+            earnings_latency_label = (
+                f"{float(earnings_latency):.1f}ms"
+                if isinstance(earnings_latency, (int, float))
+                else "unavailable"
+            )
+            st.caption(
+                f"Earnings request · {public_text(earnings.get('status'), 'unresolved', max_length=24)} · "
+                f"{public_text(earnings.get('error_kind'), 'none', max_length=24)} · "
+                f"HTTP {earnings.get('status_code') if earnings.get('status_code') is not None else '—'} · "
+                f"attempts {earnings.get('attempts') if earnings.get('attempts') is not None else '—'} · "
+                f"latency {earnings_latency_label}"
+            )
+            st.caption(
+                "Secrets-safe summary only. Provider URLs, symbols, payloads, credentials, prices, and contracts are excluded."
+            )
             persistence = st.session_state.get("_autopilot_persistence_mode")
             st.write("Personal state: saved across sessions" if persistence == "persistent" else "Personal state: this session only")
         st.markdown("**Focused ticker-analysis preset**")
@@ -2544,6 +2772,7 @@ def render_cockpit(st: Any, config: Mapping[str, Any] | Any | None = None) -> No
 
 __all__ = [
     "BREAKDOWN_SECTIONS",
+    "advanced_provider_diagnostics",
     "build_decision_brief",
     "build_home_snapshot",
     "build_timeframe_alignment",
