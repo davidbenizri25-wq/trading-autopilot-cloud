@@ -57,6 +57,7 @@ class ProductUiContractTests(unittest.TestCase):
         self.assertIn("Open {ticker} in TradingView", source)
 
     def test_display_version_is_clean(self) -> None:
+        self.assertEqual(dashboard_app.APP_DISPLAY_VERSION, "2.1.0")
         self.assertNotIn("dev", dashboard_app.APP_DISPLAY_VERSION.lower())
 
     def test_calibration_cards_preserve_mobile_summary(self) -> None:

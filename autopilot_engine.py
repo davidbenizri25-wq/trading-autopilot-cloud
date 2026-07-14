@@ -461,8 +461,11 @@ class DecisionResult:
     full_breakdown: dict[str, str]
     news: list[dict[str, Any]] = field(default_factory=list)
     earnings_date: Optional[str] = None
+    earnings_status: str = "unresolved"
+    earnings_date_status: Optional[str] = None
+    earnings_checked_through: Optional[str] = None
     options: dict[str, Any] = field(default_factory=dict)
-    engine_version: str = "2.0.0"
+    engine_version: str = "2.1.0"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -527,6 +530,7 @@ def _build_breakdown(
     warnings: list[str],
     news: list[dict[str, Any]],
     earnings_date: Optional[str],
+    earnings_status: str,
     earnings_pending: bool,
 ) -> dict[str, str]:
     def tf(*labels: str) -> str:
@@ -544,7 +548,13 @@ def _build_breakdown(
     supply = daily.resistance[:2] if daily else []
     demand = daily.support[:2] if daily else []
     news_text = "; ".join(str(item.get("title", "")) for item in news[:3] if item.get("title")) or "No provider headlines returned."
-    catalyst = f"Next earnings: {earnings_date}." if earnings_date else "Next earnings date unavailable; verify before entry."
+    catalyst = (
+        f"Next earnings: {earnings_date}."
+        if earnings_status == "scheduled" and earnings_date
+        else "No earnings event was returned inside the verified vendor-calendar window."
+        if earnings_status == "verified_none"
+        else "Next earnings date unavailable; verify before entry."
+    )
     reward_text = f"{plan.reward_to_risk:.1f}:1" if plan.reward_to_risk is not None else "unavailable"
     target_labels = ", ".join(
         f"{name.replace('_', ' ').title()}: {basis}" for name, basis in plan.target_basis.items()
@@ -628,6 +638,9 @@ def evaluate_setup(
     average_daily_dollar_volume: Optional[float] = None,
     earnings_date: Optional[str] = None,
     days_to_earnings: Optional[int] = None,
+    earnings_status: Optional[str] = None,
+    earnings_date_status: Optional[str] = None,
+    earnings_checked_through: Optional[str] = None,
     news: Optional[list[dict[str, Any]]] = None,
     provider_warnings: Optional[list[str]] = None,
 ) -> DecisionResult:
@@ -641,7 +654,11 @@ def evaluate_setup(
     }
     analyses = {label: analyze_timeframe(label, rows) for label, rows in normalized_input.items()}
     market = market_context or MarketContext()
-    warnings = list(provider_warnings or [])
+    warnings = (
+        ["Some supporting provider inputs were unavailable; no missing observation was inferred."]
+        if any(str(item or "").strip() for item in list(provider_warnings or []))
+        else []
+    )
     blockers: list[str] = []
     for timeframe in REQUIRED_TIMEFRAMES:
         item = analyses.get(timeframe)
@@ -745,11 +762,43 @@ def evaluate_setup(
             warnings.append("Liquidity is adequate for review but thin for long options.")
     else:
         warnings.append("Average daily dollar volume is unavailable.")
-    if days_to_earnings is not None and 0 <= days_to_earnings <= 3:
+    normalized_earnings_status = str(
+        earnings_status or ("scheduled" if earnings_date else "unresolved")
+    ).strip().lower()
+    if normalized_earnings_status not in {"scheduled", "verified_none", "unresolved"}:
+        normalized_earnings_status = "unresolved"
+    if normalized_earnings_status == "scheduled" and not earnings_date:
+        normalized_earnings_status = "unresolved"
+    if normalized_earnings_status == "verified_none" and earnings_date is not None:
+        normalized_earnings_status = "unresolved"
+    parsed_checked_through = None
+    if earnings_checked_through:
+        try:
+            parsed_checked_through = datetime.fromisoformat(
+                str(earnings_checked_through).strip()
+            ).date()
+        except (TypeError, ValueError):
+            parsed_checked_through = None
+    if normalized_earnings_status == "verified_none" and parsed_checked_through is None:
+        normalized_earnings_status = "unresolved"
+    if normalized_earnings_status == "scheduled":
+        valid_days = (
+            isinstance(days_to_earnings, int)
+            and not isinstance(days_to_earnings, bool)
+            and days_to_earnings >= 0
+        )
+        try:
+            datetime.fromisoformat(str(earnings_date).strip()).date()
+        except (TypeError, ValueError):
+            valid_days = False
+        if not valid_days:
+            normalized_earnings_status = "unresolved"
+
+    if normalized_earnings_status == "scheduled" and days_to_earnings is not None and 0 <= days_to_earnings <= 3:
         blockers.append(f"Earnings are {days_to_earnings} day(s) away, inside the hard catalyst-risk window.")
-    elif days_to_earnings is not None and 0 <= days_to_earnings <= 10:
+    elif normalized_earnings_status == "scheduled" and days_to_earnings is not None and 0 <= days_to_earnings <= 10:
         warnings.append(f"Earnings are {days_to_earnings} day(s) away.")
-    earnings_pending = earnings_date is None
+    earnings_pending = normalized_earnings_status == "unresolved"
     if earnings_pending:
         warnings.append("The next earnings date is unavailable and must be verified before entry.")
     if data_label.lower() in {"unavailable", "stale"}:
@@ -859,6 +908,7 @@ def evaluate_setup(
         warnings,
         news_rows,
         earnings_date,
+        normalized_earnings_status,
         earnings_pending and confirmed,
     )
     timestamp = data_timestamp or (tactical.timestamp if tactical else None) or (daily.timestamp if daily else None)
@@ -896,6 +946,9 @@ def evaluate_setup(
         full_breakdown=breakdown,
         news=news_rows,
         earnings_date=earnings_date,
+        earnings_status=normalized_earnings_status,
+        earnings_date_status=earnings_date_status,
+        earnings_checked_through=earnings_checked_through,
     )
 
 

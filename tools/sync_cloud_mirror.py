@@ -13,18 +13,24 @@ import argparse
 import hashlib
 import json
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 import shutil
+import subprocess
 import sys
 import tempfile
 from typing import Iterable, Sequence
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+LEGACY_SCHEMA_VERSION = 1
 DEFAULT_MANIFEST = Path("deploy/cloud_manifest.txt")
 STATE_RELATIVE_PATH = PurePosixPath("deploy/.cloud-mirror-state.json")
 MODES = ("dry-run", "check", "apply")
+
+_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+_REPOSITORY_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
 _DENIED_PARTS = {
     ".aws",
@@ -53,6 +59,15 @@ class SyncPlan:
     @property
     def has_drift(self) -> bool:
         return bool(self.copy_paths or self.delete_paths or self.state_needs_update)
+
+
+@dataclass(frozen=True)
+class SourceProvenance:
+    """Canonical identity recorded with every generated mirror state."""
+
+    canonical_repository: str
+    canonical_commit: str
+    version: str
 
 
 def _is_relative_to(path: Path, root: Path) -> bool:
@@ -147,6 +162,122 @@ def _validate_roots(source_root: Path, target_root: Path) -> tuple[Path, Path]:
     return source_root, target_root
 
 
+def _run_git(source_root: Path, *arguments: str, required: bool = True) -> str | None:
+    """Run one read-only Git query without invoking a shell."""
+
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(source_root), *arguments],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError as exc:
+        if required:
+            raise SyncError("Git is required to verify canonical source provenance.") from exc
+        return None
+    if completed.returncode != 0:
+        if required:
+            raise SyncError("Canonical source Git metadata could not be verified.")
+        return None
+    return completed.stdout.strip()
+
+
+def _repository_name_from_remote(remote: str) -> str:
+    value = str(remote or "").strip().rstrip("/")
+    if value.endswith(".git"):
+        value = value[:-4]
+    match = re.fullmatch(
+        r"https://github\.com/(?P<repository>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)",
+        value,
+    )
+    if match is None:
+        match = re.fullmatch(
+            r"(?:ssh://)?git@[^/:]+(?::|/)(?P<repository>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)",
+            value,
+        )
+    if not match:
+        raise SyncError("Canonical origin must be an HTTPS or SSH GitHub repository URL.")
+    return match.group("repository")
+
+
+def _validate_provenance(provenance: SourceProvenance) -> SourceProvenance:
+    repository = str(provenance.canonical_repository or "").strip()
+    commit = str(provenance.canonical_commit or "").strip().lower()
+    version = str(provenance.version or "").strip()
+    if not _REPOSITORY_RE.fullmatch(repository):
+        raise SyncError("Canonical repository provenance is invalid.")
+    if not _COMMIT_RE.fullmatch(commit):
+        raise SyncError("Canonical commit provenance must be a full 40-character SHA.")
+    if not version or len(version) > 128 or any(ord(character) < 32 for character in version):
+        raise SyncError("Canonical VERSION provenance is missing or invalid.")
+    return SourceProvenance(repository, commit, version)
+
+
+def _read_version(source_root: Path) -> str:
+    version_path = source_root / "VERSION"
+    if not version_path.is_file() or version_path.is_symlink():
+        raise SyncError("Canonical VERSION is missing or unsafe.")
+    try:
+        return version_path.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise SyncError("Canonical VERSION could not be read.") from exc
+
+
+def _source_provenance(
+    source_root: Path,
+    *,
+    mode: str,
+    source_commit: str | None,
+    canonical_repository: str | None,
+    allow_non_git_source: bool,
+) -> SourceProvenance:
+    """Resolve and verify the exact clean canonical source for this release."""
+
+    git_top = _run_git(source_root, "rev-parse", "--show-toplevel", required=False)
+    if git_top is None:
+        if not allow_non_git_source:
+            raise SyncError("Canonical source must be a Git checkout.")
+        if not source_commit or not canonical_repository:
+            raise SyncError("Non-Git test sources require explicit provenance.")
+        return _validate_provenance(
+            SourceProvenance(canonical_repository, source_commit, _read_version(source_root))
+        )
+
+    if Path(git_top).resolve() != source_root.resolve():
+        raise SyncError("Canonical source root must be the Git worktree root.")
+    head = str(_run_git(source_root, "rev-parse", "HEAD") or "").lower()
+    expected = str(source_commit or "").strip().lower()
+    if expected:
+        if not _COMMIT_RE.fullmatch(expected):
+            raise SyncError("--source-commit must be a full 40-character SHA.")
+        resolved = str(
+            _run_git(source_root, "rev-parse", "--verify", f"{expected}^{{commit}}") or ""
+        ).lower()
+        if resolved != head:
+            raise SyncError("Canonical HEAD does not match --source-commit.")
+    elif mode in {"apply", "check"}:
+        raise SyncError("--source-commit is required for apply and check modes.")
+
+    if mode in {"apply", "check"}:
+        status = _run_git(
+            source_root,
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+        )
+        if status:
+            raise SyncError("Canonical source is dirty; commit or remove all changes first.")
+
+    repository = canonical_repository
+    if not repository:
+        remote = _run_git(source_root, "remote", "get-url", "origin")
+        repository = _repository_name_from_remote(str(remote or ""))
+    return _validate_provenance(
+        SourceProvenance(str(repository), head, _read_version(source_root))
+    )
+
+
 def _safe_target_path(target_root: Path, relative_path: str | PurePosixPath) -> Path:
     relative = (
         relative_path
@@ -189,9 +320,15 @@ def _load_previous_state(target_root: Path) -> dict[str, object] | None:
         state = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise SyncError(f"Mirror state is unreadable; refusing deletions: {path}") from exc
-    if not isinstance(state, dict) or state.get("schema_version") != SCHEMA_VERSION:
+    if not isinstance(state, dict) or state.get("schema_version") not in {
+        LEGACY_SCHEMA_VERSION,
+        SCHEMA_VERSION,
+    }:
         raise SyncError("Mirror state has an unsupported schema; refusing deletions.")
+    schema_version = int(state["schema_version"])
     expected_keys = {"schema_version", "managed_paths", "manifest_sha256", "files"}
+    if schema_version == SCHEMA_VERSION:
+        expected_keys.update({"canonical_repository", "canonical_commit", "version"})
     if set(state) != expected_keys:
         raise SyncError("Mirror state has an invalid shape; refusing deletions.")
     managed_paths = state.get("managed_paths")
@@ -218,15 +355,35 @@ def _load_previous_state(target_root: Path) -> dict[str, object] | None:
     expected_manifest_hash = hashlib.sha256("\n".join(normalized).encode("utf-8")).hexdigest()
     if state.get("manifest_sha256") != expected_manifest_hash:
         raise SyncError("Mirror state manifest hash is invalid; refusing deletions.")
-    return {
-        "schema_version": SCHEMA_VERSION,
+    normalized_state: dict[str, object] = {
+        "schema_version": schema_version,
         "managed_paths": normalized,
         "manifest_sha256": expected_manifest_hash,
         "files": {relative: files[relative] for relative in normalized},
     }
+    if schema_version == SCHEMA_VERSION:
+        provenance = _validate_provenance(
+            SourceProvenance(
+                str(state.get("canonical_repository") or ""),
+                str(state.get("canonical_commit") or ""),
+                str(state.get("version") or ""),
+            )
+        )
+        normalized_state.update(
+            {
+                "canonical_repository": provenance.canonical_repository,
+                "canonical_commit": provenance.canonical_commit,
+                "version": provenance.version,
+            }
+        )
+    return normalized_state
 
 
-def _desired_state(source_root: Path, managed_paths: Sequence[str]) -> dict[str, object]:
+def _desired_state(
+    source_root: Path,
+    managed_paths: Sequence[str],
+    provenance: SourceProvenance,
+) -> dict[str, object]:
     files = {
         relative: _sha256(source_root.joinpath(*PurePosixPath(relative).parts))
         for relative in managed_paths
@@ -234,6 +391,9 @@ def _desired_state(source_root: Path, managed_paths: Sequence[str]) -> dict[str,
     manifest_payload = "\n".join(managed_paths).encode("utf-8")
     return {
         "schema_version": SCHEMA_VERSION,
+        "canonical_repository": provenance.canonical_repository,
+        "canonical_commit": provenance.canonical_commit,
+        "version": provenance.version,
         "managed_paths": list(managed_paths),
         "manifest_sha256": hashlib.sha256(manifest_payload).hexdigest(),
         "files": files,
@@ -245,10 +405,11 @@ def build_plan(
     target_root: Path,
     managed_paths: Sequence[str],
     previous_state: dict[str, object] | None,
+    provenance: SourceProvenance,
 ) -> tuple[SyncPlan, dict[str, object]]:
     """Compare source, target, and prior ownership state without mutating files."""
 
-    desired_state = _desired_state(source_root, managed_paths)
+    desired_state = _desired_state(source_root, managed_paths, provenance)
     copy_paths: list[str] = []
     unchanged_paths: list[str] = []
     for relative in managed_paths:
@@ -370,16 +531,30 @@ def run_sync(
     target_root: Path,
     manifest_path: Path,
     mode: str,
+    source_commit: str | None = None,
+    canonical_repository: str | None = None,
+    allow_non_git_source: bool = False,
 ) -> SyncPlan:
     """Plan, check, or apply one canonical-to-cloud reconciliation."""
 
     if mode not in MODES:
         raise SyncError(f"Unknown mode {mode!r}; choose one of {', '.join(MODES)}.")
     source_root, target_root = _validate_roots(source_root, target_root)
+    provenance = _source_provenance(
+        source_root,
+        mode=mode,
+        source_commit=source_commit,
+        canonical_repository=canonical_repository,
+        allow_non_git_source=allow_non_git_source,
+    )
     managed_paths = load_manifest(source_root, manifest_path)
     previous_state = _load_previous_state(target_root)
     plan, desired_state = build_plan(
-        source_root, target_root, managed_paths, previous_state
+        source_root,
+        target_root,
+        managed_paths,
+        previous_state,
+        provenance,
     )
     if mode == "apply":
         apply_plan(source_root, target_root, plan, desired_state)
@@ -407,6 +582,10 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         required=True,
         help="Absolute path to the separately checked out public cloud repository.",
     )
+    parser.add_argument(
+        "--source-commit",
+        help="Exact full canonical HEAD SHA; required for apply and check modes.",
+    )
     parser.add_argument("--mode", choices=MODES, default="dry-run")
     return parser.parse_args(argv)
 
@@ -426,6 +605,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             target_root=target_argument,
             manifest_path=manifest_path,
             mode=args.mode,
+            source_commit=args.source_commit,
         )
     except SyncError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

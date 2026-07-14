@@ -1,7 +1,9 @@
-"""Shared bankroll and risk caps for Trading Autopilot.
+"""Private-configurable bankroll and risk caps for Trading Autopilot.
 
 Decision support only. These values constrain scanners and review lists; they
-do not connect to brokers or place orders.
+do not connect to brokers or place orders. Built-in values are deliberately
+zero so a missing private config fails closed instead of publishing or
+silently inventing personal financial limits.
 """
 
 from __future__ import annotations
@@ -16,18 +18,18 @@ CONFIG_PATH = ROOT / "config" / "risk_config.json"
 
 
 DEFAULT_RISK_CONFIG: dict[str, float] = {
-    "options_bankroll": 1000,
-    "shares_bankroll": 2500,
-    "normal_option_premium_min": 50,
-    "normal_option_premium_max": 75,
-    "a_plus_option_premium_max": 100,
-    "zero_dte_option_premium_max": 40,
-    "total_open_options_exposure_max": 150,
-    "normal_share_risk_max": 50,
-    "a_plus_share_risk_max": 75,
-    "daily_combined_hard_stop": 125,
-    "weekly_combined_hard_stop": 350,
-    "review_drawdown": 500,
+    "options_bankroll": 0.0,
+    "shares_bankroll": 0.0,
+    "normal_option_premium_min": 0.0,
+    "normal_option_premium_max": 0.0,
+    "a_plus_option_premium_max": 0.0,
+    "zero_dte_option_premium_max": 0.0,
+    "total_open_options_exposure_max": 0.0,
+    "normal_share_risk_max": 0.0,
+    "a_plus_share_risk_max": 0.0,
+    "daily_combined_hard_stop": 0.0,
+    "weekly_combined_hard_stop": 0.0,
+    "review_drawdown": 0.0,
 }
 
 
@@ -47,4 +49,3 @@ def load_risk_config(path: Path | str = CONFIG_PATH) -> dict[str, float]:
 
 
 RISK_CONFIG = load_risk_config()
-

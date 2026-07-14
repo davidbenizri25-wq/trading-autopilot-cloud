@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import json
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from urllib.error import HTTPError
 from urllib.parse import parse_qs, urlsplit
+from urllib.request import Request
 
 from polygon_provider import (
     AmbiguousSymbolError,
@@ -13,11 +14,16 @@ from polygon_provider import (
     PolygonProvider,
     PolygonProviderError,
     build_aggregates_url,
+    build_earnings_calendar_url,
     build_polygon_url,
     build_stock_snapshots_url,
+    fetch_1m_bars,
+    fetch_3m_bars,
     fetch_15m_bars,
+    fetch_30m_bars,
     fetch_5m_bars,
     fetch_daily_bars,
+    fetch_earnings_context,
     fetch_market_status,
     fetch_options_chain_snapshot,
     fetch_stock_snapshots,
@@ -49,6 +55,15 @@ class FakeResponse:
 
     def read(self) -> bytes:
         return json.dumps(self.payload).encode("utf-8")
+
+
+class RawResponse(FakeResponse):
+    def __init__(self, payload: bytes) -> None:
+        self.raw_payload = payload
+        self.closed = False
+
+    def read(self) -> bytes:
+        return self.raw_payload
 
 
 def epoch_ms(value: datetime) -> int:
@@ -130,6 +145,210 @@ class PolygonTickerAndUrlTests(unittest.TestCase):
         safe = redact_sensitive_text(message, API_KEY)
         self.assertNotIn("unit-secret", safe)
         self.assertIn("[redacted]", safe)
+
+
+class PolygonEarningsCalendarTests(unittest.TestCase):
+    START = date(2026, 7, 14)
+    END = date(2026, 7, 24)
+    CHECKED_AT = datetime(2026, 7, 14, 12, 30, tzinfo=timezone.utc)
+
+    def test_calendar_url_uses_exact_filters_and_contains_no_credentials(self) -> None:
+        url = build_earnings_calendar_url("NASDAQ:AAPL", self.START, self.END)
+        parsed = urlsplit(url)
+        query = parse_qs(parsed.query)
+
+        self.assertEqual(parsed.scheme, "https")
+        self.assertEqual(parsed.hostname, "api.massive.com")
+        self.assertEqual(parsed.path, "/benzinga/v1/earnings")
+        self.assertEqual(query["ticker"], ["AAPL"])
+        self.assertEqual(query["date.gte"], [self.START.isoformat()])
+        self.assertEqual(query["date.lte"], [self.END.isoformat()])
+        self.assertEqual(query["sort"], ["date.asc"])
+        self.assertEqual(query["limit"], ["50000"])
+        self.assertNotIn("apiKey", query)
+        self.assertNotIn(API_KEY, url)
+
+    def test_scheduled_events_keep_projected_and_confirmed_status_conservative(self) -> None:
+        cases = [
+            (
+                "projected earliest",
+                [
+                    {"ticker": "AAPL", "date": "2026-07-18", "date_status": "projected"},
+                    {"ticker": "AAPL", "date": "2026-07-21", "date_status": "confirmed"},
+                ],
+                date(2026, 7, 18),
+                "projected",
+            ),
+            (
+                "confirmed only",
+                [{"ticker": "AAPL", "date": "2026-07-20", "date_status": "confirmed"}],
+                date(2026, 7, 20),
+                "confirmed",
+            ),
+        ]
+        for label, rows, expected_date, expected_status in cases:
+            with self.subTest(label=label):
+                result = fetch_earnings_context(
+                    "AAPL",
+                    self.START,
+                    self.END,
+                    API_KEY,
+                    checked_at=self.CHECKED_AT,
+                    opener=lambda _request, rows=rows: FakeResponse(
+                        {"status": "OK", "count": len(rows), "results": rows}
+                    ),
+                )
+
+                self.assertEqual(result.status, "scheduled")
+                self.assertEqual(result.date, expected_date)
+                self.assertEqual(result.date_status, expected_status)
+                self.assertEqual(result.checked_at, self.CHECKED_AT)
+                self.assertEqual(result.checked_through, self.END)
+
+    def test_successful_empty_window_is_verified_none(self) -> None:
+        result = fetch_earnings_context(
+            "AAPL",
+            self.START,
+            self.END,
+            API_KEY,
+            checked_at=self.CHECKED_AT,
+            opener=lambda _request: FakeResponse(
+                {"status": "OK", "count": 0, "results": []}
+            ),
+        )
+
+        self.assertEqual(result.status, "verified_none")
+        self.assertIsNone(result.date)
+        self.assertIsNone(result.date_status)
+        self.assertEqual(result.checked_through, self.END)
+        self.assertIn("successful", str(result.message).lower())
+
+    def test_authorization_uses_bearer_header_never_url_or_result(self) -> None:
+        seen: list[Request] = []
+
+        def opener(request: Request) -> FakeResponse:
+            seen.append(request)
+            return FakeResponse({"status": "OK", "count": 0, "results": []})
+
+        result = fetch_earnings_context(
+            "AAPL",
+            self.START,
+            self.END,
+            API_KEY,
+            opener=opener,
+            checked_at=self.CHECKED_AT,
+        )
+
+        self.assertEqual(len(seen), 1)
+        self.assertIsInstance(seen[0], Request)
+        self.assertEqual(seen[0].get_header("Authorization"), f"Bearer {API_KEY}")
+        self.assertEqual(seen[0].get_header("Accept"), "application/json")
+        self.assertNotIn(API_KEY, seen[0].full_url)
+        self.assertNotIn(API_KEY, json.dumps(result.to_dict(), sort_keys=True))
+
+    def test_ten_day_checked_through_window_is_supplied_by_caller(self) -> None:
+        end = self.START + timedelta(days=10)
+        seen: list[Request] = []
+
+        def opener(request: Request) -> FakeResponse:
+            seen.append(request)
+            return FakeResponse({"status": "OK", "count": 0, "results": []})
+
+        result = fetch_earnings_context(
+            "AAPL",
+            self.START,
+            end,
+            API_KEY,
+            opener=opener,
+            checked_at=self.CHECKED_AT,
+        )
+
+        query = parse_qs(urlsplit(seen[0].full_url).query)
+        self.assertEqual((end - self.START).days, 10)
+        self.assertEqual(query["date.gte"], [self.START.isoformat()])
+        self.assertEqual(query["date.lte"], [end.isoformat()])
+        self.assertEqual(result.checked_through, end)
+
+    def test_transport_and_payload_failures_remain_unresolved(self) -> None:
+        def forbidden(request: Request) -> FakeResponse:
+            raise HTTPError(request.full_url, 403, "forbidden", None, None)
+
+        def network_failure(_request: Request) -> FakeResponse:
+            raise TimeoutError(f"network failed with {API_KEY}")
+
+        cases = [
+            ("http 403", forbidden),
+            ("network", network_failure),
+            ("malformed json", lambda _request: RawResponse(b"{not-json")),
+            ("missing results", lambda _request: FakeResponse({"status": "OK", "count": 0})),
+        ]
+        for label, opener in cases:
+            with self.subTest(label=label):
+                result = fetch_earnings_context(
+                    "AAPL",
+                    self.START,
+                    self.END,
+                    API_KEY,
+                    opener=opener,
+                    checked_at=self.CHECKED_AT,
+                )
+
+                self.assertEqual(result.status, "unresolved")
+                self.assertIsNone(result.date)
+                self.assertIsNone(result.date_status)
+                self.assertEqual(result.checked_through, self.END)
+                self.assertNotIn(API_KEY, json.dumps(result.to_dict(), sort_keys=True))
+
+    def test_filter_leakage_remains_unresolved(self) -> None:
+        leaked_rows = [
+            {"ticker": "MSFT", "date": "2026-07-18", "date_status": "confirmed"},
+            {"ticker": "AAPL", "date": "2026-08-01", "date_status": "confirmed"},
+            {"ticker": "AAPL", "date": "2026-07-18", "date_status": "estimated"},
+        ]
+        for row in leaked_rows:
+            with self.subTest(row=row):
+                result = fetch_earnings_context(
+                    "AAPL",
+                    self.START,
+                    self.END,
+                    API_KEY,
+                    opener=lambda _request, row=row: FakeResponse(
+                        {"status": "OK", "count": 1, "results": [row]}
+                    ),
+                    checked_at=self.CHECKED_AT,
+                )
+
+                self.assertEqual(result.status, "unresolved")
+                self.assertIsNone(result.date)
+                self.assertIsNone(result.date_status)
+
+    def test_incomplete_pagination_remains_unresolved(self) -> None:
+        next_url = (
+            "https://api.massive.com/benzinga/v1/earnings?"
+            "ticker=AAPL&date.gte=2026-07-14&date.lte=2026-07-24&cursor=next"
+        )
+        result = fetch_earnings_context(
+            "AAPL",
+            self.START,
+            self.END,
+            API_KEY,
+            opener=lambda _request: FakeResponse(
+                {
+                    "status": "OK",
+                    "count": 0,
+                    "results": [],
+                    "next_url": next_url,
+                }
+            ),
+            checked_at=self.CHECKED_AT,
+            max_pages=1,
+        )
+
+        self.assertEqual(result.status, "unresolved")
+        self.assertIsNone(result.date)
+        self.assertIsNone(result.date_status)
+        self.assertEqual(result.checked_through, self.END)
+        self.assertIn("page limit", str(result.message).lower())
 
 
 class PolygonReferenceAndAggregateTests(unittest.TestCase):
@@ -295,6 +514,96 @@ class PolygonReferenceAndAggregateTests(unittest.TestCase):
         bars = fetch_5m_bars("AAPL", "2026-07-01", "2026-07-02", "test-key", opener=opener)
         self.assertEqual(bars[0].timeframe, "5m")
         self.assertIn("/range/5/minute/", seen[0])
+
+    def test_every_intraday_source_fetch_uses_exact_polygon_range_and_label(self) -> None:
+        cases = [
+            ("1m", fetch_1m_bars, "/range/1/minute/"),
+            ("3m", fetch_3m_bars, "/range/3/minute/"),
+            ("5m", fetch_5m_bars, "/range/5/minute/"),
+            ("15m", fetch_15m_bars, "/range/15/minute/"),
+            ("30m", fetch_30m_bars, "/range/30/minute/"),
+        ]
+        for timeframe, fetcher, expected_path in cases:
+            with self.subTest(timeframe=timeframe):
+                seen: list[str] = []
+
+                def opener(url: str) -> FakeResponse:
+                    seen.append(url)
+                    return FakeResponse(
+                        {
+                            "status": "OK",
+                            "results": [
+                                {
+                                    "t": 1_700_000_000_000,
+                                    "o": 100,
+                                    "h": 102,
+                                    "l": 99,
+                                    "c": 101,
+                                    "v": 10_000,
+                                    "vw": 100.75,
+                                    "n": 42,
+                                }
+                            ],
+                        }
+                    )
+
+                bars = fetcher(
+                    "AAPL", "2026-07-01", "2026-07-02", "test-key", opener=opener
+                )
+                self.assertEqual(len(bars), 1)
+                self.assertEqual(bars[0].timeframe, timeframe)
+                self.assertEqual(bars[0].vwap, 100.75)
+                self.assertEqual(bars[0].transactions, 42)
+                self.assertIn(expected_path, seen[0])
+
+    def test_monthly_label_is_never_misread_as_one_minute_source(self) -> None:
+        with self.assertRaisesRegex(ValueError, "Polygon source timeframe"):
+            build_aggregates_url(
+                "AAPL", "1M", "2026-07-01", "2026-07-02", "test-key"
+            )
+
+    def test_provider_exposes_new_intraday_source_methods(self) -> None:
+        seen: list[str] = []
+
+        def opener(url: str) -> FakeResponse:
+            seen.append(url)
+            return FakeResponse(
+                {
+                    "status": "OK",
+                    "results": [
+                        {
+                            "t": 1_700_000_000_000,
+                            "o": 100,
+                            "h": 101,
+                            "l": 99,
+                            "c": 100.5,
+                            "v": 10_000,
+                        }
+                    ],
+                }
+            )
+
+        provider = PolygonProvider("test-key", opener=opener)
+        self.assertEqual(
+            provider.bars_1m("AAPL", "2026-07-01", "2026-07-02")[0].timeframe,
+            "1m",
+        )
+        self.assertEqual(
+            provider.bars_3m("AAPL", "2026-07-01", "2026-07-02")[0].timeframe,
+            "3m",
+        )
+        self.assertEqual(
+            provider.bars_30m("AAPL", "2026-07-01", "2026-07-02")[0].timeframe,
+            "30m",
+        )
+        self.assertEqual(
+            [urlsplit(url).path for url in seen],
+            [
+                "/v2/aggs/ticker/AAPL/range/1/minute/2026-07-01/2026-07-02",
+                "/v2/aggs/ticker/AAPL/range/3/minute/2026-07-01/2026-07-02",
+                "/v2/aggs/ticker/AAPL/range/30/minute/2026-07-01/2026-07-02",
+            ],
+        )
 
     def test_aggregate_fetch_rejects_silent_truncation(self) -> None:
         payload = {

@@ -102,8 +102,9 @@ from tradingview_integration import (
 )
 
 
-APP_VERSION = "1.5.4-mobile-calibration-warning-polish-dev"
-APP_DISPLAY_VERSION = "1.5.4"
+APP_VERSION = "2.1.0-premium-terminal"
+APP_DISPLAY_VERSION = "2.1.0"
+PRIVATE_STATE_OPT_IN_KEY = "AUTOPILOT_PRIVATE_STATE_ENABLED"
 SAMPLE_WARNING = "SAMPLE/EXAMPLE DATA ONLY — NOT LIVE MARKET DATA"
 LEGACY_SAMPLE_WARNING = "SAMPLE DATA ONLY — NOT LIVE MARKET DATA"
 USER_SUPPLIED_WARNING = "USER-SUPPLIED DATA — VERIFY MANUALLY BEFORE ANY TRADING DECISION"
@@ -1756,6 +1757,19 @@ def _configured_access_code(st: Any) -> str | None:
     return access_code or None
 
 
+def _private_state_opted_in(st: Any) -> bool:
+    """Require an explicit deployment opt-in before enabling shared disk state."""
+
+    value = None
+    try:
+        value = st.secrets.get(PRIVATE_STATE_OPT_IN_KEY)
+    except Exception:
+        value = None
+    if value in (None, ""):
+        value = os.environ.get(PRIVATE_STATE_OPT_IN_KEY)
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _require_streamlit_access(st: Any) -> None:
     access_code = _configured_access_code(st)
     if not access_code:
@@ -2919,6 +2933,12 @@ def _show_daily_review(st: Any, rows: list[dict[str, Any]], sections: dict[str, 
 def _market_data_config_from_streamlit(st: Any) -> dict[str, str]:
     secrets = getattr(st, "secrets", None)
     config = get_market_data_provider_config(secrets=secrets, environ=os.environ)
+    # Persistent state is shared by every session using the same server-side
+    # file. Keep it disabled unless the deployment explicitly opts into private
+    # state and also protects the app with an access code.
+    if not (_private_state_opted_in(st) and _configured_access_code(st)):
+        return config
+    config["AUTOPILOT_PRIVATE_STATE_ENABLED"] = "true"
     for key in ("AUTOPILOT_STATE_PATH", "AUTOPILOT_STATE_ALLOWED_ROOT"):
         value = None
         try:
@@ -2929,7 +2949,7 @@ def _market_data_config_from_streamlit(st: Any) -> dict[str, str]:
             value = os.environ.get(key)
         if value:
             config[key] = str(value).strip()
-    if _configured_access_code(st) and not config.get("AUTOPILOT_STATE_PATH"):
+    if not config.get("AUTOPILOT_STATE_PATH"):
         config["AUTOPILOT_STATE_PATH"] = str(ROOT / "data" / ".autopilot_state.json")
         config["AUTOPILOT_STATE_ALLOWED_ROOT"] = str(ROOT / "data")
     return config

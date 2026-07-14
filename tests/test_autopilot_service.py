@@ -1,19 +1,27 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 import unittest
+from unittest.mock import Mock, patch
 
+from autopilot_engine import MarketContext, evaluate_setup as evaluate_engine_setup
 from autopilot_service import (
+    AutopilotServiceError,
+    _CHART_DATA_CACHE,
+    _bar_completion_time,
+    _chart_frames_from_engine_frames,
     TTLCache,
+    analyze_symbol,
     _completed_bars,
     _data_label,
     _frames_for_symbol,
     _latest_timestamp,
     _option_contract_input,
+    load_chart_bars,
     sector_etf_for_security,
     unavailable_result,
 )
-from polygon_provider import OHLCVBar, ResolvedTicker
+from polygon_provider import EarningsContext, OHLCVBar, ResolvedTicker
 
 
 class AutopilotServiceTests(unittest.TestCase):
@@ -31,6 +39,27 @@ class AutopilotServiceTests(unittest.TestCase):
             share_class_figi=None,
             last_updated=None,
         )
+
+    def _provider(self, earnings: EarningsContext) -> Mock:
+        provider = Mock()
+        provider.resolve_symbol.return_value = self._security("AAPL")
+        provider.market_status.return_value = Mock(market="open")
+        provider.news.return_value = []
+        provider.earnings_context.return_value = earnings
+        return provider
+
+    def _frames(self) -> dict[str, list[dict[str, object]]]:
+        row = {
+            "timestamp": "2030-07-02T14:30:00+00:00",
+            "open": 100,
+            "high": 101,
+            "low": 99,
+            "close": 100.5,
+            "volume": 1_000,
+            "timeframe": "15m",
+            "complete": True,
+        }
+        return {"15M": [row], "1D": [row]}
 
     def test_sector_override(self) -> None:
         self.assertEqual(sector_etf_for_security(self._security("AAPL")), "XLK")
@@ -64,6 +93,14 @@ class AutopilotServiceTests(unittest.TestCase):
         )
         self.assertEqual(latest, completed_15m.timestamp + timedelta(minutes=15))
 
+    def test_minute_and_month_completion_labels_do_not_collide(self) -> None:
+        started = datetime(2030, 7, 2, 14, 30, tzinfo=timezone.utc)
+        self.assertEqual(_bar_completion_time(started, "1m"), started + timedelta(minutes=1))
+        self.assertEqual(
+            _bar_completion_time(started, "1M"),
+            datetime(2030, 8, 1, 4, 0, tzinfo=timezone.utc),
+        )
+
     def test_service_preserves_completed_five_minute_frame(self) -> None:
         now = datetime(2030, 7, 2, 15, 7, tzinfo=timezone.utc)
         completed = OHLCVBar(now - timedelta(minutes=7), 100, 101, 99, 100.5, 1_000, "5m")
@@ -92,6 +129,271 @@ class AutopilotServiceTests(unittest.TestCase):
         self.assertEqual(cache.get_or_create("x", lambda: calls.append(1) or {"value": 3}), {"value": 3})
         self.assertEqual(cache.get_or_create("x", lambda: calls.append(2) or {"value": 4}), {"value": 3})
         self.assertEqual(calls, [1])
+
+    def test_chart_frame_keys_use_exact_ui_labels_without_mutating_sources(self) -> None:
+        frames = {
+            "5M": [{"timestamp": "2030-07-02T14:30:00+00:00", "close": 100}],
+            "1M": [{"timestamp": "2030-07-01T04:00:00+00:00", "close": 90}],
+        }
+        output = _chart_frames_from_engine_frames(frames)
+        self.assertEqual(set(output), {"5m", "1M"})
+        output["5m"][0]["close"] = 999
+        self.assertEqual(frames["5M"][0]["close"], 100)
+
+    def test_lazy_chart_interval_filters_forming_bar_and_reuses_cache(self) -> None:
+        now = datetime(2030, 7, 2, 15, 7, tzinfo=timezone.utc)
+        completed = OHLCVBar(now - timedelta(minutes=2), 100, 101, 99, 100.5, 1_000, "1m")
+        forming = OHLCVBar(now - timedelta(seconds=30), 100.5, 102, 100, 101, 900, "1m")
+
+        class Provider:
+            calls = 0
+
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def bars_1m(self, *_args):
+                Provider.calls += 1
+                return [completed, forming]
+
+        _CHART_DATA_CACHE.clear()
+        with patch("autopilot_service.PolygonProvider", Provider):
+            first = load_chart_bars("aapl", "1m", "test-key", now=now)
+            first[0]["close"] = 999
+            second = load_chart_bars("AAPL", "1m", "test-key", now=now)
+        self.assertEqual(Provider.calls, 1)
+        self.assertEqual(len(second), 1)
+        self.assertEqual(second[0]["close"], 100.5)
+        self.assertEqual(second[0]["timeframe"], "1m")
+        self.assertTrue(second[0]["complete"])
+
+    def test_four_hour_chart_uses_registry_lookback_and_real_resampling(self) -> None:
+        now = datetime(2030, 7, 2, 19, 0, tzinfo=timezone.utc)
+        started = datetime(2030, 7, 2, 13, 30, tzinfo=timezone.utc)
+        source = [
+            OHLCVBar(
+                started + timedelta(minutes=15 * index),
+                100 + index,
+                101 + index,
+                99 + index,
+                100.5 + index,
+                1_000 + index,
+                "15m",
+            )
+            for index in range(20)
+        ]
+
+        class Provider:
+            requested_start = None
+
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def bars_15m(self, _ticker, start, _end):
+                Provider.requested_start = start
+                return source
+
+        _CHART_DATA_CACHE.clear()
+        with patch("autopilot_service.PolygonProvider", Provider):
+            rows = load_chart_bars("AAPL", "4H", "test-key", now=now)
+        self.assertEqual(Provider.requested_start, (now - timedelta(days=730)).date())
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["timeframe"], "4H")
+        self.assertEqual(rows[0]["open"], 100)
+        self.assertEqual(rows[0]["close"], 115.5)
+
+    def test_selected_chart_interval_does_not_mutate_mtf_decision(self) -> None:
+        now = datetime(2030, 7, 2, 15, 7, tzinfo=timezone.utc)
+        resolved = self._security("AAPL")
+        provider = unittest.mock.Mock()
+        provider.resolve_symbol.return_value = resolved
+        provider.market_status.return_value = unittest.mock.Mock(market="open")
+        provider.news.return_value = []
+        base_row = {
+            "timestamp": "2030-07-02T14:30:00+00:00",
+            "open": 100,
+            "high": 101,
+            "low": 99,
+            "close": 100.5,
+            "volume": 1_000,
+            "timeframe": "15m",
+            "complete": True,
+        }
+        selected_row = dict(base_row, timeframe="1m")
+        frames = {"15M": [base_row], "1D": [base_row]}
+        decision = unavailable_result("AAPL", "fixture")
+        decision_snapshot = decision.to_dict()
+
+        with (
+            patch("autopilot_service.PolygonProvider", return_value=provider),
+            patch("autopilot_service._frames_for_symbol", return_value=(frames, [])),
+            patch(
+                "autopilot_service._market_context",
+                return_value=(MarketContext(regime="mixed"), {}, []),
+            ),
+            patch("autopilot_service.evaluate_setup", return_value=decision),
+            patch("autopilot_service.load_chart_bars", return_value=[selected_row]),
+        ):
+            result = analyze_symbol(
+                "AAPL",
+                "test-key",
+                now=now,
+                include_options=False,
+                selected_timeframe="1m",
+            )
+
+        self.assertEqual(decision.to_dict(), decision_snapshot)
+        self.assertEqual(result.selected_timeframe, "1m")
+        self.assertEqual(result.chart_bars, [selected_row])
+        self.assertEqual(set(result.chart_frames), {"15m", "1D", "1m"})
+        self.assertIn("interval=1", result.tradingview_url)
+        serialized = result.to_dict()
+        self.assertEqual(serialized["selected_timeframe"], "1m")
+        self.assertEqual(serialized["chart_frames"]["1m"], [selected_row])
+
+    def test_chart_loader_rejects_missing_or_unknown_inputs(self) -> None:
+        with self.assertRaises(AutopilotServiceError):
+            load_chart_bars("", "1m", "test-key")
+        with self.assertRaises(AutopilotServiceError):
+            load_chart_bars("AAPL", "2m", "test-key")
+
+    def test_service_propagates_scheduled_earnings_context_into_decision(self) -> None:
+        now = datetime(2030, 7, 2, 15, 7, tzinfo=timezone.utc)
+        checked_through = date(2030, 7, 12)
+        earnings = EarningsContext(
+            status="scheduled",
+            date=date(2030, 7, 9),
+            date_status="projected",
+            checked_at=now,
+            checked_through=checked_through,
+        )
+        provider = self._provider(earnings)
+        captured: dict[str, object] = {}
+
+        def record_evaluate(*args, **kwargs):
+            captured.update(kwargs)
+            return evaluate_engine_setup(*args, **kwargs)
+
+        with (
+            patch("autopilot_service.PolygonProvider", return_value=provider),
+            patch("autopilot_service._frames_for_symbol", return_value=(self._frames(), [])),
+            patch(
+                "autopilot_service._market_context",
+                return_value=(MarketContext(regime="mixed"), {}, []),
+            ),
+            patch("autopilot_service.evaluate_setup", side_effect=record_evaluate),
+            patch("autopilot_service.load_chart_bars", return_value=[]),
+        ):
+            result = analyze_symbol(
+                "AAPL",
+                "test-key",
+                now=now,
+                include_options=False,
+            )
+
+        provider.earnings_context.assert_called_once_with(
+            "AAPL",
+            now.date(),
+            checked_through,
+            checked_at=now,
+        )
+        self.assertEqual(captured["earnings_date"], "2030-07-09")
+        self.assertEqual(captured["days_to_earnings"], 7)
+        self.assertEqual(captured["earnings_status"], "scheduled")
+        self.assertEqual(captured["earnings_date_status"], "projected")
+        self.assertEqual(captured["earnings_checked_through"], "2030-07-12")
+        self.assertEqual(result.decision.earnings_status, "scheduled")
+        self.assertEqual(result.decision.earnings_date, "2030-07-09")
+        self.assertEqual(result.provider_health.provider, "Polygon + Benzinga")
+        serialized = result.to_dict()["decision"]
+        self.assertEqual(serialized["earnings_date_status"], "projected")
+        self.assertEqual(serialized["earnings_checked_through"], "2030-07-12")
+
+    def test_service_never_invents_a_complete_earnings_window(self) -> None:
+        now = datetime(2030, 7, 2, 15, 7, tzinfo=timezone.utc)
+        earnings = Mock()
+        earnings.status = "verified_none"
+        earnings.date = None
+        earnings.date_status = None
+        earnings.checked_through = None
+        earnings.message = "Calendar verification was incomplete."
+        provider = self._provider(earnings)
+        captured: dict[str, object] = {}
+
+        def record_evaluate(*args, **kwargs):
+            captured.update(kwargs)
+            return evaluate_engine_setup(*args, **kwargs)
+
+        with (
+            patch("autopilot_service.PolygonProvider", return_value=provider),
+            patch("autopilot_service._frames_for_symbol", return_value=(self._frames(), [])),
+            patch(
+                "autopilot_service._market_context",
+                return_value=(MarketContext(regime="mixed"), {}, []),
+            ),
+            patch("autopilot_service.evaluate_setup", side_effect=record_evaluate),
+            patch("autopilot_service.load_chart_bars", return_value=[]),
+        ):
+            result = analyze_symbol("AAPL", "test-key", now=now, include_options=False)
+
+        self.assertEqual(captured["earnings_status"], "unresolved")
+        self.assertIsNone(captured["earnings_checked_through"])
+        self.assertEqual(result.decision.earnings_status, "unresolved")
+        self.assertEqual(result.provider_health.provider, "Polygon")
+
+    def test_verified_none_passes_explicit_none_to_options_context(self) -> None:
+        now = datetime(2030, 7, 2, 15, 7, tzinfo=timezone.utc)
+        earnings = EarningsContext(
+            status="verified_none",
+            date=None,
+            date_status=None,
+            checked_at=now,
+            checked_through=date(2030, 7, 12),
+        )
+        provider = self._provider(earnings)
+        contract = Mock()
+        contract.to_dict.return_value = {
+            "underlying_ticker": "AAPL",
+            "option_ticker": "O:AAPL300719C00100000",
+        }
+        provider.options_chain.return_value = [contract]
+        decision = unavailable_result("AAPL", "fixture")
+        decision.state = "ENTER"
+        decision.verdict = "ENTER"
+        decision.entry_conditions_satisfied = True
+        decision.earnings_status = "verified_none"
+        decision.earnings_date = None
+        captured: dict[str, object] = {}
+        ranked = {"status": "recommend", "contracts": [{"contract_symbol": "fixture"}]}
+
+        def record_rank(contracts, context, *, now):
+            captured["contracts"] = contracts
+            captured["context"] = context
+            captured["now"] = now
+            return ranked
+
+        with (
+            patch("autopilot_service.PolygonProvider", return_value=provider),
+            patch("autopilot_service._frames_for_symbol", return_value=(self._frames(), [])),
+            patch(
+                "autopilot_service._market_context",
+                return_value=(MarketContext(regime="mixed"), {}, []),
+            ),
+            patch("autopilot_service.evaluate_setup", return_value=decision),
+            patch("autopilot_service.load_chart_bars", return_value=[]),
+            patch("options_ranker.rank_option_contracts", side_effect=record_rank),
+        ):
+            result = analyze_symbol(
+                "AAPL",
+                "test-key",
+                now=now,
+                include_options=True,
+            )
+
+        options_context = captured["context"]
+        self.assertIn("earnings_date", options_context)
+        self.assertIsNone(options_context["earnings_date"])
+        self.assertEqual(captured["now"], now)
+        self.assertEqual(result.decision.options, ranked)
 
     def test_option_rank_input_requires_quote_timestamp_and_keeps_underlying(self) -> None:
         row = _option_contract_input(
