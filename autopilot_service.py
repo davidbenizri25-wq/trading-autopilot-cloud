@@ -10,15 +10,18 @@ import math
 import threading
 import time
 from typing import Any, Callable, Mapping, Optional
-from zoneinfo import ZoneInfo
 
 from autopilot_engine import (
     DecisionResult,
+    MARKET_TIMEZONE,
     MarketContext,
     analyze_timeframe,
+    bar_completion_timestamp,
     build_market_context,
+    exchange_session_close_time,
     evaluate_setup,
     normalize_bars,
+    required_frame_freshness_issues,
 )
 from polygon_provider import (
     InvalidTickerError,
@@ -61,6 +64,10 @@ MIC_TO_TRADINGVIEW = {
 
 class AutopilotServiceError(RuntimeError):
     """Safe error that can be shown in the product UI."""
+
+
+class CacheCoalescingTimeoutError(RuntimeError):
+    """A bounded cache follower wait expired before its leader completed."""
 
 
 @dataclass
@@ -110,9 +117,19 @@ class ServiceResult:
 
 
 class TTLCache:
-    def __init__(self, ttl_seconds: int = 300, max_items: int = 128) -> None:
+    def __init__(
+        self,
+        ttl_seconds: int = 300,
+        max_items: int = 128,
+        wait_timeout_seconds: float = 60.0,
+    ) -> None:
         self.ttl_seconds = max(int(ttl_seconds), 1)
         self.max_items = max(int(max_items), 1)
+        try:
+            timeout = float(wait_timeout_seconds)
+        except (TypeError, ValueError):
+            timeout = 60.0
+        self.wait_timeout_seconds = min(max(timeout, 0.01), 300.0)
         self._items: dict[str, tuple[float, Any]] = {}
         self._lock = threading.RLock()
         self._inflight: dict[str, dict[str, Any]] = {}
@@ -123,8 +140,15 @@ class TTLCache:
         self._expirations = 0
         self._evictions = 0
         self._coalesced_waits = 0
+        self._coalesced_timeouts = 0
 
-    def get_or_create(self, key: str, factory: Callable[[], Any]) -> Any:
+    def get_or_create(
+        self,
+        key: str,
+        factory: Callable[[], Any],
+        *,
+        cache_if: Optional[Callable[[Any], bool]] = None,
+    ) -> Any:
         now = time.monotonic()
         with self._lock:
             cached = self._items.get(key)
@@ -149,7 +173,12 @@ class TTLCache:
                 leader = False
 
         if not leader:
-            flight["event"].wait()
+            if not flight["event"].wait(timeout=self.wait_timeout_seconds):
+                with self._lock:
+                    self._coalesced_timeouts += 1
+                raise CacheCoalescingTimeoutError(
+                    "A shared cache load exceeded the bounded follower wait."
+                )
             error = flight.get("error")
             if error is not None:
                 raise error
@@ -160,24 +189,27 @@ class TTLCache:
         try:
             value = factory()
             cached_value = deepcopy(value)
-        except Exception as exc:
+            should_cache = cache_if(value) if cache_if is not None else True
+        except BaseException as exc:
             with self._lock:
                 self._load_errors += 1
                 flight["error"] = exc
+            raise
+        else:
+            with self._lock:
+                self._loads += 1
+                if should_cache:
+                    self._items[key] = (time.monotonic(), cached_value)
+                    if len(self._items) > self.max_items:
+                        oldest = min(self._items.items(), key=lambda item: item[1][0])[0]
+                        self._items.pop(oldest, None)
+                        self._evictions += 1
+                flight["value"] = cached_value
+            return value
+        finally:
+            with self._lock:
                 self._inflight.pop(key, None)
                 flight["event"].set()
-            raise
-        with self._lock:
-            self._loads += 1
-            self._items[key] = (time.monotonic(), cached_value)
-            if len(self._items) > self.max_items:
-                oldest = min(self._items.items(), key=lambda item: item[1][0])[0]
-                self._items.pop(oldest, None)
-                self._evictions += 1
-            flight["value"] = cached_value
-            self._inflight.pop(key, None)
-            flight["event"].set()
-        return value
 
     def snapshot(self) -> dict[str, int]:
         """Return aggregate cache health without exposing keys or cached values."""
@@ -194,6 +226,7 @@ class TTLCache:
                 "expirations": self._expirations,
                 "evictions": self._evictions,
                 "coalesced_waits": self._coalesced_waits,
+                "coalesced_timeouts": self._coalesced_timeouts,
             }
 
     def clear(self, *, reset_stats: bool = True) -> None:
@@ -207,6 +240,7 @@ class TTLCache:
                 self._expirations = 0
                 self._evictions = 0
                 self._coalesced_waits = 0
+                self._coalesced_timeouts = 0
 
 
 _DATA_CACHE = TTLCache(ttl_seconds=300, max_items=96)
@@ -264,47 +298,32 @@ def _bar_dict(bar: OHLCVBar) -> dict[str, Any]:
     }
 
 
-_MARKET_TIMEZONE = ZoneInfo("America/New_York")
-
-
 def _bar_completion_time(timestamp: datetime, timeframe: str) -> datetime:
-    value = timestamp if timestamp.tzinfo is not None else timestamp.replace(tzinfo=timezone.utc)
-    value = value.astimezone(timezone.utc)
-    label = normalize_timeframe(timeframe)
-    durations = {"1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30, "1H": 60, "4H": 240}
-    if label in durations:
-        duration = durations[label]
-        completion = value + timedelta(minutes=duration)
-        local_start = value.astimezone(_MARKET_TIMEZONE)
-        regular_close = datetime.combine(
-            local_start.date(), datetime_time(16, 0), tzinfo=_MARKET_TIMEZONE
-        ).astimezone(timezone.utc)
-        if datetime_time(9, 30) <= local_start.time() < datetime_time(16, 0):
-            completion = min(completion, regular_close)
-        return completion
-    local = value.astimezone(_MARKET_TIMEZONE)
-    if label == "1D":
-        return datetime.combine(
-            local.date(), datetime_time(16, 0), tzinfo=_MARKET_TIMEZONE
-        ).astimezone(timezone.utc)
-    if label == "1W":
-        monday = local.date() - timedelta(days=local.weekday())
-        return datetime.combine(
-            monday + timedelta(days=4), datetime_time(16, 0), tzinfo=_MARKET_TIMEZONE
-        ).astimezone(timezone.utc)
-    if label == "1M":
-        if local.month == 12:
-            next_month = datetime(local.year + 1, 1, 1, tzinfo=_MARKET_TIMEZONE)
-        else:
-            next_month = datetime(local.year, local.month + 1, 1, tzinfo=_MARKET_TIMEZONE)
-        return next_month.astimezone(timezone.utc)
-    return value
+    return bar_completion_timestamp(timestamp, timeframe)
 
 
 def _completed_bars(bars: list[OHLCVBar], timeframe: str, now: datetime) -> list[OHLCVBar]:
     cutoff = now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
     cutoff = cutoff.astimezone(timezone.utc)
     return [bar for bar in bars if _bar_completion_time(bar.timestamp, timeframe) <= cutoff]
+
+
+def _regular_session_bars(bars: list[OHLCVBar]) -> list[OHLCVBar]:
+    """Keep decision inputs inside the 09:30–16:00 New York cash session."""
+
+    output: list[OHLCVBar] = []
+    for bar in bars:
+        timestamp = bar.timestamp
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=timezone.utc)
+        local = timestamp.astimezone(MARKET_TIMEZONE)
+        wall_clock = local.time().replace(tzinfo=None)
+        if (
+            local.weekday() < 5
+            and datetime_time(9, 30) <= wall_clock < exchange_session_close_time(local.date())
+        ):
+            output.append(bar)
+    return output
 
 
 def _frames_for_symbol(
@@ -335,8 +354,8 @@ def _frames_for_symbol(
             warnings.append(str(exc))
         frames: dict[str, list[dict[str, Any]]] = {}
         daily = _completed_bars(daily, "1D", now)
-        intraday = _completed_bars(intraday, "15M", now)
-        five_minute = _completed_bars(five_minute, "5M", now)
+        intraday = _completed_bars(_regular_session_bars(intraday), "15M", now)
+        five_minute = _completed_bars(_regular_session_bars(five_minute), "5M", now)
         if daily:
             weekly = _completed_bars(resample_bars(daily, "1w"), "1W", now)
             monthly = _completed_bars(resample_bars(daily, "1mo"), "1M", now)
@@ -353,7 +372,20 @@ def _frames_for_symbol(
             frames["5M"] = [_bar_dict(bar) for bar in five_minute]
         return frames, warnings
 
-    return _DATA_CACHE.get_or_create(cache_key, fetch)
+    def complete_error_free_bundle(
+        value: tuple[dict[str, list[dict[str, Any]]], list[str]],
+    ) -> bool:
+        frames, warnings = value
+        return not warnings and all(
+            bool(frames.get(label))
+            for label in ("1D", "1W", "1M", "15M", "1H", "4H", "5M")
+        )
+
+    return _DATA_CACHE.get_or_create(
+        cache_key,
+        fetch,
+        cache_if=complete_error_free_bundle,
+    )
 
 
 def _chart_frames_from_engine_frames(
@@ -420,7 +452,11 @@ def load_chart_bars(
             return [_bar_dict(bar) for bar in completed]
 
         try:
-            return _CHART_DATA_CACHE.get_or_create(cache_key, fetch_source)
+            return _CHART_DATA_CACHE.get_or_create(
+                cache_key,
+                fetch_source,
+                cache_if=bool,
+            )
         except (InvalidTickerError, PolygonProviderError) as exc:
             raise AutopilotServiceError(str(exc)) from None
 
@@ -444,7 +480,11 @@ def load_chart_bars(
             return [_bar_dict(bar) for bar in completed_target]
 
         try:
-            return _CHART_DATA_CACHE.get_or_create(cache_key, fetch_resampled)
+            return _CHART_DATA_CACHE.get_or_create(
+                cache_key,
+                fetch_resampled,
+                cache_if=bool,
+            )
         except (InvalidTickerError, PolygonProviderError) as exc:
             raise AutopilotServiceError(str(exc)) from None
 
@@ -650,7 +690,9 @@ def analyze_symbol(
     namespace = _cache_namespace(clean_key, opener)
     frames, provider_messages = _frames_for_symbol(provider, resolved.ticker, current, cache_namespace=namespace)
     sector_symbol = sector_etf_for_security(resolved)
-    market_context, _, market_messages = _market_context(provider, frames, sector_symbol, current, namespace)
+    market_context, market_frames, market_messages = _market_context(
+        provider, frames, sector_symbol, current, namespace
+    )
     provider_messages.extend(market_messages)
     try:
         market_status = provider.market_status()
@@ -769,6 +811,22 @@ def analyze_symbol(
     label = _data_label(market_label, latest, current)
     data_age_seconds = _data_age_seconds(latest, current)
     latest_text = latest.isoformat().replace("+00:00", "Z") if latest else None
+    freshness_issues = required_frame_freshness_issues(
+        frames,
+        now=current,
+        market_status=market_label,
+        context=resolved.ticker,
+    )
+    for benchmark in ("SPY", "QQQ"):
+        freshness_issues.extend(
+            required_frame_freshness_issues(
+                market_frames.get(benchmark, {}),
+                now=current,
+                market_status=market_label,
+                required_timeframes=("1D", "4H"),
+                context=f"{benchmark} benchmark",
+            )
+        )
     decision = evaluate_setup(
         resolved.ticker,
         frames,
@@ -794,6 +852,8 @@ def analyze_symbol(
         earnings_throttled=earnings_throttled,
         news=news_rows,
         provider_warnings=provider_messages,
+        evaluated_at=current,
+        freshness_issues=freshness_issues,
     )
 
     if include_options and decision.state in {"ENTER", "ARMED"}:
@@ -861,7 +921,7 @@ def analyze_symbol(
         data_age_seconds=(
             round(data_age_seconds, 3) if data_age_seconds is not None else None
         ),
-        stale=label == "stale",
+        stale=label in {"stale", "unavailable"},
         cache_stats={
             "analysis": _DATA_CACHE.snapshot(),
             "chart": _CHART_DATA_CACHE.snapshot(),

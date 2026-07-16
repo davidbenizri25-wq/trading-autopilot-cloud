@@ -198,6 +198,7 @@ _PROVIDER_OBSERVATIONS: deque[ProviderRequestObservation] = deque(
 )
 _PROVIDER_OBSERVATIONS_LOCK = threading.RLock()
 _PROVIDER_COOLDOWNS: dict[str, float] = {}
+_PROVIDER_REQUEST_LOCKS: dict[str, threading.Lock] = {}
 
 
 def clear_provider_observations(*, preserve_cooldowns: bool = False) -> None:
@@ -224,6 +225,16 @@ def _set_provider_cooldown(provider: str, deadline: float) -> None:
     key = str(provider or "Polygon").strip().lower()
     with _PROVIDER_OBSERVATIONS_LOCK:
         _PROVIDER_COOLDOWNS[key] = max(_PROVIDER_COOLDOWNS.get(key, 0.0), deadline)
+
+
+def _provider_request_lock(provider: str) -> threading.Lock:
+    key = str(provider or "Polygon").strip().lower()
+    with _PROVIDER_OBSERVATIONS_LOCK:
+        lock = _PROVIDER_REQUEST_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _PROVIDER_REQUEST_LOCKS[key] = lock
+        return lock
 
 
 def recent_provider_observations(limit: int = 50) -> list[JsonDict]:
@@ -1053,7 +1064,7 @@ def _bounded_request_seconds(value: Any, *, default: float, maximum: float) -> f
     return min(seconds, maximum)
 
 
-def _request_json(
+def _request_json_uncoordinated(
     url: str,
     *,
     api_key: str,
@@ -1064,6 +1075,7 @@ def _request_json(
     max_retries: int = DEFAULT_PROVIDER_MAX_RETRIES,
     transport_timeout_seconds: float = DEFAULT_PROVIDER_TRANSPORT_TIMEOUT_SECONDS,
     request_budget_seconds: float = DEFAULT_PROVIDER_REQUEST_BUDGET_SECONDS,
+    coordinator_wait_seconds: float = 0.0,
     sleep: Callable[[float], None] = time_module.sleep,
     clock: Callable[[], float] = time_module.monotonic,
 ) -> JsonDict:
@@ -1088,7 +1100,10 @@ def _request_json(
     last_retry_after: Optional[float] = None
 
     def elapsed_ms() -> float:
-        return max((clock() - started_at) * 1000.0, 0.0)
+        return max(
+            (clock() - started_at + max(float(coordinator_wait_seconds), 0.0)) * 1000.0,
+            0.0,
+        )
 
     def remaining_budget_seconds() -> float:
         return max(request_deadline - clock(), 0.0)
@@ -1107,6 +1122,7 @@ def _request_json(
     cooldown_remaining = _provider_cooldown_remaining(provider_label, started_at)
     if cooldown_remaining is not None:
         remaining = round(cooldown_remaining, 3)
+        coordination_latency_ms = max(float(coordinator_wait_seconds), 0.0) * 1000.0
         _record_provider_observation(
             provider=provider_label,
             operation=operation,
@@ -1114,7 +1130,7 @@ def _request_json(
             classification="throttling",
             status_code=429,
             attempts=1,
-            latency_ms=0.0,
+            latency_ms=coordination_latency_ms,
             throttled=True,
             retry_after_seconds=remaining,
         )
@@ -1127,7 +1143,7 @@ def _request_json(
             attempts=1,
             retryable=True,
             retry_after_seconds=remaining,
-            latency_ms=0.0,
+            latency_ms=round(coordination_latency_ms, 3),
         )
 
     while True:
@@ -1332,6 +1348,87 @@ def _request_json(
         retry_after_seconds=last_retry_after,
     )
     return payload
+
+
+def _request_json(
+    url: str,
+    *,
+    api_key: str,
+    opener: Optional[UrlOpener],
+    operation: str,
+    headers: Optional[Mapping[str, str]] = None,
+    provider_label: str = "Polygon",
+    max_retries: int = DEFAULT_PROVIDER_MAX_RETRIES,
+    transport_timeout_seconds: float = DEFAULT_PROVIDER_TRANSPORT_TIMEOUT_SECONDS,
+    request_budget_seconds: float = DEFAULT_PROVIDER_REQUEST_BUDGET_SECONDS,
+    sleep: Callable[[float], None] = time_module.sleep,
+    clock: Callable[[], float] = time_module.monotonic,
+) -> JsonDict:
+    """Coordinate provider calls so a concurrent 429 closes the shared gate.
+
+    The coordinator wait is bounded by the same request budget.  After a caller
+    acquires the provider lock, the uncoordinated implementation performs a
+    second cooldown check before touching the transport.
+    """
+
+    request_budget = _bounded_request_seconds(
+        request_budget_seconds,
+        default=DEFAULT_PROVIDER_REQUEST_BUDGET_SECONDS,
+        maximum=DEFAULT_PROVIDER_REQUEST_BUDGET_SECONDS,
+    )
+    coordinator = _provider_request_lock(provider_label)
+    wait_started = clock()
+    acquired = coordinator.acquire(timeout=request_budget)
+    waited_seconds = max(clock() - wait_started, 0.0)
+    if not acquired:
+        _record_provider_observation(
+            provider=provider_label,
+            operation=operation,
+            outcome="error",
+            classification="timeout",
+            status_code=None,
+            attempts=1,
+            latency_ms=waited_seconds * 1000.0,
+            throttled=False,
+            retry_after_seconds=None,
+        )
+        raise PolygonProviderError(
+            f"{provider_label} {operation} timed out waiting for bounded request coordination.",
+            operation=operation,
+            provider=provider_label,
+            classification="timeout",
+            attempts=1,
+            retryable=True,
+            latency_ms=round(waited_seconds * 1000.0, 3),
+        )
+    try:
+        remaining_budget = request_budget - waited_seconds
+        if remaining_budget <= 0:
+            raise PolygonProviderError(
+                f"{provider_label} {operation} exhausted its request budget before transport.",
+                operation=operation,
+                provider=provider_label,
+                classification="timeout",
+                attempts=1,
+                retryable=True,
+                latency_ms=round(waited_seconds * 1000.0, 3),
+            )
+        return _request_json_uncoordinated(
+            url,
+            api_key=api_key,
+            opener=opener,
+            operation=operation,
+            headers=headers,
+            provider_label=provider_label,
+            max_retries=max_retries,
+            transport_timeout_seconds=transport_timeout_seconds,
+            request_budget_seconds=remaining_budget,
+            coordinator_wait_seconds=waited_seconds,
+            sleep=sleep,
+            clock=clock,
+        )
+    finally:
+        coordinator.release()
 
 
 def _mapping(value: Any) -> Mapping[str, Any]:

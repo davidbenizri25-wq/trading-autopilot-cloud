@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import patch
 from urllib.error import HTTPError
 
-from autopilot_service import TTLCache
+from autopilot_service import CacheCoalescingTimeoutError, TTLCache
 from polygon_provider import (
     PolygonProviderError,
     _request_json,
@@ -290,6 +290,46 @@ class ProviderRetryAndObservationTests(unittest.TestCase):
         self.assertEqual(blocked.exception.retry_after_seconds, 60.0)
         self.assertEqual(recent_provider_observations(1)[0]["outcome"], "circuit_open")
 
+    def test_simultaneous_429_is_coordinated_before_a_second_transport_call(self) -> None:
+        first_entered = threading.Event()
+        release_first = threading.Event()
+        calls = 0
+        calls_lock = threading.Lock()
+
+        def opener(url: str) -> FakeResponse:
+            nonlocal calls
+            with calls_lock:
+                calls += 1
+            first_entered.set()
+            self.assertTrue(release_first.wait(timeout=2))
+            raise HTTPError(url, 429, "rate limited", {"Retry-After": "60"}, None)
+
+        def request(operation: str) -> str:
+            try:
+                _request_json(
+                    f"https://api.polygon.io/{operation}",
+                    api_key="key",
+                    opener=opener,
+                    operation=operation,
+                )
+            except PolygonProviderError as exc:
+                return exc.classification
+            return "unexpected-success"
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            first = executor.submit(request, "first")
+            self.assertTrue(first_entered.wait(timeout=2))
+            second = executor.submit(request, "second")
+            time.sleep(0.05)
+            release_first.set()
+            results = [first.result(timeout=2), second.result(timeout=2)]
+
+        self.assertEqual(results, ["throttling", "throttling"])
+        self.assertEqual(calls, 1)
+        coordinated = recent_provider_observations(1)[0]
+        self.assertEqual(coordinated["outcome"], "circuit_open")
+        self.assertGreaterEqual(coordinated["latency_ms"], 40.0)
+
     def test_observation_reset_can_preserve_an_active_provider_cooldown(self) -> None:
         clock = FakeClock()
         calls = 0
@@ -398,6 +438,7 @@ class CacheObservationTests(unittest.TestCase):
                 "expirations": 1,
                 "evictions": 0,
                 "coalesced_waits": 0,
+                "coalesced_timeouts": 0,
             },
         )
 
@@ -452,6 +493,60 @@ class CacheObservationTests(unittest.TestCase):
         self.assertEqual(snapshot["loads"], 1)
         self.assertEqual(snapshot["hits"], workers - 1)
         self.assertEqual(snapshot["coalesced_waits"], workers - 1)
+
+    def test_coalesced_wait_is_bounded_and_leader_still_completes(self) -> None:
+        cache = TTLCache(ttl_seconds=30, wait_timeout_seconds=0.05)
+        factory_entered = threading.Event()
+        release_factory = threading.Event()
+
+        def factory() -> int:
+            factory_entered.set()
+            self.assertTrue(release_factory.wait(timeout=2))
+            return 7
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            leader = executor.submit(cache.get_or_create, "shared", factory)
+            self.assertTrue(factory_entered.wait(timeout=2))
+            follower = executor.submit(cache.get_or_create, "shared", factory)
+            with self.assertRaises(CacheCoalescingTimeoutError):
+                follower.result(timeout=1)
+            release_factory.set()
+            self.assertEqual(leader.result(timeout=2), 7)
+        self.assertEqual(cache.snapshot()["coalesced_timeouts"], 1)
+
+    def test_base_exception_leader_notifies_all_coalesced_waiters(self) -> None:
+        cache = TTLCache(ttl_seconds=30, wait_timeout_seconds=1)
+        workers = 3
+        start = threading.Barrier(workers + 1)
+        factory_entered = threading.Event()
+        release_factory = threading.Event()
+        calls = 0
+        calls_lock = threading.Lock()
+
+        def factory() -> int:
+            nonlocal calls
+            with calls_lock:
+                calls += 1
+            factory_entered.set()
+            self.assertTrue(release_factory.wait(timeout=2))
+            raise KeyboardInterrupt("fixture leader cancellation")
+
+        def worker() -> int:
+            start.wait(timeout=2)
+            return cache.get_or_create("shared", factory)
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = [executor.submit(worker) for _ in range(workers)]
+            start.wait(timeout=2)
+            self.assertTrue(factory_entered.wait(timeout=2))
+            time.sleep(0.05)
+            release_factory.set()
+            for future in futures:
+                with self.assertRaises(KeyboardInterrupt):
+                    future.result(timeout=2)
+
+        self.assertEqual(calls, 1)
+        self.assertEqual(cache.snapshot()["load_errors"], 1)
 
 
 if __name__ == "__main__":
