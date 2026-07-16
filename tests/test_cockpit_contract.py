@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 import tempfile
 from contextlib import nullcontext
@@ -12,10 +14,16 @@ from unittest.mock import patch
 from dashboard.cockpit import (
     _active_timeframe,
     _apply_tracking_action,
+    _chart_rows_for,
+    _CHART_CACHE,
     _compact_market_value,
+    _decision_rail_html,
+    _initialize_state,
+    _presentation_mode,
     _safe_analysis_record,
     _render_advanced,
     _set_active_timeframe,
+    _sync_presentation_toggle,
     _ticker_from_search_choice,
     BREAKDOWN_SECTIONS,
     advanced_provider_diagnostics,
@@ -27,15 +35,18 @@ from dashboard.cockpit import (
     entry_action_allowed,
     format_price,
     format_timestamp,
+    options_empty_state_message,
     options_table_rows,
     public_text,
     release_build_label,
+    revalidated_provider_health,
     resolve_state_path,
 )
 
 
 ROOT = Path(__file__).resolve().parents[1]
 COCKPIT = ROOT / "dashboard" / "cockpit.py"
+DECISION_NOW = datetime(2026, 7, 13, 15, 1, 0, tzinfo=timezone.utc)
 
 
 def complete_decision(**overrides):
@@ -170,6 +181,127 @@ class CockpitContractTests(unittest.TestCase):
                 presentation=True,
             )
 
+    def test_presentation_state_is_isolated_from_session_only_private_state(self) -> None:
+        private_state = {"watchlist": ["AAPL"], "positions": {"AAPL": {"status": "open"}}}
+        st = SimpleNamespace(
+            session_state={
+                "_autopilot_state_identity": "session-only",
+                "_autopilot_personal_state": private_state,
+            }
+        )
+
+        presentation_state, store = _initialize_state(st, {}, presentation=True)
+
+        self.assertIsNone(store)
+        self.assertEqual(presentation_state.get("watchlist"), [])
+        self.assertEqual(presentation_state.get("positions"), {})
+        self.assertIs(st.session_state["_autopilot_personal_state"], private_state)
+        self.assertIsNot(presentation_state, private_state)
+
+    def test_presentation_tradingview_widget_receives_no_private_watchlist(self) -> None:
+        class FakeStreamlit:
+            def __init__(self) -> None:
+                self.session_state = {}
+
+            def expander(self, *_args, **_kwargs):
+                return nullcontext()
+
+            def markdown(self, *_args, **_kwargs):
+                return None
+
+            def write(self, *_args, **_kwargs):
+                return None
+
+            def caption(self, *_args, **_kwargs):
+                return None
+
+            def toggle(self, *_args, **_kwargs):
+                return True
+
+            def iframe(self, *_args, **_kwargs):
+                return None
+
+        brief = {
+            "source": "Polygon",
+            "ticker": "AAPL",
+            "safe_decision": complete_decision(),
+        }
+        with (
+            patch("dashboard.cockpit.tradingview_widget_html", return_value="<html></html>") as widget,
+            patch("dashboard.cockpit.tradingview_market_context_html", return_value="<html></html>"),
+        ):
+            _render_advanced(
+                FakeStreamlit(),
+                {"provider_health": {}, "tradingview_symbol": "NASDAQ:AAPL"},
+                {"watchlist": ["PRIVATE"]},
+                brief,
+                "15m",
+                presentation=True,
+            )
+
+        self.assertEqual(widget.call_args.kwargs["watchlist"], [])
+
+    def test_presentation_toggle_synchronizes_session_and_query(self) -> None:
+        st = SimpleNamespace(
+            session_state={"_autopilot_presentation_toggle": True},
+            query_params={},
+        )
+        _sync_presentation_toggle(st)
+        self.assertTrue(st.session_state["_autopilot_presentation"])
+        self.assertEqual(st.query_params["view"], "presentation")
+
+        st.session_state["_autopilot_presentation_toggle"] = False
+        _sync_presentation_toggle(st)
+        self.assertFalse(st.session_state["_autopilot_presentation"])
+        self.assertNotIn("view", st.query_params)
+
+    def test_active_presentation_repairs_a_missing_shareable_query_marker(self) -> None:
+        st = SimpleNamespace(
+            session_state={"_autopilot_presentation": True},
+            query_params={},
+        )
+
+        self.assertTrue(_presentation_mode(st))
+        self.assertEqual(st.query_params["view"], "presentation")
+
+    def test_empty_options_copy_distinguishes_not_run_from_no_observations(self) -> None:
+        blocked = complete_decision(
+            verdict="PASS",
+            state="BLOCKED",
+            options={},
+        )
+        blocked_copy = options_empty_state_message(blocked)
+        self.assertIn("screening was skipped", blocked_copy)
+        self.assertIn("ENTER or ARMED", blocked_copy)
+        self.assertNotIn("cleared", blocked_copy)
+        self.assertNotIn("liquidity", blocked_copy)
+
+        entered = complete_decision(options={"status": "pass", "ranked_contracts": []})
+        entered_copy = options_empty_state_message(entered)
+        self.assertIn("no usable contract observations", entered_copy.lower())
+        self.assertNotIn("cleared", entered_copy)
+
+    def test_empty_dashboard_chart_result_is_not_cached(self) -> None:
+        payload = {"resolved": {"ticker": "AAPL"}, "chart_frames": {}}
+        recovered = [{"timestamp": "2026-07-16T14:00:00Z", "close": 210.0}]
+        _CHART_CACHE.clear()
+        with patch("dashboard.cockpit.load_chart_bars", side_effect=[[], recovered]) as loader:
+            first = _chart_rows_for(payload, "1m", "test-key")
+            second = _chart_rows_for(payload, "1m", "test-key")
+
+        self.assertEqual(first, [])
+        self.assertEqual(second, recovered)
+        self.assertEqual(loader.call_count, 2)
+
+    def test_stale_price_and_levels_are_historically_labeled(self) -> None:
+        brief = build_decision_brief(
+            complete_decision(data_label="stale"),
+            now=DECISION_NOW,
+        )
+        self.assertEqual(brief["price_label"], "Last observed price")
+        rail = _decision_rail_html(brief)
+        self.assertIn("Historical levels · not actionable", rail)
+
     def test_market_ribbon_compacts_provider_unavailable_messages(self) -> None:
         self.assertEqual(
             _compact_market_value("Unavailable from the configured stock feed"),
@@ -184,7 +316,8 @@ class CockpitContractTests(unittest.TestCase):
                 data_source="Unavailable",
                 current_price=None,
                 invalidation_condition="A decisive close above unavailable.",
-            )
+            ),
+            now=DECISION_NOW,
         )
 
         self.assertEqual(brief["verdict"], "PASS")
@@ -230,37 +363,65 @@ class CockpitContractTests(unittest.TestCase):
 
     def test_release_build_label_uses_only_valid_public_hashes(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            state_path = Path(temp_dir) / ".cloud-mirror-state.json"
+            root = Path(temp_dir)
+            deploy = root / "deploy"
+            deploy.mkdir()
+            managed = root / "dashboard" / "app.py"
+            managed.parent.mkdir()
+            managed.write_text("verified release content\n", encoding="utf-8")
+            file_digest = hashlib.sha256(managed.read_bytes()).hexdigest()
+            manifest = hashlib.sha256(
+                json.dumps(
+                    [{"path": "dashboard/app.py", "sha256": file_digest}],
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("utf-8")
+            ).hexdigest()
+            state_path = deploy / ".cloud-mirror-state.json"
             state_path.write_text(
                 json.dumps(
                     {
-                        "schema_version": 2,
+                        "schema_version": 3,
                         "canonical_repository": "davidbenizri25-wq/trading-elite-system",
                         "version": "2.1.0-premium-terminal",
                         "canonical_commit": "a" * 40,
-                        "manifest_sha256": "b" * 64,
+                        "managed_paths": ["dashboard/app.py"],
+                        "manifest_sha256": manifest,
+                        "files": {"dashboard/app.py": file_digest},
                     }
                 ),
                 encoding="utf-8",
             )
             self.assertEqual(
                 release_build_label(state_path),
-                "v2.1.0 · source aaaaaaa · manifest bbbbbbb",
+                f"v2.1.0 · source aaaaaaa · manifest {manifest[:7]}",
             )
+            mismatched_state = json.loads(state_path.read_text(encoding="utf-8"))
+            mismatched_state["managed_paths"].append("polygon_provider.py")
+            state_path.write_text(json.dumps(mismatched_state), encoding="utf-8")
+            self.assertEqual(release_build_label(state_path), "v2.1.0")
+            mismatched_state["managed_paths"] = ["dashboard/app.py"]
+            state_path.write_text(json.dumps(mismatched_state), encoding="utf-8")
+            managed.write_text("tampered release content\n", encoding="utf-8")
+            self.assertEqual(release_build_label(state_path), "v2.1.0")
+            managed.write_text("verified release content\n", encoding="utf-8")
             state_path.write_text('{"canonical_commit":"/private/tmp/leak"}', encoding="utf-8")
             self.assertEqual(release_build_label(state_path), "v2.1.0")
             state_path.write_text("[]", encoding="utf-8")
             self.assertEqual(release_build_label(state_path), "v2.1.0")
 
-            real_state = Path(temp_dir) / "real-state.json"
+            real_state = root / "real-state.json"
             real_state.write_text(
                 json.dumps(
                     {
-                        "schema_version": 2,
+                        "schema_version": 3,
                         "canonical_repository": "davidbenizri25-wq/trading-elite-system",
                         "version": "2.1.0-premium-terminal",
                         "canonical_commit": "a" * 40,
-                        "manifest_sha256": "b" * 64,
+                        "managed_paths": ["dashboard/app.py"],
+                        "manifest_sha256": manifest,
+                        "files": {"dashboard/app.py": file_digest},
                     }
                 ),
                 encoding="utf-8",
@@ -279,7 +440,7 @@ class CockpitContractTests(unittest.TestCase):
         self.assertEqual(len({key for key, _ in BREAKDOWN_SECTIONS}), 21)
 
     def test_top_card_brief_contains_every_decision_field(self) -> None:
-        brief = build_decision_brief(complete_decision())
+        brief = build_decision_brief(complete_decision(), now=DECISION_NOW)
         required = {
             "verdict",
             "state",
@@ -317,7 +478,10 @@ class CockpitContractTests(unittest.TestCase):
     def test_unavailable_or_stale_market_evidence_forces_pass(self) -> None:
         for data_label in ("unavailable", "stale"):
             with self.subTest(data_label=data_label):
-                brief = build_decision_brief(complete_decision(data_label=data_label))
+                brief = build_decision_brief(
+                    complete_decision(data_label=data_label),
+                    now=DECISION_NOW,
+                )
                 self.assertEqual(brief["verdict"], "PASS")
                 self.assertEqual(brief["state"], "BLOCKED")
                 self.assertEqual(brief["entry_satisfied"], "No")
@@ -333,8 +497,17 @@ class CockpitContractTests(unittest.TestCase):
         self.assertEqual(format_price(None), "Unavailable")
 
     def test_entry_recording_requires_a_current_explicit_enter_decision(self) -> None:
-        self.assertTrue(entry_action_allowed(build_decision_brief(complete_decision())))
-        self.assertFalse(entry_action_allowed(build_decision_brief(complete_decision(data_label="stale"))))
+        self.assertTrue(
+            entry_action_allowed(build_decision_brief(complete_decision(), now=DECISION_NOW))
+        )
+        self.assertFalse(
+            entry_action_allowed(
+                build_decision_brief(
+                    complete_decision(data_label="stale"),
+                    now=DECISION_NOW,
+                )
+            )
+        )
         self.assertFalse(
             entry_action_allowed(
                 build_decision_brief(
@@ -342,11 +515,62 @@ class CockpitContractTests(unittest.TestCase):
                         verdict="WAIT FOR CONFIRMATION",
                         state="ARMED",
                         entry_conditions_satisfied=False,
-                    )
+                    ),
+                    now=DECISION_NOW,
                 )
             )
         )
-        self.assertFalse(entry_action_allowed(build_decision_brief(complete_decision(current_price=None))))
+        self.assertFalse(
+            entry_action_allowed(
+                build_decision_brief(
+                    complete_decision(current_price=None),
+                    now=DECISION_NOW,
+                )
+            )
+        )
+
+    def test_cached_enter_is_re_aged_at_render_boundary(self) -> None:
+        brief = build_decision_brief(
+            complete_decision(),
+            now=datetime(2026, 7, 13, 15, 4, 0, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(brief["verdict"], "PASS")
+        self.assertEqual(brief["state"], "BLOCKED")
+        self.assertEqual(brief["currentness"], "Stale — decision gated")
+        self.assertFalse(entry_action_allowed(brief))
+
+    def test_off_session_reaging_synchronizes_copy_and_provider_health(self) -> None:
+        after_close = datetime(2026, 7, 13, 20, 1, 0, tzinfo=timezone.utc)
+        decision = complete_decision(
+            data_timestamp="2026-07-13T20:00:00Z",
+            full_breakdown={
+                **complete_decision()["full_breakdown"],
+                "final_verdict": "ENTER NOW",
+                "bull_case": "Buy the trigger.",
+            },
+        )
+
+        brief = build_decision_brief(decision, now=after_close)
+        health = revalidated_provider_health(
+            {
+                "provider": "Polygon",
+                "status": "connected",
+                "data_label": "real-time",
+                "timestamp": "2026-07-13T20:00:00Z",
+            },
+            brief["safe_decision"],
+            now=after_close,
+        )
+
+        self.assertEqual(brief["verdict"], "PASS")
+        self.assertEqual(brief["market_status"], "Closed")
+        self.assertEqual(brief["currentness"], "Last close")
+        self.assertNotIn("ENTER NOW", brief["safe_decision"]["full_breakdown"]["final_verdict"])
+        self.assertNotIn("Buy the trigger", brief["safe_decision"]["full_breakdown"]["bull_case"])
+        self.assertEqual(health["data_label"], "last-close")
+        self.assertEqual(health["data_age_seconds"], 60.0)
+        self.assertTrue(health["stale"])
 
     def test_tracking_boundary_rejects_stale_non_enter_entry(self) -> None:
         st = SimpleNamespace(session_state={})
@@ -379,7 +603,7 @@ class CockpitContractTests(unittest.TestCase):
             warnings=["Earnings are 7 day(s) away."],
             primary_risk="Earnings are 7 day(s) away.",
         )
-        brief = build_decision_brief(decision)
+        brief = build_decision_brief(decision, now=DECISION_NOW)
 
         self.assertEqual(brief["verdict"], "ENTER")
         self.assertEqual(brief["primary_risk"], "Earnings are 7 day(s) away.")
@@ -450,7 +674,7 @@ class CockpitContractTests(unittest.TestCase):
                 }
             ],
         }
-        model = build_home_snapshot(state)
+        model = build_home_snapshot(state, now=DECISION_NOW)
         self.assertEqual([item["ticker"] for item in model["watchlist"]], ["MSFT", "NVDA"])
         self.assertEqual(model["enter_candidates"][0]["ticker"], "MSFT")
         self.assertEqual(model["armed_candidates"][0]["ticker"], "NVDA")

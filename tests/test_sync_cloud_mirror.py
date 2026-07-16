@@ -1,3 +1,4 @@
+import hashlib
 import json
 from pathlib import Path
 import subprocess
@@ -5,6 +6,7 @@ import tempfile
 import unittest
 
 from tools.sync_cloud_mirror import (
+    SCHEMA_VERSION,
     STATE_RELATIVE_PATH,
     SyncError,
     _repository_name_from_remote,
@@ -33,6 +35,10 @@ class CloudMirrorSyncTests(unittest.TestCase):
 
     def _write_manifest(self, *paths: str) -> None:
         self.manifest.write_text("\n".join(paths) + "\n", encoding="utf-8")
+
+    @staticmethod
+    def _legacy_manifest_sha256(*paths: str) -> str:
+        return hashlib.sha256("\n".join(sorted(paths)).encode("utf-8")).hexdigest()
 
     def _run(self, mode: str):
         return run_sync(
@@ -89,7 +95,7 @@ class CloudMirrorSyncTests(unittest.TestCase):
             (self.target / Path(STATE_RELATIVE_PATH.as_posix())).read_text(encoding="utf-8")
         )
         self.assertEqual(state["managed_paths"], ["alpha.txt"])
-        self.assertEqual(state["schema_version"], 2)
+        self.assertEqual(state["schema_version"], SCHEMA_VERSION)
         self.assertEqual(state["canonical_repository"], "example/canonical")
         self.assertEqual(state["canonical_commit"], "a" * 40)
         self.assertEqual(state["version"], "test-version")
@@ -117,6 +123,30 @@ class CloudMirrorSyncTests(unittest.TestCase):
         self.assertTrue(drift.has_drift)
         self.assertEqual(drift.copy_paths, ("alpha.txt",))
 
+    def test_source_content_change_alters_manifest_and_check_detects_drift(self) -> None:
+        self._write_source("alpha.txt", "canonical v1\n")
+        self._write_manifest("alpha.txt")
+        self._run("apply")
+        state_path = self.target / Path(STATE_RELATIVE_PATH.as_posix())
+        first_state = json.loads(state_path.read_text(encoding="utf-8"))
+
+        self._write_source("alpha.txt", "canonical v2\n")
+        drift = self._run("check")
+
+        self.assertTrue(drift.has_drift)
+        self.assertEqual(drift.copy_paths, ("alpha.txt",))
+        self.assertTrue(drift.state_needs_update)
+
+        self._run("apply")
+        second_state = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(second_state["schema_version"], SCHEMA_VERSION)
+        self.assertNotEqual(
+            first_state["files"]["alpha.txt"], second_state["files"]["alpha.txt"]
+        )
+        self.assertNotEqual(
+            first_state["manifest_sha256"], second_state["manifest_sha256"]
+        )
+
     def test_schema_one_state_migrates_without_losing_managed_ownership(self) -> None:
         self._write_source("alpha.txt", "canonical\n")
         self._write_manifest("alpha.txt")
@@ -126,14 +156,58 @@ class CloudMirrorSyncTests(unittest.TestCase):
         for key in ("canonical_repository", "canonical_commit", "version"):
             state.pop(key)
         state["schema_version"] = 1
+        state["manifest_sha256"] = self._legacy_manifest_sha256(*state["managed_paths"])
         state_path.write_text(json.dumps(state), encoding="utf-8")
 
         plan = self._run("apply")
 
         self.assertTrue(plan.state_needs_update)
         migrated = json.loads(state_path.read_text(encoding="utf-8"))
-        self.assertEqual(migrated["schema_version"], 2)
+        self.assertEqual(migrated["schema_version"], SCHEMA_VERSION)
         self.assertEqual(migrated["managed_paths"], ["alpha.txt"])
+
+    def test_schema_two_state_migrates_to_content_backed_manifest(self) -> None:
+        self._write_source("alpha.txt", "canonical\n")
+        self._write_manifest("alpha.txt")
+        self._run("apply")
+        state_path = self.target / Path(STATE_RELATIVE_PATH.as_posix())
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        content_manifest = state["manifest_sha256"]
+        state["schema_version"] = 2
+        state["manifest_sha256"] = self._legacy_manifest_sha256(*state["managed_paths"])
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+
+        check_plan = self._run("check")
+
+        self.assertTrue(check_plan.state_needs_update)
+        self.assertEqual(check_plan.copy_paths, ())
+        self.assertEqual(check_plan.delete_paths, ())
+
+        self._run("apply")
+        migrated = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(migrated["schema_version"], SCHEMA_VERSION)
+        self.assertEqual(migrated["manifest_sha256"], content_manifest)
+
+    def test_schema_two_migration_preserves_stale_file_deletion_protection(self) -> None:
+        self._write_source("keep.txt", "keep\n")
+        self._write_source("retire.txt", "generated\n")
+        self._write_manifest("keep.txt", "retire.txt")
+        self._run("apply")
+        state_path = self.target / Path(STATE_RELATIVE_PATH.as_posix())
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["schema_version"] = 2
+        state["manifest_sha256"] = self._legacy_manifest_sha256(*state["managed_paths"])
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+
+        (self.target / "retire.txt").write_text("manual cloud change\n", encoding="utf-8")
+        self._write_manifest("keep.txt")
+
+        with self.assertRaisesRegex(SyncError, "changed since the last sync"):
+            self._run("apply")
+        self.assertEqual(
+            (self.target / "retire.txt").read_text(encoding="utf-8"),
+            "manual cloud change\n",
+        )
 
     def test_rejects_same_tree_and_nested_tree_targets(self) -> None:
         self._write_source("alpha.txt", "canonical\n")

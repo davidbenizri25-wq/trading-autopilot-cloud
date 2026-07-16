@@ -8,6 +8,7 @@ from autopilot_engine import MarketContext, evaluate_setup as evaluate_engine_se
 from autopilot_service import (
     AutopilotServiceError,
     _CHART_DATA_CACHE,
+    _DATA_CACHE,
     _bar_completion_time,
     _chart_frames_from_engine_frames,
     TTLCache,
@@ -15,6 +16,7 @@ from autopilot_service import (
     _completed_bars,
     _data_label,
     _frames_for_symbol,
+    _regular_session_bars,
     _latest_timestamp,
     _option_contract_input,
     load_chart_bars,
@@ -25,6 +27,46 @@ from polygon_provider import EarningsContext, OHLCVBar, ResolvedTicker
 
 
 class AutopilotServiceTests(unittest.TestCase):
+    def test_decision_intraday_frames_exclude_extended_hours(self) -> None:
+        def bar(hour: int, minute: int) -> OHLCVBar:
+            return OHLCVBar(
+                datetime(2026, 7, 16, hour, minute, tzinfo=timezone.utc),
+                100,
+                101,
+                99,
+                100.5,
+                1_000,
+                "15m",
+            )
+
+        filtered = _regular_session_bars(
+            [
+                bar(12, 0),   # 08:00 ET pre-market
+                bar(13, 30),  # 09:30 ET
+                bar(19, 45),  # 15:45 ET
+                bar(20, 0),   # 16:00 ET after-hours boundary
+            ]
+        )
+
+        self.assertEqual(
+            [item.timestamp for item in filtered],
+            [bar(13, 30).timestamp, bar(19, 45).timestamp],
+        )
+
+        half_day = [
+            OHLCVBar(
+                datetime(2026, 11, 27, hour, minute, tzinfo=timezone.utc),
+                100,
+                101,
+                99,
+                100.5,
+                1_000,
+                "15m",
+            )
+            for hour, minute in ((17, 45), (18, 0))  # 12:45 and 13:00 ET
+        ]
+        self.assertEqual(_regular_session_bars(half_day), [half_day[0]])
+
     def _security(self, ticker: str) -> ResolvedTicker:
         return ResolvedTicker(
             ticker=ticker,
@@ -130,6 +172,105 @@ class AutopilotServiceTests(unittest.TestCase):
         self.assertEqual(cache.get_or_create("x", lambda: calls.append(2) or {"value": 4}), {"value": 3})
         self.assertEqual(calls, [1])
 
+    def test_partial_error_frame_bundle_is_not_cached_and_can_recover(self) -> None:
+        now = datetime(2030, 7, 16, 14, 5, tzinfo=timezone.utc)
+        daily = [
+            OHLCVBar(
+                datetime(2030, month, day, 4, tzinfo=timezone.utc),
+                100,
+                101,
+                99,
+                100.5,
+                1_000,
+                "1d",
+            )
+            for month, day in ((6, 2), (6, 30), (7, 6), (7, 15))
+        ]
+        intraday = [
+            OHLCVBar(
+                datetime(2030, 7, 15, 13, 30, tzinfo=timezone.utc),
+                100,
+                101,
+                99,
+                100.5,
+                1_000,
+                "15m",
+            ),
+            OHLCVBar(
+                datetime(2030, 7, 16, 13, 45, tzinfo=timezone.utc),
+                100,
+                101,
+                99,
+                100.5,
+                1_000,
+                "15m",
+            ),
+        ]
+        five_minute = [
+            OHLCVBar(
+                datetime(2030, 7, 16, 13, 55, tzinfo=timezone.utc),
+                100,
+                101,
+                99,
+                100.5,
+                1_000,
+                "5m",
+            )
+        ]
+
+        class RecoveringProvider:
+            def __init__(self) -> None:
+                self.calls = {"daily": 0, "15m": 0, "5m": 0}
+
+            def _result(self, label: str, rows: list[OHLCVBar]) -> list[OHLCVBar]:
+                self.calls[label] += 1
+                if self.calls[label] == 1:
+                    raise PolygonProviderError(
+                        "fixture availability failure",
+                        classification="availability",
+                    )
+                return rows
+
+            def daily_bars(self, *_args):
+                return self._result("daily", daily)
+
+            def bars_15m(self, *_args):
+                return self._result("15m", intraday)
+
+            def bars_5m(self, *_args):
+                return self._result("5m", five_minute)
+
+        from polygon_provider import PolygonProviderError
+
+        provider = RecoveringProvider()
+        _DATA_CACHE.clear()
+        first, first_warnings = _frames_for_symbol(
+            provider,
+            "AAPL",
+            now,
+            cache_namespace="partial-recovery",
+        )
+        second, second_warnings = _frames_for_symbol(
+            provider,
+            "AAPL",
+            now,
+            cache_namespace="partial-recovery",
+        )
+        third, third_warnings = _frames_for_symbol(
+            provider,
+            "AAPL",
+            now,
+            cache_namespace="partial-recovery",
+        )
+
+        self.assertEqual(first, {})
+        self.assertEqual(len(first_warnings), 3)
+        self.assertEqual(second_warnings, [])
+        self.assertEqual(third_warnings, [])
+        self.assertTrue(all(second.get(label) for label in ("1D", "1W", "1M", "15M", "1H", "4H", "5M")))
+        self.assertEqual(second, third)
+        self.assertEqual(provider.calls, {"daily": 2, "15m": 2, "5m": 2})
+
     def test_chart_frame_keys_use_exact_ui_labels_without_mutating_sources(self) -> None:
         frames = {
             "5M": [{"timestamp": "2030-07-02T14:30:00+00:00", "close": 100}],
@@ -165,6 +306,29 @@ class AutopilotServiceTests(unittest.TestCase):
         self.assertEqual(second[0]["close"], 100.5)
         self.assertEqual(second[0]["timeframe"], "1m")
         self.assertTrue(second[0]["complete"])
+
+    def test_empty_chart_result_is_not_cached_and_can_recover(self) -> None:
+        now = datetime(2030, 7, 2, 15, 7, tzinfo=timezone.utc)
+        recovered = OHLCVBar(now - timedelta(minutes=2), 100, 101, 99, 100.5, 1_000, "1m")
+
+        class Provider:
+            calls = 0
+
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def bars_1m(self, *_args):
+                Provider.calls += 1
+                return [] if Provider.calls == 1 else [recovered]
+
+        _CHART_DATA_CACHE.clear()
+        with patch("autopilot_service.PolygonProvider", Provider):
+            first = load_chart_bars("AAPL", "1m", "test-key", now=now)
+            second = load_chart_bars("AAPL", "1m", "test-key", now=now)
+
+        self.assertEqual(first, [])
+        self.assertEqual(len(second), 1)
+        self.assertEqual(Provider.calls, 2)
 
     def test_four_hour_chart_uses_registry_lookback_and_real_resampling(self) -> None:
         now = datetime(2030, 7, 2, 19, 0, tzinfo=timezone.utc)
@@ -348,6 +512,46 @@ class AutopilotServiceTests(unittest.TestCase):
         self.assertEqual(result.provider_health.provider, "Polygon + Massive / Benzinga")
         self.assertEqual(result.provider_health.earnings_error_kind, "implementation")
 
+    def test_service_passes_stale_benchmark_freshness_into_decision_boundary(self) -> None:
+        now = datetime(2030, 7, 2, 15, 7, tzinfo=timezone.utc)
+        earnings = EarningsContext(
+            status="verified_none",
+            date=None,
+            date_status=None,
+            checked_at=now,
+            checked_through=date(2030, 7, 12),
+        )
+        provider = self._provider(earnings)
+        target_frames = self._frames()
+        stale_row = dict(target_frames["1D"][0], timestamp="2020-01-02T14:30:00+00:00")
+        market_frames = {
+            "SPY": {"1D": [stale_row], "4H": [stale_row]},
+            "QQQ": {"1D": [stale_row], "4H": [stale_row]},
+        }
+        captured: dict[str, object] = {}
+        decision = unavailable_result("AAPL", "fixture")
+
+        def record_evaluate(*_args, **kwargs):
+            captured.update(kwargs)
+            return decision
+
+        with (
+            patch("autopilot_service.PolygonProvider", return_value=provider),
+            patch("autopilot_service._frames_for_symbol", return_value=(target_frames, [])),
+            patch(
+                "autopilot_service._market_context",
+                return_value=(MarketContext(regime="risk-on"), market_frames, []),
+            ),
+            patch("autopilot_service.evaluate_setup", side_effect=record_evaluate),
+            patch("autopilot_service.load_chart_bars", return_value=[]),
+        ):
+            analyze_symbol("AAPL", "test-key", now=now, include_options=False)
+
+        issues = list(captured["freshness_issues"])
+        self.assertTrue(any("SPY benchmark 1D evidence is stale" in item for item in issues))
+        self.assertTrue(any("QQQ benchmark 4H evidence is stale" in item for item in issues))
+        self.assertEqual(captured["evaluated_at"], now)
+
     def test_verified_none_passes_explicit_none_to_options_context(self) -> None:
         now = datetime(2030, 7, 2, 15, 7, tzinfo=timezone.utc)
         earnings = EarningsContext(
@@ -454,6 +658,32 @@ class AutopilotServiceTests(unittest.TestCase):
         result = unavailable_result("AAPL", "not configured")
         self.assertEqual(result.verdict, "PASS")
         self.assertEqual(result.data_label, "unavailable")
+
+    def test_unavailable_provider_health_sets_stale_contract_flag(self) -> None:
+        now = datetime(2030, 7, 2, 15, 7, tzinfo=timezone.utc)
+        provider = self._provider(
+            EarningsContext(
+                status="verified_none",
+                date=None,
+                date_status=None,
+                checked_at=now,
+                checked_through=date(2030, 7, 12),
+            )
+        )
+        with (
+            patch("autopilot_service.PolygonProvider", return_value=provider),
+            patch("autopilot_service._frames_for_symbol", return_value=({}, [])),
+            patch(
+                "autopilot_service._market_context",
+                return_value=(MarketContext(regime="unavailable"), {}, []),
+            ),
+            patch("autopilot_service.load_chart_bars", return_value=[]),
+        ):
+            result = analyze_symbol("AAPL", "test-key", now=now, include_options=False)
+
+        self.assertEqual(result.provider_health.data_label, "unavailable")
+        self.assertTrue(result.provider_health.stale)
+        self.assertEqual(result.decision.verdict, "PASS")
 
 
 if __name__ == "__main__":

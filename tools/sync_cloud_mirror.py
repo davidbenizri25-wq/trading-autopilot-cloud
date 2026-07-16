@@ -23,8 +23,12 @@ import tempfile
 from typing import Iterable, Sequence
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 LEGACY_SCHEMA_VERSION = 1
+PROVENANCE_SCHEMA_VERSION = 2
+SUPPORTED_SCHEMA_VERSIONS = frozenset(
+    {LEGACY_SCHEMA_VERSION, PROVENANCE_SCHEMA_VERSION, SCHEMA_VERSION}
+)
 DEFAULT_MANIFEST = Path("deploy/cloud_manifest.txt")
 STATE_RELATIVE_PATH = PurePosixPath("deploy/.cloud-mirror-state.json")
 MODES = ("dry-run", "check", "apply")
@@ -306,6 +310,35 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _legacy_manifest_sha256(managed_paths: Sequence[str]) -> str:
+    """Return the schema 1/2 path-list checksum used by existing releases."""
+
+    return hashlib.sha256("\n".join(managed_paths).encode("utf-8")).hexdigest()
+
+
+def _content_manifest_sha256(
+    managed_paths: Sequence[str], files: dict[str, str]
+) -> str:
+    """Bind a schema 3 manifest checksum to every managed path and file digest.
+
+    The compact JSON array is deterministic because managed paths are normalized
+    and sorted before this helper is called. JSON keeps path/digest boundaries
+    unambiguous without relying on a filesystem-specific separator.
+    """
+
+    payload = [
+        {"path": relative, "sha256": files[relative]}
+        for relative in managed_paths
+    ]
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _state_path(target_root: Path) -> Path:
     return _safe_target_path(target_root, STATE_RELATIVE_PATH)
 
@@ -320,14 +353,14 @@ def _load_previous_state(target_root: Path) -> dict[str, object] | None:
         state = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise SyncError(f"Mirror state is unreadable; refusing deletions: {path}") from exc
-    if not isinstance(state, dict) or state.get("schema_version") not in {
-        LEGACY_SCHEMA_VERSION,
-        SCHEMA_VERSION,
-    }:
+    if (
+        not isinstance(state, dict)
+        or state.get("schema_version") not in SUPPORTED_SCHEMA_VERSIONS
+    ):
         raise SyncError("Mirror state has an unsupported schema; refusing deletions.")
     schema_version = int(state["schema_version"])
     expected_keys = {"schema_version", "managed_paths", "manifest_sha256", "files"}
-    if schema_version == SCHEMA_VERSION:
+    if schema_version >= PROVENANCE_SCHEMA_VERSION:
         expected_keys.update({"canonical_repository", "canonical_commit", "version"})
     if set(state) != expected_keys:
         raise SyncError("Mirror state has an invalid shape; refusing deletions.")
@@ -352,16 +385,20 @@ def _load_previous_state(target_root: Path) -> dict[str, object] | None:
         for digest in files.values()
     ):
         raise SyncError("Mirror state contains an invalid file hash.")
-    expected_manifest_hash = hashlib.sha256("\n".join(normalized).encode("utf-8")).hexdigest()
+    normalized_files = {relative: files[relative] for relative in normalized}
+    if schema_version >= SCHEMA_VERSION:
+        expected_manifest_hash = _content_manifest_sha256(normalized, normalized_files)
+    else:
+        expected_manifest_hash = _legacy_manifest_sha256(normalized)
     if state.get("manifest_sha256") != expected_manifest_hash:
         raise SyncError("Mirror state manifest hash is invalid; refusing deletions.")
     normalized_state: dict[str, object] = {
         "schema_version": schema_version,
         "managed_paths": normalized,
         "manifest_sha256": expected_manifest_hash,
-        "files": {relative: files[relative] for relative in normalized},
+        "files": normalized_files,
     }
-    if schema_version == SCHEMA_VERSION:
+    if schema_version >= PROVENANCE_SCHEMA_VERSION:
         provenance = _validate_provenance(
             SourceProvenance(
                 str(state.get("canonical_repository") or ""),
@@ -388,14 +425,13 @@ def _desired_state(
         relative: _sha256(source_root.joinpath(*PurePosixPath(relative).parts))
         for relative in managed_paths
     }
-    manifest_payload = "\n".join(managed_paths).encode("utf-8")
     return {
         "schema_version": SCHEMA_VERSION,
         "canonical_repository": provenance.canonical_repository,
         "canonical_commit": provenance.canonical_commit,
         "version": provenance.version,
         "managed_paths": list(managed_paths),
-        "manifest_sha256": hashlib.sha256(manifest_payload).hexdigest(),
+        "manifest_sha256": _content_manifest_sha256(managed_paths, files),
         "files": files,
     }
 

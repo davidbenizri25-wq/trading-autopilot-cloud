@@ -7,11 +7,16 @@ plan.  It never places orders and it never upgrades incomplete data to ENTER.
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import date as datetime_date, datetime, time as datetime_time, timedelta, timezone
+from functools import lru_cache
 import math
 import re
 from typing import Any, Iterable, Mapping, Optional
+from zoneinfo import ZoneInfo
+
+from timeframes import normalize_timeframe
 
 
 TIMEFRAME_WEIGHTS = {
@@ -25,6 +30,18 @@ TIMEFRAME_WEIGHTS = {
 }
 REQUIRED_TIMEFRAMES = ("1W", "1D", "4H", "15M")
 MIN_REQUIRED_BARS = 60
+MARKET_TIMEZONE = ZoneInfo("America/New_York")
+MAX_REALTIME_AGE_SECONDS = 2 * 60
+MAX_DELAYED_AGE_SECONDS = 30 * 60
+FRAME_MAX_AGE_SECONDS = {
+    "15M": MAX_DELAYED_AGE_SECONDS,
+    # The most recent completed 4H/Daily bar can legitimately be from the
+    # prior regular session, including a three-day weekend.
+    "4H": 5 * 24 * 60 * 60,
+    "1D": 5 * 24 * 60 * 60,
+    # A current weekly structure bar is normally the previous Friday close.
+    "1W": 14 * 24 * 60 * 60,
+}
 STATE_TO_VERDICT = {
     "ENTER": "ENTER",
     "FORMING": "WAIT FOR CONFIRMATION",
@@ -33,6 +50,426 @@ STATE_TO_VERDICT = {
     "EXTENDED": "PASS",
     "INVALIDATED": "PASS",
 }
+
+
+@dataclass(frozen=True)
+class FreshnessAssessment:
+    """Pure decision-currentness result shared by service, UI, and tests."""
+
+    valid_for_entry: bool
+    effective_label: str
+    timestamp: Optional[str]
+    age_seconds: Optional[float]
+    reasons: tuple[str, ...] = ()
+
+
+def _utc_datetime(value: Any) -> Optional[datetime]:
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _regular_session_open(now: datetime) -> bool:
+    local = now.astimezone(MARKET_TIMEZONE)
+    wall_clock = local.time().replace(tzinfo=None)
+    return (
+        _is_exchange_session_date(local.date())
+        and datetime_time(9, 30) <= wall_clock < exchange_session_close_time(local.date())
+    )
+
+
+def _nth_weekday(year: int, month: int, weekday: int, occurrence: int) -> datetime_date:
+    first = datetime_date(year, month, 1)
+    offset = (weekday - first.weekday()) % 7
+    return first + timedelta(days=offset + 7 * (occurrence - 1))
+
+
+def _last_weekday(year: int, month: int, weekday: int) -> datetime_date:
+    if month == 12:
+        cursor = datetime_date(year + 1, 1, 1) - timedelta(days=1)
+    else:
+        cursor = datetime_date(year, month + 1, 1) - timedelta(days=1)
+    return cursor - timedelta(days=(cursor.weekday() - weekday) % 7)
+
+
+def _easter_sunday(year: int) -> datetime_date:
+    """Return Gregorian Easter using the Meeus/Jones/Butcher algorithm."""
+
+    a = year % 19
+    b, c = divmod(year, 100)
+    d, e = divmod(b, 4)
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i, k = divmod(c, 4)
+    l = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * l) // 451
+    month = (h + l - 7 * m + 114) // 31
+    day = (h + l - 7 * m + 114) % 31 + 1
+    return datetime_date(year, month, day)
+
+
+def _observed_fixed_holiday(
+    value: datetime_date,
+    *,
+    observe_saturday: bool = True,
+) -> datetime_date:
+    if value.weekday() == 5 and observe_saturday:
+        return value - timedelta(days=1)
+    if value.weekday() == 6:
+        return value + timedelta(days=1)
+    return value
+
+
+@lru_cache(maxsize=32)
+def _exchange_holidays(year: int) -> frozenset[datetime_date]:
+    """Return regular full-day NYSE-style closures for a calendar year.
+
+    The calendar intentionally covers recurring full-day closures only. An
+    unexpected exceptional closure therefore remains fail-closed because no
+    bar will satisfy the expected-session check.
+    """
+
+    holidays = {
+        # NYSE does not normally move a Saturday New Year's closure into the
+        # prior calendar year (for example, Dec. 31, 2021 remained open).
+        _observed_fixed_holiday(datetime_date(year, 1, 1), observe_saturday=False),
+        _nth_weekday(year, 1, 0, 3),  # Martin Luther King Jr. Day
+        _nth_weekday(year, 2, 0, 3),  # Washington's Birthday
+        _easter_sunday(year) - timedelta(days=2),  # Good Friday
+        _last_weekday(year, 5, 0),  # Memorial Day
+        _observed_fixed_holiday(datetime_date(year, 7, 4)),
+        _nth_weekday(year, 9, 0, 1),  # Labor Day
+        _nth_weekday(year, 11, 3, 4),  # Thanksgiving
+        _observed_fixed_holiday(datetime_date(year, 12, 25)),
+    }
+    if year >= 2022:
+        holidays.add(_observed_fixed_holiday(datetime_date(year, 6, 19)))
+    return frozenset(holidays)
+
+
+def _is_exchange_session_date(value: datetime_date) -> bool:
+    return value.weekday() < 5 and value not in _exchange_holidays(value.year)
+
+
+def _previous_exchange_session(value: datetime_date) -> datetime_date:
+    candidate = value - timedelta(days=1)
+    for _ in range(14):
+        if _is_exchange_session_date(candidate):
+            return candidate
+        candidate -= timedelta(days=1)
+    # Fourteen consecutive calendar days without a regular session is not a
+    # normal U.S. equity schedule. Preserve the conservative prior date so the
+    # caller's exact-session comparison fails closed.
+    return candidate
+
+
+def _session_week_start(value: datetime_date) -> datetime_date:
+    return value - timedelta(days=value.weekday())
+
+
+def _is_early_close_session(value: datetime_date) -> bool:
+    thanksgiving = _nth_weekday(value.year, 11, 3, 4)
+    independence_closure = _observed_fixed_holiday(datetime_date(value.year, 7, 4))
+    early_before_independence = (
+        _previous_exchange_session(independence_closure)
+        if independence_closure.weekday() != 0
+        else None
+    )
+    return (
+        value == thanksgiving + timedelta(days=1)
+        or (value.month == 12 and value.day == 24)
+        or value == early_before_independence
+    ) and _is_exchange_session_date(value)
+
+
+def exchange_session_close_time(value: datetime_date) -> datetime_time:
+    """Return the recurring regular cash-session close."""
+
+    return datetime_time(13, 0) if _is_early_close_session(value) else datetime_time(16, 0)
+
+
+def _latest_4h_bucket_completion_time(value: datetime_date) -> datetime_time:
+    # A 09:30-anchored 4H aggregate completes at 13:30 even when the cash
+    # session itself closes at 13:00.
+    return datetime_time(13, 30) if _is_early_close_session(value) else datetime_time(16, 0)
+
+
+def assess_source_freshness(
+    *,
+    data_label: Any,
+    data_timestamp: Any,
+    market_status: Any,
+    now: Optional[datetime] = None,
+) -> FreshnessAssessment:
+    """Validate one source timestamp without trusting a precomputed label.
+
+    This helper never upgrades a source already labelled stale or unavailable.
+    A source must be inside the regular session, have a non-future timestamp,
+    and agree with its real-time/delayed label before it is entry-eligible.
+    """
+
+    observed_at = now or datetime.now(timezone.utc)
+    if observed_at.tzinfo is None:
+        observed_at = observed_at.replace(tzinfo=timezone.utc)
+    observed_at = observed_at.astimezone(timezone.utc)
+    original_label = str(data_label or "unavailable").strip().lower().replace("_", "-")
+    supported_labels = {"real-time", "realtime", "delayed", "last-close", "stale", "unavailable"}
+    if original_label == "realtime":
+        original_label = "real-time"
+    timestamp = _utc_datetime(data_timestamp)
+    reasons: list[str] = []
+    effective_label = original_label if original_label in supported_labels else "unavailable"
+
+    if original_label not in supported_labels:
+        reasons.append("Market-data currentness label is unsupported.")
+    if original_label in {"stale", "unavailable"}:
+        reasons.append(f"Market data is {original_label}; incomplete data cannot produce ENTER.")
+    if timestamp is None:
+        reasons.append("Market-data source timestamp is missing or invalid.")
+        if original_label not in {"stale", "unavailable"}:
+            effective_label = "unavailable"
+
+    age_seconds: Optional[float] = None
+    if timestamp is not None:
+        age_seconds = (observed_at - timestamp).total_seconds()
+        if age_seconds < 0:
+            reasons.append("Market-data source timestamp is in the future.")
+            if original_label not in {"stale", "unavailable"}:
+                effective_label = "stale"
+
+    normalized_market = str(market_status or "unknown").strip().lower()
+    regular_session_open = normalized_market == "open" and _regular_session_open(observed_at)
+    if not regular_session_open:
+        reasons.append("The regular market is not open; current evidence cannot produce ENTER.")
+        if effective_label in {"real-time", "delayed"}:
+            effective_label = "last-close"
+    if original_label == "last-close":
+        reasons.append("Last-close evidence is planning-only and cannot produce ENTER.")
+    if age_seconds is not None and age_seconds >= 0:
+        if original_label == "real-time" and age_seconds > MAX_REALTIME_AGE_SECONDS:
+            reasons.append("Real-time label contradicts the source timestamp age.")
+            effective_label = "stale"
+        elif original_label == "delayed" and age_seconds > MAX_DELAYED_AGE_SECONDS:
+            reasons.append("Delayed source timestamp is stale.")
+            effective_label = "stale"
+
+    clean_timestamp = (
+        timestamp.isoformat().replace("+00:00", "Z") if timestamp is not None else None
+    )
+    return FreshnessAssessment(
+        valid_for_entry=not reasons,
+        effective_label=effective_label,
+        timestamp=clean_timestamp,
+        age_seconds=age_seconds,
+        reasons=tuple(dict.fromkeys(reasons)),
+    )
+
+
+def bar_completion_timestamp(timestamp: datetime, timeframe: str) -> datetime:
+    """Return the expected completion instant for one provider bar start."""
+
+    value = timestamp if timestamp.tzinfo is not None else timestamp.replace(tzinfo=timezone.utc)
+    value = value.astimezone(timezone.utc)
+    label = normalize_timeframe(timeframe)
+    durations = {"1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30, "1H": 60, "4H": 240}
+    if label in durations:
+        completion = value + timedelta(minutes=durations[label])
+        local_start = value.astimezone(MARKET_TIMEZONE)
+        regular_close = datetime.combine(
+            local_start.date(), datetime_time(16, 0), tzinfo=MARKET_TIMEZONE
+        ).astimezone(timezone.utc)
+        if datetime_time(9, 30) <= local_start.time().replace(tzinfo=None) < datetime_time(16, 0):
+            completion = min(completion, regular_close)
+        return completion
+    local = value.astimezone(MARKET_TIMEZONE)
+    if label == "1D":
+        return datetime.combine(
+            local.date(), datetime_time(16, 0), tzinfo=MARKET_TIMEZONE
+        ).astimezone(timezone.utc)
+    if label == "1W":
+        monday = local.date() - timedelta(days=local.weekday())
+        return datetime.combine(
+            monday + timedelta(days=4), datetime_time(16, 0), tzinfo=MARKET_TIMEZONE
+        ).astimezone(timezone.utc)
+    if label == "1M":
+        if local.month == 12:
+            next_month = datetime(local.year + 1, 1, 1, tzinfo=MARKET_TIMEZONE)
+        else:
+            next_month = datetime(local.year, local.month + 1, 1, tzinfo=MARKET_TIMEZONE)
+        return next_month.astimezone(timezone.utc)
+    return value
+
+
+def required_frame_freshness_issues(
+    bars_by_timeframe: Mapping[str, Iterable[Mapping[str, Any]]],
+    *,
+    now: datetime,
+    market_status: Any,
+    required_timeframes: Iterable[str] = REQUIRED_TIMEFRAMES,
+    context: str = "Ticker",
+) -> list[str]:
+    """Return cadence-aware freshness blockers for required completed frames."""
+
+    current = now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
+    current = current.astimezone(timezone.utc)
+    normalized_market = str(market_status or "unknown").strip().lower()
+    issues: list[str] = []
+    safe_context = re.sub(r"[^A-Za-z0-9 ._\-/]", "", str(context or "Ticker"))[:80] or "Ticker"
+    for raw_label in required_timeframes:
+        label = str(raw_label or "").strip().upper()
+        rows = normalize_bars(bars_by_timeframe.get(label, []))
+        if not rows:
+            issues.append(f"{safe_context} {label} source timestamp is missing.")
+            continue
+
+        # Providers commonly include the candle that is still forming.  Entry
+        # freshness must be based on the newest *completed* candle, not the
+        # newest row, or current daily/weekly/intraday bars would make healthy
+        # live evidence look future-dated throughout their formation period.
+        completed_at: Optional[datetime] = None
+        completed_started_at: Optional[datetime] = None
+        saw_future_or_in_progress = False
+        for row in reversed(rows):
+            timestamp = row.get("timestamp")
+            if not isinstance(timestamp, (int, float)) or timestamp <= 1_000_000_000:
+                continue
+            try:
+                started_at = datetime.fromtimestamp(timestamp, timezone.utc)
+                candidate_completion = bar_completion_timestamp(started_at, label)
+            except (OSError, OverflowError, ValueError):
+                continue
+            if candidate_completion <= current:
+                completed_at = candidate_completion
+                completed_started_at = started_at
+                break
+            saw_future_or_in_progress = True
+
+        if completed_at is None:
+            if saw_future_or_in_progress:
+                issues.append(f"{safe_context} {label} source timestamp is in the future.")
+            else:
+                issues.append(f"{safe_context} {label} source timestamp is missing.")
+            continue
+        age_seconds = (current - completed_at).total_seconds()
+        maximum_age = FRAME_MAX_AGE_SECONDS.get(label)
+        if maximum_age is not None and age_seconds > maximum_age:
+            issues.append(f"{safe_context} {label} evidence is stale for its cadence.")
+            continue
+        if normalized_market == "open" and _regular_session_open(current):
+            local_now = current.astimezone(MARKET_TIMEZONE)
+            local_completion = completed_at.astimezone(MARKET_TIMEZONE)
+            previous_session = _previous_exchange_session(local_now.date())
+            if label == "15M":
+                if (
+                    local_now.time().replace(tzinfo=None) < datetime_time(9, 45)
+                    or local_completion.date() != local_now.date()
+                    or local_completion.time().replace(tzinfo=None) < datetime_time(9, 45)
+                ):
+                    issues.append(
+                        f"{safe_context} 15M has no current-session completed bar after 09:45 ET."
+                    )
+            elif label == "4H":
+                after_first_bucket = (
+                    local_now.time().replace(tzinfo=None) >= datetime_time(13, 30)
+                )
+                expected_session = local_now.date() if after_first_bucket else previous_session
+                minimum_completion = (
+                    datetime_time(13, 30)
+                    if after_first_bucket
+                    else _latest_4h_bucket_completion_time(previous_session)
+                )
+                if (
+                    local_completion.date() != expected_session
+                    or local_completion.time().replace(tzinfo=None) < minimum_completion
+                ):
+                    issues.append(
+                        f"{safe_context} 4H evidence is not from the latest completed exchange-session bucket."
+                    )
+            elif label == "1D" and local_completion.date() != previous_session:
+                issues.append(
+                    f"{safe_context} 1D evidence is not from the latest completed exchange session."
+                )
+            elif label == "1W" and completed_started_at is not None:
+                prior_week_session = _previous_exchange_session(
+                    _session_week_start(local_now.date())
+                )
+                expected_week = _session_week_start(prior_week_session)
+                observed_week = _session_week_start(
+                    completed_started_at.astimezone(MARKET_TIMEZONE).date()
+                )
+                if observed_week != expected_week:
+                    issues.append(
+                        f"{safe_context} 1W evidence is not from the latest completed exchange week."
+                    )
+    return list(dict.fromkeys(issues))
+
+
+def revalidate_decision_freshness(
+    decision: Mapping[str, Any] | None,
+    *,
+    now: Optional[datetime] = None,
+    market_status: Optional[str] = None,
+) -> dict[str, Any]:
+    """Return a copy gated against current time; never upgrade a stale decision."""
+
+    source = deepcopy(dict(decision or {}))
+    observed_at = now or datetime.now(timezone.utc)
+    if observed_at.tzinfo is None:
+        observed_at = observed_at.replace(tzinfo=timezone.utc)
+    observed_at = observed_at.astimezone(timezone.utc)
+    assessment = assess_source_freshness(
+        data_label=source.get("data_label"),
+        data_timestamp=source.get("data_timestamp"),
+        market_status=market_status if market_status is not None else source.get("market_status"),
+        now=now,
+    )
+    if assessment.valid_for_entry:
+        return source
+
+    source["data_label"] = assessment.effective_label
+    if (
+        str(source.get("market_status") or "").strip().lower() == "open"
+        and not _regular_session_open(observed_at)
+    ):
+        source["market_status"] = "closed"
+    source["verdict"] = "PASS"
+    source["state"] = "BLOCKED"
+    source["entry_conditions_satisfied"] = False
+    source["do_this_now"] = (
+        "Pass for now—current market evidence failed the freshness/session gate, so no entry decision was made."
+    )
+    source["primary_risk"] = assessment.reasons[0] if assessment.reasons else (
+        "Current market evidence is not eligible for an entry decision."
+    )
+    blockers = [str(item) for item in list(source.get("blockers") or []) if str(item).strip()]
+    source["blockers"] = list(dict.fromkeys([*assessment.reasons, *blockers]))
+    reasons = [str(item) for item in list(source.get("reasons") or []) if str(item).strip()]
+    source["reasons"] = list(dict.fromkeys([*assessment.reasons, *reasons]))[:3]
+    options = source.get("options") if isinstance(source.get("options"), Mapping) else None
+    if options is not None:
+        gated_options = deepcopy(dict(options))
+        gated_options.update(
+            {
+                "status": "PASS",
+                "recommendation": "No contract recommendation",
+                "reason": "Options are gated because the underlying evidence is not current and entry-eligible.",
+                "contracts": [],
+                "ranked_contracts": [],
+            }
+        )
+        source["options"] = gated_options
+    return source
 
 
 def _float(value: Any) -> Optional[float]:
@@ -654,6 +1091,8 @@ def evaluate_setup(
     earnings_throttled: bool = False,
     news: Optional[list[dict[str, Any]]] = None,
     provider_warnings: Optional[list[str]] = None,
+    evaluated_at: Optional[datetime] = None,
+    freshness_issues: Optional[Iterable[str]] = None,
 ) -> DecisionResult:
     """Evaluate a setup without relying on a generic score threshold."""
 
@@ -665,12 +1104,24 @@ def evaluate_setup(
     }
     analyses = {label: analyze_timeframe(label, rows) for label, rows in normalized_input.items()}
     market = market_context or MarketContext()
+    freshness = assess_source_freshness(
+        data_label=data_label,
+        data_timestamp=data_timestamp,
+        market_status=market_status,
+        now=evaluated_at,
+    )
     warnings = (
         ["Some supporting provider inputs were unavailable; no missing observation was inferred."]
         if any(str(item or "").strip() for item in list(provider_warnings or []))
         else []
     )
     blockers: list[str] = []
+    blockers.extend(freshness.reasons)
+    blockers.extend(
+        str(item).strip()
+        for item in list(freshness_issues or [])
+        if str(item or "").strip()
+    )
     for timeframe in REQUIRED_TIMEFRAMES:
         item = analyses.get(timeframe)
         if not _required_frame_complete(item):
@@ -812,9 +1263,6 @@ def evaluate_setup(
     earnings_pending = normalized_earnings_status == "unresolved"
     if earnings_pending:
         warnings.append("The next earnings date is unavailable and must be verified before entry.")
-    if data_label.lower() in {"unavailable", "stale"}:
-        blockers.append(f"Market data is {data_label.lower()}; incomplete data cannot produce ENTER.")
-
     confirmed = False
     near_trigger = False
     extended = False
@@ -943,7 +1391,7 @@ def evaluate_setup(
         current_price=_round(current_price, 2),
         market_status=market_status,
         data_timestamp=timestamp,
-        data_label=data_label,
+        data_label=freshness.effective_label,
         data_source=data_source,
         entry_conditions_satisfied=state == "ENTER",
         plan=plan,

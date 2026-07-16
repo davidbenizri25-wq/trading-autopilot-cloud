@@ -12,6 +12,7 @@ from copy import deepcopy
 from dataclasses import asdict
 from datetime import datetime, timezone
 import hashlib
+import hmac
 import html
 import json
 import os
@@ -20,7 +21,11 @@ import re
 from typing import Any, Callable, Mapping, MutableMapping, Optional
 
 from autopilot_chart import build_autopilot_chart
-from autopilot_engine import analyze_timeframe
+from autopilot_engine import (
+    analyze_timeframe,
+    assess_source_freshness,
+    revalidate_decision_freshness,
+)
 from autopilot_journal import aggregate_calibration, evaluate_journal_outcome
 from autopilot_service import (
     AutopilotServiceError,
@@ -734,14 +739,24 @@ def _config_value(config: Mapping[str, Any] | Any | None, key: str, default: Any
     return getattr(config, key, default)
 
 
-def _safe_decision(decision: Mapping[str, Any] | None) -> dict[str, Any]:
+def _safe_decision(
+    decision: Mapping[str, Any] | None,
+    *,
+    now: Optional[datetime] = None,
+) -> dict[str, Any]:
     """Prepare a fail-closed, display-safe decision mapping."""
 
-    source = deepcopy(dict(decision or {}))
+    # Currentness is evidence, not durable state. Re-age every decision at the
+    # render boundary so a cached/session-held ENTER cannot outlive its source.
+    source = revalidate_decision_freshness(decision, now=now)
     data_label = str(source.get("data_label") or "unavailable").strip().lower()
     source_name = str(source.get("data_source") or "Unavailable").strip().lower()
     price = _number(source.get("current_price"))
-    fail_closed = data_label in {"unavailable", "stale"} or source_name == "unavailable" or price is None
+    fail_closed = (
+        data_label in {"unavailable", "stale", "last-close", "last_close"}
+        or source_name == "unavailable"
+        or price is None
+    )
     if fail_closed:
         source["verdict"] = "PASS"
         source["state"] = "BLOCKED"
@@ -773,15 +788,63 @@ def _safe_decision(decision: Mapping[str, Any] | None) -> dict[str, Any]:
     else:
         breakdown = dict(breakdown)
     if fail_closed:
-        breakdown["final_verdict"] = source["do_this_now"]
+        unavailable_scenario = (
+            "This scenario is not actionable until fresh regular-session provider evidence is restored."
+        )
+        breakdown.update(
+            {
+                "entry_and_invalidation_plan": source["do_this_now"],
+                "targets_and_reward_to_risk": (
+                    "Previously calculated levels are historical only and are not an active trade plan."
+                ),
+                "bull_case": unavailable_scenario,
+                "bear_case": unavailable_scenario,
+                "no_trade_case": source["do_this_now"],
+                "options_analysis": (
+                    "Options are gated because the underlying evidence is not current and entry-eligible."
+                ),
+                "final_verdict": source["do_this_now"],
+            }
+        )
     source["full_breakdown"] = breakdown
     return source
 
 
-def build_decision_brief(decision: Mapping[str, Any] | None) -> dict[str, Any]:
+def revalidated_provider_health(
+    health: Mapping[str, Any] | None,
+    decision: Mapping[str, Any] | None,
+    *,
+    now: Optional[datetime] = None,
+) -> dict[str, Any]:
+    """Re-age display health from the same evidence used by the decision gate."""
+
+    source = deepcopy(dict(health or {}))
+    evidence = decision if isinstance(decision, Mapping) else {}
+    assessment = assess_source_freshness(
+        data_label=evidence.get("data_label") or source.get("data_label"),
+        data_timestamp=evidence.get("data_timestamp") or source.get("timestamp"),
+        market_status=evidence.get("market_status"),
+        now=now,
+    )
+    source["data_label"] = assessment.effective_label
+    source["timestamp"] = assessment.timestamp or source.get("timestamp")
+    source["data_age_seconds"] = (
+        round(assessment.age_seconds, 3)
+        if assessment.age_seconds is not None and assessment.age_seconds >= 0
+        else None
+    )
+    source["stale"] = not assessment.valid_for_entry
+    return source
+
+
+def build_decision_brief(
+    decision: Mapping[str, Any] | None,
+    *,
+    now: Optional[datetime] = None,
+) -> dict[str, Any]:
     """Build every value required by the top decision card."""
 
-    safe = _safe_decision(decision)
+    safe = _safe_decision(decision, now=now)
     plan = safe.get("plan") if isinstance(safe.get("plan"), Mapping) else {}
     reasons = [public_text(item, "Evidence unavailable") for item in list(safe.get("reasons") or [])[:3]]
     while len(reasons) < 3:
@@ -798,6 +861,14 @@ def build_decision_brief(decision: Mapping[str, Any] | None) -> dict[str, Any]:
     )
     confidence = _number(safe.get("confidence"))
     confidence_text = f"{max(0, min(100, int(round(confidence))))}%" if confidence is not None else "Unavailable"
+    data_label = str(safe.get("data_label") or "unavailable").strip().lower()
+    price_label = (
+        "Last observed price"
+        if data_label in {"stale", "last-close", "last_close"}
+        else "Price unavailable"
+        if data_label == "unavailable"
+        else "Current price"
+    )
     return {
         "verdict": verdict,
         "verdict_class": "enter" if verdict == "ENTER" else "wait" if verdict == "WAIT" else "pass",
@@ -814,6 +885,7 @@ def build_decision_brief(decision: Mapping[str, Any] | None) -> dict[str, Any]:
         ),
         "grade": public_text(safe.get("grade"), "Unavailable", max_length=8),
         "current_price": format_price(safe.get("current_price")),
+        "price_label": price_label,
         "market_status": public_text(str(safe.get("market_status") or "unknown").replace("_", " ").title(), "Unknown"),
         "timestamp": format_timestamp(safe.get("data_timestamp")),
         "currentness": currentness_label(safe.get("data_label")),
@@ -916,6 +988,25 @@ def options_table_rows(options: Mapping[str, Any] | None) -> list[dict[str, str]
     return rows
 
 
+def options_empty_state_message(decision: Mapping[str, Any] | None) -> str:
+    """Explain an empty options result without implying an unperformed screen."""
+
+    source = decision if isinstance(decision, Mapping) else {}
+    options = source.get("options") if isinstance(source.get("options"), Mapping) else {}
+    status = str(options.get("status") or "unavailable").strip().upper()
+    state = str(source.get("state") or "BLOCKED").strip().upper()
+    if state not in {"ENTER", "ARMED"}:
+        return (
+            "Options: not run — screening was skipped because the underlying setup "
+            "did not reach an options-eligible ENTER or ARMED state."
+        )
+    if status == "WAIT":
+        return "Options: wait — the underlying setup is not confirmed, so no contract is recommended."
+    if status == "PASS":
+        return "Options: pass — no usable contract observations were returned for evaluation."
+    return "Options: unavailable — a current, complete chain was not returned."
+
+
 def _format_decimal(value: Any, digits: int) -> str:
     number = _number(value)
     return f"{number:.{digits}f}" if number is not None else "Unavailable"
@@ -932,7 +1023,11 @@ def _earnings_label(value: Mapping[str, Any]) -> str:
     return date
 
 
-def build_home_snapshot(state: Mapping[str, Any] | None) -> dict[str, Any]:
+def build_home_snapshot(
+    state: Mapping[str, Any] | None,
+    *,
+    now: Optional[datetime] = None,
+) -> dict[str, Any]:
     """Build the source-backed home model from persisted personal state."""
 
     state = state or {}
@@ -942,11 +1037,15 @@ def build_home_snapshot(state: Mapping[str, Any] | None) -> dict[str, Any]:
         if not isinstance(raw, Mapping):
             continue
         decision = raw.get("decision") if isinstance(raw.get("decision"), Mapping) else raw
-        safe = _safe_decision(decision)
+        safe = _safe_decision(decision, now=now)
         safe["ticker"] = str(safe.get("ticker") or ticker_key).upper()
         safe["saved_at"] = raw.get("saved_at") or safe.get("saved_at")
         if isinstance(raw.get("provider_health"), Mapping):
-            safe["provider_health"] = dict(raw.get("provider_health") or {})
+            safe["provider_health"] = revalidated_provider_health(
+                raw.get("provider_health"),
+                safe,
+                now=now,
+            )
         analyses.append(safe)
     analyses.sort(
         key=lambda item: (
@@ -1041,7 +1140,7 @@ def build_home_snapshot(state: Mapping[str, Any] | None) -> dict[str, Any]:
         "enter_candidates": [item for item in analyses if str(item.get("state")).upper() == "ENTER"][:5],
         "armed_candidates": [item for item in analyses if str(item.get("state")).upper() == "ARMED"][:5],
         "invalidated": [item for item in analyses if str(item.get("state")).upper() == "INVALIDATED"][:5],
-        "positions": build_position_snapshot(state),
+        "positions": build_position_snapshot(state, now=now),
         "data_health": f"{public_text(data_source, 'Unavailable', max_length=48)} · {currentness_label(data_label)}",
         "last_refresh": format_timestamp(
             provider_health.get("timestamp") or newest.get("data_timestamp") or newest.get("saved_at")
@@ -1049,7 +1148,11 @@ def build_home_snapshot(state: Mapping[str, Any] | None) -> dict[str, Any]:
     }
 
 
-def build_position_snapshot(state: Mapping[str, Any] | None) -> list[dict[str, str]]:
+def build_position_snapshot(
+    state: Mapping[str, Any] | None,
+    *,
+    now: Optional[datetime] = None,
+) -> list[dict[str, str]]:
     """Build conservative position-management cards from saved plans and fresh analyses."""
 
     state = state or {}
@@ -1062,7 +1165,7 @@ def build_position_snapshot(state: Mapping[str, Any] | None) -> list[dict[str, s
         ticker = str(raw_position.get("ticker") or ticker_key).upper()
         raw_analysis = analyses.get(ticker) if isinstance(analyses.get(ticker), Mapping) else {}
         decision = raw_analysis.get("decision") if isinstance(raw_analysis.get("decision"), Mapping) else raw_analysis
-        safe = _safe_decision(decision if isinstance(decision, Mapping) else {})
+        safe = _safe_decision(decision if isinstance(decision, Mapping) else {}, now=now)
         direction = str(raw_position.get("direction") or safe.get("direction") or "unknown").lower()
         current = _number(safe.get("current_price"))
         entry = _number(raw_position.get("entry_price"))
@@ -1146,8 +1249,15 @@ def _initialize_state(
     presentation: bool = False,
 ) -> tuple[dict[str, Any], Optional[AutopilotStateStore]]:
     session = st.session_state
+    if presentation:
+        state = session.get("_autopilot_presentation_state")
+        if not isinstance(state, Mapping):
+            state = default_state()
+            session["_autopilot_presentation_state"] = state
+        return state, None
+
     private_state_enabled = _truthy(_config_value(config, "AUTOPILOT_PRIVATE_STATE_ENABLED"))
-    path = None if presentation or not private_state_enabled else resolve_state_path(config)
+    path = resolve_state_path(config) if private_state_enabled else None
     session_key = hashlib.sha256(path.encode("utf-8")).hexdigest() if path else "session-only"
     if session.get("_autopilot_state_identity") == session_key and "_autopilot_personal_state" in session:
         return session["_autopilot_personal_state"], session.get("_autopilot_state_store")
@@ -1178,7 +1288,8 @@ def _safe_analysis_record(payload: Mapping[str, Any]) -> dict[str, Any]:
     market = decision.get("market_context") if isinstance(decision.get("market_context"), Mapping) else {}
     options = decision.get("options") if isinstance(decision.get("options"), Mapping) else {}
     timeframes = decision.get("timeframes") if isinstance(decision.get("timeframes"), Mapping) else {}
-    health = payload.get("provider_health") if isinstance(payload.get("provider_health"), Mapping) else {}
+    raw_health = payload.get("provider_health") if isinstance(payload.get("provider_health"), Mapping) else {}
+    health = revalidated_provider_health(raw_health, decision)
     return {
         "ticker": decision.get("ticker"),
         "name": decision.get("name"),
@@ -1213,6 +1324,8 @@ def _safe_analysis_record(payload: Mapping[str, Any]) -> dict[str, Any]:
             "status": health.get("status"),
             "data_label": health.get("data_label"),
             "timestamp": health.get("timestamp"),
+            "data_age_seconds": health.get("data_age_seconds"),
+            "stale": health.get("stale") is True,
         },
     }
 
@@ -1418,7 +1531,10 @@ def _tracking_snapshot(payload: Mapping[str, Any]) -> dict[str, Any]:
 def _apply_tracking_action(st: Any, payload: Mapping[str, Any], action: str) -> str:
     session = st.session_state
     state = deepcopy(session.get("_autopilot_personal_state") or default_state())
-    decision = _safe_decision(payload.get("decision") if isinstance(payload.get("decision"), Mapping) else {})
+    raw_decision = payload.get("decision") if isinstance(payload.get("decision"), Mapping) else {}
+    # Re-age again at the action boundary. A page may remain open after the
+    # last render, and recording an entry must never trust that older verdict.
+    decision = _safe_decision(revalidate_decision_freshness(raw_decision))
     if action == "entered" and not entry_action_allowed(build_decision_brief(decision)):
         return "blocked"
     ticker = str(decision.get("ticker") or "").upper()
@@ -1572,7 +1688,21 @@ def _presentation_mode(st: Any) -> bool:
     )
     if requested:
         st.session_state["_autopilot_presentation"] = True
-    return bool(st.session_state.get("_autopilot_presentation", requested))
+    enabled = bool(st.session_state.get("_autopilot_presentation", requested))
+    if enabled and not requested:
+        # Presentation is privacy-sensitive and shareable. Keep its URL marker
+        # invariant even if browser history/manual query editing drops it; the
+        # explicit toggle callback remains the authoritative way to turn it off.
+        _set_query_values(st, view="presentation", presentation=None)
+    return enabled
+
+
+def _sync_presentation_toggle(st: Any) -> None:
+    """Synchronize the widget, session flag and shareable query parameter."""
+
+    enabled = bool(st.session_state.get("_autopilot_presentation_toggle"))
+    st.session_state["_autopilot_presentation"] = enabled
+    _set_query_values(st, view="presentation" if enabled else None, presentation=None)
 
 
 def _active_timeframe(st: Any) -> str:
@@ -1637,7 +1767,7 @@ def _chart_rows_for(
             return load_chart_bars(ticker, label, provider_key)
 
         try:
-            rows = _CHART_CACHE.get_or_create(cache_key, create)
+            rows = _CHART_CACHE.get_or_create(cache_key, create, cache_if=bool)
         except Exception:
             rows = []
         if rows:
@@ -1835,7 +1965,7 @@ def _compact_market_value(value: Any) -> str:
 
 
 def release_build_label(state_path: Path | None = None) -> str:
-    """Return a public, secrets-safe source marker for production verification."""
+    """Return a public marker only when deployed content verifies end to end."""
 
     path = state_path or _RELEASE_STATE_PATH
     if path.is_symlink() or not path.is_file():
@@ -1847,7 +1977,7 @@ def release_build_label(state_path: Path | None = None) -> str:
     if not isinstance(state, Mapping):
         return f"v{APP_DISPLAY_VERSION}"
     if (
-        state.get("schema_version") != 2
+        state.get("schema_version") != 3
         or state.get("canonical_repository") != "davidbenizri25-wq/trading-elite-system"
         or state.get("version") != "2.1.0-premium-terminal"
     ):
@@ -1856,6 +1986,65 @@ def release_build_label(state_path: Path | None = None) -> str:
     manifest = str(state.get("manifest_sha256") or "").strip().lower()
     if not re.fullmatch(r"[0-9a-f]{40}", canonical) or not re.fullmatch(r"[0-9a-f]{64}", manifest):
         return f"v{APP_DISPLAY_VERSION}"
+    raw_files = state.get("files")
+    if not isinstance(raw_files, Mapping) or not raw_files:
+        return f"v{APP_DISPLAY_VERSION}"
+    raw_managed_paths = state.get("managed_paths")
+    if not isinstance(raw_managed_paths, list) or not raw_managed_paths:
+        return f"v{APP_DISPLAY_VERSION}"
+    normalized_files: dict[str, str] = {}
+    for raw_relative, raw_digest in raw_files.items():
+        relative = str(raw_relative or "").strip().replace("\\", "/")
+        digest = str(raw_digest or "").strip().lower()
+        relative_path = Path(relative)
+        if (
+            not relative
+            or relative_path.is_absolute()
+            or ".." in relative_path.parts
+            or not re.fullmatch(r"[0-9a-f]{64}", digest)
+        ):
+            return f"v{APP_DISPLAY_VERSION}"
+        if relative in normalized_files:
+            return f"v{APP_DISPLAY_VERSION}"
+        normalized_files[relative] = digest
+    normalized_managed_paths: list[str] = []
+    for raw_relative in raw_managed_paths:
+        relative = str(raw_relative or "").strip().replace("\\", "/")
+        relative_path = Path(relative)
+        if not relative or relative_path.is_absolute() or ".." in relative_path.parts:
+            return f"v{APP_DISPLAY_VERSION}"
+        normalized_managed_paths.append(relative)
+    if (
+        len(set(normalized_managed_paths)) != len(normalized_managed_paths)
+        or normalized_managed_paths != sorted(normalized_managed_paths)
+        or normalized_managed_paths != sorted(normalized_files)
+    ):
+        return f"v{APP_DISPLAY_VERSION}"
+    manifest_payload = [
+        {"path": relative, "sha256": normalized_files[relative]}
+        for relative in sorted(normalized_files)
+    ]
+    expected_manifest = hashlib.sha256(
+        json.dumps(
+            manifest_payload,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    if not hmac.compare_digest(manifest, expected_manifest):
+        return f"v{APP_DISPLAY_VERSION}"
+    root = path.parent.parent
+    for relative, expected_digest in normalized_files.items():
+        deployed = root.joinpath(*Path(relative).parts)
+        if deployed.is_symlink() or not deployed.is_file():
+            return f"v{APP_DISPLAY_VERSION}"
+        try:
+            actual_digest = hashlib.sha256(deployed.read_bytes()).hexdigest()
+        except OSError:
+            return f"v{APP_DISPLAY_VERSION}"
+        if not hmac.compare_digest(actual_digest, expected_digest):
+            return f"v{APP_DISPLAY_VERSION}"
     return f"v{APP_DISPLAY_VERSION} · source {canonical[:7]} · manifest {manifest[:7]}"
 
 
@@ -1892,9 +2081,15 @@ def _decision_rail_html(brief: Mapping[str, Any]) -> str:
             ("R:R", brief.get("reward_to_risk")),
         ]
     )
+    currentness = str(brief.get("currentness") or "")
+    title = (
+        "Historical levels · not actionable"
+        if currentness in {"Stale — decision gated", "Last close", "Unavailable"}
+        else "Decision rail"
+    )
     return (
         '<div class="ap-rail">'
-        '<div class="ap-section-title">Decision rail</div>'
+        f'<div class="ap-section-title">{html.escape(title)}</div>'
         + metrics
         + _reward_ladder_html(brief)
         + f'<div class="ap-label">Why this decision</div><ol>{reasons}</ol>'
@@ -1922,18 +2117,31 @@ def _render_header(st: Any, *, presentation: bool) -> bool:
     )
 
     toggle_key = "_autopilot_presentation_toggle"
+    query_requested = _query_value(st, "view") == "presentation" or _truthy(
+        _query_value(st, "presentation")
+    )
+    query_synced_key = "_autopilot_presentation_query_synced"
     if toggle_key not in st.session_state:
         st.session_state[toggle_key] = bool(presentation)
+    elif query_requested and not st.session_state.get(query_synced_key):
+        # A newly opened shareable URL must win over stale widget state from a
+        # previous normal-mode render in the same browser session.
+        st.session_state[toggle_key] = True
+    st.session_state[query_synced_key] = query_requested
     enabled = bool(
         st.toggle(
             "Presentation Mode",
             key=toggle_key,
             help="Hides personal watchlist, journal, positions and tracking controls for a clean shareable view.",
+            on_change=_sync_presentation_toggle,
+            args=(st,),
         )
     )
     if enabled != presentation:
-        st.session_state["_autopilot_presentation"] = enabled
-        _set_query_values(st, view="presentation" if enabled else None, presentation=None)
+        _sync_presentation_toggle(st)
+        rerun = getattr(st, "rerun", None)
+        if callable(rerun):
+            rerun()
     if enabled:
         st.markdown(
             "<style>header[data-testid='stHeader'] { background: transparent; } .ap-private-only { display:none !important; }</style>",
@@ -2105,7 +2313,7 @@ def _render_decision_card(st: Any, brief: Mapping[str, Any]) -> None:
     st.markdown(
         _html_grid(
             [
-                ("Current price", brief["current_price"]),
+                (brief["price_label"], brief["current_price"]),
                 ("Market", brief["market_status"]),
                 ("Setup", brief["setup_type"]),
                 ("Entry confirmed", brief["entry_satisfied"]),
@@ -2365,12 +2573,7 @@ def _render_options(st: Any, decision: Mapping[str, Any]) -> None:
     rows = options_table_rows(options)
     status = str(options.get("status") or "unavailable").strip().upper()
     if not rows:
-        messages = {
-            "WAIT": "Options: wait — the underlying setup is not confirmed, so no contract is recommended.",
-            "PASS": "Options: pass — no complete contract cleared every liquidity, freshness and risk gate.",
-            "UNAVAILABLE": "Options: unavailable — a current, complete chain was not returned.",
-        }
-        st.info(messages.get(status, "Options: unavailable — a current, complete chain was not returned."))
+        st.info(options_empty_state_message(decision))
         return
     if status == "RECOMMEND":
         st.success("A current contract cleared the underlying ENTER gate and the contract-quality gates.")
@@ -2426,7 +2629,8 @@ def _render_advanced(
         st.markdown("**Methodology shown on the app-native chart**")
         st.write("9 EMA · 21 WMA · 50 WMA · 200 WMA · 200 SMA · MACD 12/26/9")
         st.caption("The 21-period line is a weighted moving average, not an exponential moving average.")
-        health = payload.get("provider_health") if isinstance(payload.get("provider_health"), Mapping) else {}
+        raw_health = payload.get("provider_health") if isinstance(payload.get("provider_health"), Mapping) else {}
+        health = revalidated_provider_health(raw_health, brief.get("safe_decision"))
         st.markdown("**Source health**")
         st.write(
             f"{public_text(health.get('provider') or brief['source'], 'Unavailable', max_length=48)} · "
@@ -2505,7 +2709,9 @@ def _render_advanced(
             st.write("Personal state: saved across sessions" if persistence == "persistent" else "Personal state: this session only")
         st.markdown("**Focused ticker-analysis preset**")
         symbol = normalize_tradingview_symbol(payload.get("tradingview_symbol") or brief["ticker"])
-        watchlist = list(state.get("watchlist") or []) if isinstance(state, Mapping) else []
+        watchlist = [] if presentation else (
+            list(state.get("watchlist") or []) if isinstance(state, Mapping) else []
+        )
         load_tradingview = st.toggle(
             "Load official TradingView widgets",
             value=False,
@@ -2728,7 +2934,7 @@ def render_cockpit(st: Any, config: Mapping[str, Any] | Any | None = None) -> No
     if not isinstance(payload, Mapping):
         if not presentation:
             _prepare_home_context(st, config)
-        state = st.session_state.get("_autopilot_personal_state") or state
+            state = st.session_state.get("_autopilot_personal_state") or state
         _render_home(st, state, presentation=presentation)
         return
 
@@ -2764,7 +2970,8 @@ def render_cockpit(st: Any, config: Mapping[str, Any] | Any | None = None) -> No
     if not presentation:
         _render_tracking_actions(st, payload, brief)
     _render_breakdown(st, brief["safe_decision"])
-    state = st.session_state.get("_autopilot_personal_state") or state
+    if not presentation:
+        state = st.session_state.get("_autopilot_personal_state") or state
     _render_advanced(st, payload, state, brief, timeframe, presentation=presentation)
     _render_export(st, payload, brief, timeframe, selected_analysis)
     st.caption("Trading Autopilot provides decision support only. It does not connect to a broker or place orders.")
@@ -2781,9 +2988,11 @@ __all__ = [
     "format_price",
     "format_ratio",
     "format_timestamp",
+    "options_empty_state_message",
     "options_table_rows",
     "entry_action_allowed",
     "public_text",
+    "revalidated_provider_health",
     "render_cockpit",
     "resolve_state_path",
     "verdict_label",

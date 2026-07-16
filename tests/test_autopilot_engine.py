@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 import unittest
 
 from autopilot_engine import (
@@ -9,8 +10,18 @@ from autopilot_engine import (
     evaluate_tracked_plan,
     important_state_change,
     normalize_bars,
+    revalidate_decision_freshness,
+    required_frame_freshness_issues,
     wma_series,
 )
+
+
+EVALUATED_AT = datetime(2026, 7, 16, 14, 5, tzinfo=timezone.utc)
+SOURCE_TIMESTAMP = "2026-07-16T14:00:00Z"
+
+
+def freshness_inputs() -> dict[str, object]:
+    return {"data_timestamp": SOURCE_TIMESTAMP, "evaluated_at": EVALUATED_AT}
 
 
 def trend_bars(*, bullish: bool = True, count: int = 260, start: float = 100.0) -> list[dict[str, float]]:
@@ -38,6 +49,13 @@ def evaluate_confirmed_fixture(**earnings: object):
     """Evaluate one otherwise-confirmed setup with only earnings inputs varied."""
 
     bars = trend_bars()
+    inputs = {
+        "market_status": "open",
+        "data_label": "delayed",
+        **freshness_inputs(),
+        "average_daily_dollar_volume": 500_000_000,
+        **earnings,
+    }
     return evaluate_setup(
         "AAPL",
         {"1M": bars, "1W": bars, "1D": bars, "4H": bars, "1H": bars, "15M": bars, "5M": bars},
@@ -46,10 +64,7 @@ def evaluate_confirmed_fixture(**earnings: object):
             spy_direction="bullish",
             qqq_direction="bullish",
         ),
-        market_status="open",
-        data_label="delayed",
-        average_daily_dollar_volume=500_000_000,
-        **earnings,
+        **inputs,
     )
 
 
@@ -85,6 +100,7 @@ class AutopilotEngineTests(unittest.TestCase):
             market_context=MarketContext(regime="risk-on", spy_direction="bullish", qqq_direction="bullish"),
             market_status="open",
             data_label="delayed",
+            **freshness_inputs(),
             average_daily_dollar_volume=500_000_000,
             earnings_date="2030-12-01",
             days_to_earnings=120,
@@ -98,6 +114,233 @@ class AutopilotEngineTests(unittest.TestCase):
         self.assertGreaterEqual(result.plan.reward_to_risk or 0, 1.8)
         self.assertIn("calculated fallback", result.plan.target_basis["target_1"])
 
+    def test_timestamp_and_session_gate_blocks_old_future_and_last_close_enter(self) -> None:
+        valid_earnings = {
+            "earnings_status": "verified_none",
+            "earnings_checked_through": "2026-07-26",
+        }
+        cases = (
+            (
+                "midnight during open market",
+                {
+                    "data_label": "delayed",
+                    "data_timestamp": "2026-07-16T00:00:00Z",
+                },
+            ),
+            (
+                "future timestamp",
+                {
+                    "data_label": "real-time",
+                    "data_timestamp": "2026-07-16T14:06:00Z",
+                },
+            ),
+            (
+                "last close outside market",
+                {
+                    "market_status": "closed",
+                    "data_label": "last-close",
+                    "data_timestamp": "2026-07-15T20:00:00Z",
+                },
+            ),
+        )
+        for label, values in cases:
+            with self.subTest(label=label):
+                result = evaluate_confirmed_fixture(**valid_earnings, **values)
+                self.assertEqual(result.state, "BLOCKED")
+                self.assertEqual(result.verdict, "PASS")
+                self.assertFalse(result.entry_conditions_satisfied)
+
+    def test_cached_decision_is_reaged_and_never_upgrades_stale_input(self) -> None:
+        source_timestamp = "2026-07-16T13:35:00Z"
+        decision = {
+            "verdict": "ENTER",
+            "state": "ENTER",
+            "entry_conditions_satisfied": True,
+            "market_status": "open",
+            "data_label": "delayed",
+            "data_timestamp": source_timestamp,
+            "options": {
+                "status": "RECOMMEND",
+                "recommendation": "fixture",
+                "ranked_contracts": [{"contract_symbol": "fixture"}],
+            },
+        }
+        before_boundary = revalidate_decision_freshness(
+            decision,
+            now=datetime(2026, 7, 16, 14, 4, tzinfo=timezone.utc),
+        )
+        after_boundary = revalidate_decision_freshness(
+            decision,
+            now=datetime(2026, 7, 16, 14, 6, tzinfo=timezone.utc),
+        )
+        self.assertEqual(before_boundary["verdict"], "ENTER")
+        self.assertEqual(after_boundary["verdict"], "PASS")
+        self.assertEqual(after_boundary["state"], "BLOCKED")
+        self.assertEqual(after_boundary["options"]["ranked_contracts"], [])
+        self.assertEqual(decision["verdict"], "ENTER")
+
+        originally_stale = dict(
+            decision,
+            data_label="stale",
+            data_timestamp="2026-07-16T14:05:00Z",
+        )
+        gated = revalidate_decision_freshness(originally_stale, now=EVALUATED_AT)
+        self.assertEqual(gated["data_label"], "stale")
+        self.assertEqual(gated["verdict"], "PASS")
+
+        half_day = revalidate_decision_freshness(
+            {
+                **decision,
+                "data_timestamp": "2026-11-27T17:55:00Z",
+                "data_label": "delayed",
+            },
+            now=datetime(2026, 11, 27, 18, 5, tzinfo=timezone.utc),
+        )
+        self.assertEqual(half_day["verdict"], "PASS")
+        self.assertEqual(half_day["state"], "BLOCKED")
+        self.assertEqual(half_day["market_status"], "closed")
+        self.assertEqual(half_day["data_label"], "last-close")
+
+    def test_required_and_benchmark_frames_have_cadence_aware_age_gates(self) -> None:
+        def row(timestamp: str) -> dict[str, object]:
+            return {
+                "timestamp": timestamp,
+                "open": 100,
+                "high": 101,
+                "low": 99,
+                "close": 100.5,
+                "volume": 1_000,
+            }
+
+        current_frames = {
+            "15M": [row("2026-07-16T13:45:00Z")],
+            "4H": [row("2026-07-15T17:30:00Z")],
+            "1D": [row("2026-07-15T04:00:00Z")],
+            "1W": [row("2026-07-06T04:00:00Z")],
+        }
+        self.assertEqual(
+            required_frame_freshness_issues(
+                current_frames,
+                now=EVALUATED_AT,
+                market_status="open",
+                context="AAPL",
+            ),
+            [],
+        )
+
+        forming_frames = {
+            **current_frames,
+            # These newest rows are legitimately still forming at 10:05 ET.
+            # Freshness must fall back to the eligible completed rows above.
+            "15M": [
+                row("2026-07-16T13:45:00Z"),
+                row("2026-07-16T14:00:00Z"),
+            ],
+            "1D": [
+                row("2026-07-15T04:00:00Z"),
+                row("2026-07-16T04:00:00Z"),
+            ],
+            "1W": [
+                row("2026-07-06T04:00:00Z"),
+                row("2026-07-13T04:00:00Z"),
+            ],
+        }
+        self.assertEqual(
+            required_frame_freshness_issues(
+                forming_frames,
+                now=EVALUATED_AT,
+                market_status="open",
+                context="AAPL",
+            ),
+            [],
+        )
+
+        stale_target = {**current_frames, "1D": [row("2023-11-17T05:00:00Z")]}
+        target_issues = required_frame_freshness_issues(
+            stale_target,
+            now=EVALUATED_AT,
+            market_status="open",
+            context="AAPL",
+        )
+        self.assertTrue(any("AAPL 1D evidence is stale" in item for item in target_issues))
+
+        stale_benchmark = {
+            "1D": [row("2023-11-17T05:00:00Z")],
+            "4H": [row("2023-11-17T14:30:00Z")],
+        }
+        benchmark_issues = required_frame_freshness_issues(
+            stale_benchmark,
+            now=EVALUATED_AT,
+            market_status="open",
+            required_timeframes=("1D", "4H"),
+            context="SPY benchmark",
+        )
+        self.assertTrue(all("SPY benchmark" in item for item in benchmark_issues))
+
+        future = {**current_frames, "15M": [row("2026-07-16T14:05:00Z")]}
+        future_issues = required_frame_freshness_issues(
+            future,
+            now=EVALUATED_AT,
+            market_status="open",
+            context="AAPL",
+        )
+        self.assertTrue(any("15M source timestamp is in the future" in item for item in future_issues))
+
+        missing_sessions = {
+            **current_frames,
+            "4H": [row("2026-07-13T17:30:00Z")],
+            "1D": [row("2026-07-13T04:00:00Z")],
+        }
+        missing_session_issues = required_frame_freshness_issues(
+            missing_sessions,
+            now=EVALUATED_AT,
+            market_status="open",
+            context="AAPL",
+        )
+        self.assertTrue(any("latest completed exchange-session bucket" in item for item in missing_session_issues))
+        self.assertTrue(any("latest completed exchange session" in item for item in missing_session_issues))
+
+        missing_week = {**current_frames, "1W": [row("2026-06-29T04:00:00Z")]}
+        weekly_issues = required_frame_freshness_issues(
+            missing_week,
+            now=EVALUATED_AT,
+            market_status="open",
+            context="AAPL",
+        )
+        self.assertTrue(any("latest completed exchange week" in item for item in weekly_issues))
+
+        early_close_frames = {
+            "15M": [row("2026-11-30T14:45:00Z")],
+            "4H": [row("2026-11-27T14:30:00Z")],
+            "1D": [row("2026-11-27T05:00:00Z")],
+            "1W": [row("2026-11-23T05:00:00Z")],
+        }
+        self.assertEqual(
+            required_frame_freshness_issues(
+                early_close_frames,
+                now=datetime(2026, 11, 30, 15, 5, tzinfo=timezone.utc),
+                market_status="open",
+                context="AAPL",
+            ),
+            [],
+        )
+
+        post_holiday_frames = {
+            "15M": [row("2026-09-08T13:45:00Z")],
+            "4H": [row("2026-09-04T17:30:00Z")],
+            "1D": [row("2026-09-04T04:00:00Z")],
+            "1W": [row("2026-08-31T04:00:00Z")],
+        }
+        self.assertEqual(
+            required_frame_freshness_issues(
+                post_holiday_frames,
+                now=datetime(2026, 9, 8, 14, 5, tzinfo=timezone.utc),
+                market_status="open",
+                context="AAPL",
+            ),
+            [],
+        )
+
     def test_required_frames_need_sixty_bars_and_complete_indicators(self) -> None:
         bars = trend_bars(count=26)
         result = evaluate_setup(
@@ -107,6 +350,7 @@ class AutopilotEngineTests(unittest.TestCase):
                 regime="risk-on", spy_direction="bullish", qqq_direction="bullish"
             ),
             data_label="delayed",
+            **freshness_inputs(),
             average_daily_dollar_volume=500_000_000,
             earnings_date="2030-12-01",
             days_to_earnings=120,
@@ -126,6 +370,7 @@ class AutopilotEngineTests(unittest.TestCase):
                 regime="risk-on", spy_direction="bullish", qqq_direction="bullish"
             ),
             data_label="delayed",
+            **freshness_inputs(),
             average_daily_dollar_volume=500_000_000,
             earnings_date="2030-12-01",
             days_to_earnings=120,
@@ -274,6 +519,7 @@ class AutopilotEngineTests(unittest.TestCase):
                 regime="risk-on", spy_direction="bullish", qqq_direction="bullish"
             ),
             data_label="delayed",
+            **freshness_inputs(),
             average_daily_dollar_volume=500_000_000,
             earnings_date="2030-12-01",
             days_to_earnings=120,
@@ -292,6 +538,7 @@ class AutopilotEngineTests(unittest.TestCase):
                 regime="risk-on", spy_direction="bullish", qqq_direction="bullish"
             ),
             data_label="delayed",
+            **freshness_inputs(),
             average_daily_dollar_volume=500_000_000,
             earnings_date="2030-12-01",
             days_to_earnings=120,
@@ -309,6 +556,7 @@ class AutopilotEngineTests(unittest.TestCase):
             {"1W": bars, "1D": bars, "4H": bars, "15M": bars},
             market_context=MarketContext(regime="risk-off", spy_direction="bearish", qqq_direction="bearish"),
             data_label="delayed",
+            **freshness_inputs(),
             average_daily_dollar_volume=500_000_000,
         )
         self.assertEqual(result.state, "BLOCKED")
@@ -321,6 +569,8 @@ class AutopilotEngineTests(unittest.TestCase):
             {"1D": trend_bars()},
             market_context=MarketContext(regime="risk-on"),
             data_label="real-time",
+            data_timestamp=SOURCE_TIMESTAMP,
+            evaluated_at=datetime(2026, 7, 16, 14, 1, tzinfo=timezone.utc),
         )
         self.assertEqual(result.verdict, "PASS")
         self.assertLess(result.confidence, 40)
@@ -332,6 +582,7 @@ class AutopilotEngineTests(unittest.TestCase):
             {"1W": bars, "1D": bars, "4H": bars, "15M": bars},
             market_context=MarketContext(regime="risk-on"),
             data_label="delayed",
+            **freshness_inputs(),
             average_daily_dollar_volume=500_000_000,
             earnings_date="2030-01-02",
             days_to_earnings=2,
